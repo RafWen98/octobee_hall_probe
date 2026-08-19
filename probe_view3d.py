@@ -177,12 +177,14 @@ class ProbeView3D(gl.GLViewWidget):
                 color=QtGui.QColor.fromRgbF(*col)))
 
     def reset_camera(self):
-        self.opts["center"] = pg.Vector(0, 0, self.geom.tube_length_mm / 2.0)
-        # Side-on and slightly above: the tube runs across the view, so all four
-        # faces and the whole length are readable at once. Frame the arms, not
-        # the tube -- the chips sit far outside it.
-        self.setCameraPosition(distance=self.extent_mm * 1.5,
-                               elevation=16, azimuth=-65)
+        # Frame the arms, not the tube: with 89 mm arms on a 25 mm tube the
+        # probe is wider than it is long, so fitting the tube alone would run
+        # the chips off the edges. Look from above the horizontal rather than
+        # along it, or the four sets of arms overlap into an unreadable cross.
+        centre = pg.Vector(0, 0, self.geom.tube_length_mm / 2.0)
+        self.opts["center"] = centre
+        self.setCameraPosition(pos=centre, distance=self.extent_mm * 1.35,
+                               elevation=26, azimuth=-58)
 
     # ---- live update -----------------------------------------------------
     def reset_scale(self):

@@ -245,6 +245,69 @@ Until they are harmonised, tell the analysis the truth per box:
 python octobee_cal.py --range 40 --range 20      # 694 then 695, in --uut order
 ```
 
+### Gain: all 16 now at 3000 (±20 mT), permanently — 2026-08-19
+
+Applied and verified. Two independent mechanisms hold it:
+
+1. **EEPROM `EGain_sel` (0x10E) = 0x00** on all 16 chips, with the key (0x1FE)
+   and checksum (0x1FF) rewritten via `activate_EEPROM_config()`. This is what
+   the chip reads at power-up.
+2. **`/mnt/local/rc.user` gain loop on both carriers.** 695 already had one; 694
+   did not (and did not even have `set-device-gain.py`). Both now run the same
+   block, so the gain is re-asserted at every boot even if an EEPROM ever goes
+   invalid.
+
+```bash
+# what the boot block does, on both boxes now
+export PYTHONPATH=$PYTHONPATH:/usr/local/senm3dx
+for sensor in 0 1 2 3 4 5 6 7; do
+    /usr/local/CARE/set-device-gain.py $sensor 3000
+done
+```
+
+Verified from the data afterwards: the gain-chain noise ratio on 694 moved
+14.5 → 26.7 while 695 stayed at 28.0, so **the two boxes now agree to 1.05×**.
+The 1.82× mismatch is gone. All 16 report `gain=3000`, `EGain_sel=0x00`,
+`key=0xa5`, `valid=True`, and each chip has loaded its own gain-3000 trims.
+
+**Everything is now ±20 mT / 63 V/T**, so use `--range 20` (a single value now
+applies to both boxes).
+
+#### Two things to know
+
+**±20 mT clips.** Gain 3000 saturates above 20 mT at the sensor. A small
+neodymium magnet a few mm from a chip easily exceeds that. If you see flat-topped
+peaks, that is clipping, not saturation of the ADC — drop to gain 1500 (±40 mT).
+
+**Fine-gain trims.** The EEPROM stores a separate trim set per gain, and the
+gain-3000 set has more dropped `SENS_*` entries than the gain-1500 set (10 axes
+of 48 vs 5). A dropped trim means that axis uses auto-linearity instead of a
+manual fine-gain correction — worth ≤ ~4 % on that axis. Not a reason to avoid
+gain 3000, but it is the floor on cross-calibration until you measure scale
+factors yourself (§4 step 5).
+
+#### Backups and undo
+
+Full 256-byte EEPROM dumps of all 16 chips, taken before any write, are in
+`eeprom_backup/`. Original `rc.user` files are in `rcuser_backup/`, and
+`/mnt/local/rc.user.bak.pre-gain` on 694.
+
+```bash
+# revert one carrier's EEPROM exactly as it was
+python3 /tmp/onbox_gain_config.py restore --in /tmp/eeprom_acq1001_694.json
+# or just change gain again
+python3 /tmp/onbox_gain_config.py set --gain 1500
+python3 /tmp/onbox_gain_config.py verify --gain 1500
+```
+
+If you change gain, **change it in both places** — EEPROM *and* the `rc.user`
+loop on both boxes. The rc.user loop wins at boot, so editing only the EEPROM
+would silently be overridden. That is exactly how the two boxes came to differ.
+
+One chip needed a retry: 694 sensor 7 first wrote checksum `0xbb` where `0xba`
+was correct and reported `valid=False`. Re-running `activate_EEPROM_config()`
+fixed it. `onbox_gain_config.py verify` is what catches this — always run it.
+
 ### A library bug to know about
 
 `get_meas_range()` returns `'400 mT'` while `get_gain()` returns `1500`, and the
@@ -552,12 +615,17 @@ is analogue pickup in the cabling and grounding rather than a sensor problem.
 The chips are not on the tube: each rides at the tip of a 92 mm SENIS eval-kit
 PCB standing off radially, so its field sensitive volume sits **89 mm clear of
 the face** it is bolted to (3 mm in from the board's tip, 0.55 mm above the
-board surface). With a 40 mm tube that puts every chip 109 mm from the tube
-axis and 218 mm from the chip opposite it.
+board surface). On the 1 inch (25.4 mm) tube that puts every chip 101.7 mm from
+the tube axis and 203 mm from the chip opposite it.
+
+The boards lie perpendicular to the tube axis -- shelves, not fins -- and the
+mounting plates repeat every 33 mm along each face (30 mm plate, ~3 mm gap),
+four to a face. So the head is four rings of four, and it is wider than it is
+long.
 
 That standoff is the single biggest geometric fact about this instrument. A
-magnet 20 mm off one chip is ~240 mm from the far side, and 1/r^3 turns that
-into a **~1800x** difference in what they read from the same magnet. Any
+magnet 20 mm off one chip is ~220 mm from the far side, and 1/r^3 turns that
+into a **~1600x** difference in what they read from the same magnet. Any
 comparison of spike heights has to divide it out before blaming a register --
 which is what *use geometry weighting* on the Calibration tab does.
 

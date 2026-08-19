@@ -255,6 +255,21 @@ def report(boxes, ranges, do_plot, plot_path):
                   f"{offs[0]:9.1f} {offs[1]:9.1f} {offs[2]:9.1f}   "
                   f"{noise[0]:9.2f} {noise[1]:9.2f} {noise[2]:9.2f}")
 
+    # A healthy chip sits its VCM near 2.2 V. Anything far outside that window is
+    # not a calibration problem: the analog line is open (a floating ACQ423 input
+    # drifts, so the value also changes between captures) or shorted. Checking
+    # only for the ADC rails misses this -- a floating input can sit mid-scale.
+    VCM_LO, VCM_HI = 1.5, 3.0
+    broken = [r for r in rows if not (VCM_LO <= r["vcm_v"] <= VCM_HI)]
+    if broken:
+        print()
+        for r in broken:
+            print(f"!! S{r['sensor']}: VCM = {r['vcm_v']:.3f} V, outside "
+                  f"{VCM_LO}-{VCM_HI} V. That analog line is open or shorted -- "
+                  f"the chip may still be fine on SPI.")
+        print("   Check the eval-kit ribbon for those ports. Field numbers for "
+              "these sensors are meaningless until fixed.")
+
     vcms = np.array([r["vcm_v"] for r in rows])
     noises = np.array([r["noise"] for r in rows])
     print()

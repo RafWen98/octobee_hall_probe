@@ -1,0 +1,47 @@
+# DEFAULT init for acq423, 200000 Hz, auto soft trigger
+#
+# created by deploy_sysconfig for uut:acq1001_695 mezz:acq423
+# by dt100@eigg-fs on Thu 11 Sep 15:11:15 BST 2025
+# git dfd3753558f321e924fae47dea28d1803192bfa4
+# incant ./deploy_sysconfig.sh acq1001_695 acq423 1
+
+/usr/local/CARE/acq1001\+acq42x.init
+# Local clock and soft trigger
+set.site 0 sync_role master 200000
+# Alternate front panel clock and front panel trigger
+#set.site 0 sync_role fpmaster 200000 1000000
+
+# For other combinations try 'set.site 0 sync_role help'
+
+judgement() {
+# short trace length, rapid update 50Hz possible
+set.site 1 RTM_TRANSLEN ${1:-128}
+set.site 1 RGM RTM
+set.site 1 RGM:DX ${2:-d0}
+set.site 1 RGM:SENSE rising
+}
+# see /mnt/local/sysconfig/epics.sh
+source /mnt/local/sysconfig/acq400.sh
+[ ! -z "$ACQ400_JUDGEMENT" ] && judgement $ACQ400_JUDGEMENT
+
+# Set trigger source for SPAD uSec counter; soft_trigger same as ADC default trigger
+set.site 0 spad1_us 1,1,1
+
+# Power good monitoring for connected SENIS sensors
+# Checks once upon boot
+/mnt/local/pgood_spad
+
+# Enable I2C temperature ADC poll and include in SPAD2-6
+/mnt/local/temps_spad &
+
+# enable port 4210 stream
+echo STREAM_OPTS= >> /etc/sysconfig/acq400_streamd.conf
+
+# ThreeDHALLInterface lives here; set-device-gain.py does not add it itself
+export PYTHONPATH=$PYTHONPATH:/usr/local/senm3dx
+
+# Set sensor gains (belt-and-braces: the EEPROM EGain_sel byte already selects
+# gain 3000 at power-up, this re-asserts it in case the EEPROM is ever invalid)
+for sensor in 0 1 2 3 4 5 6 7; do
+    /usr/local/CARE/set-device-gain.py $sensor 3000
+done
