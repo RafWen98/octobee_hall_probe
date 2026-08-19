@@ -2,12 +2,13 @@
 """
 probe_geometry.py -- where each sensor actually sits, and which way its chip faces.
 
-The probe is a square tube carrying 16 SENM3Dx evaluation-kit PCBs, 4 per face,
-each standing off radially like a bristle on a brush. The chips are NOT on the
-tube surface: each one rides at the far tip of a 92 mm board, so the field
-sensitive volume sits roughly 89 mm clear of the face it is bolted to.
+The probe is a square tube carrying 16 SENM3Dx evaluation-kit PCBs, 4 per face.
+Each board lies FLAT ON its face -- coplanar with it, bolted down through the
+wide foot -- and reaches out sideways past the edge of the tube, tangentially.
+The chip rides at the far tip. So the arms are not spokes pointing away from the
+axis; they are tangents, and the four on a given ring form a pinwheel.
 
-That standoff dominates everything geometric about this instrument:
+That matters for three separate things:
 
   1. Every chip has a DIFFERENT orientation, so comparing a single axis across
      sensors is meaningless. Compare |B| (rotation invariant), or rotate each
@@ -18,16 +19,21 @@ That standoff dominates everything geometric about this instrument:
      amplitude differences before any gain or calibration difference.
      expected_response() quantifies it so it can be divided out.
 
+  3. Because the board lies flat, its 30 mm-wide foot runs ALONG the tube. That
+     is what sets the 33 mm plate pitch (30 mm plate + ~3 mm gap), and it is why
+     four boards fit in a row on a 25.4 mm face without fouling each other.
+
 Dimensions come from the SENIS eval-kit drawing (Figure 2) and the FSV detail
 (Figure 3):
 
-    PCB overall length              92 mm
-    mounting end                    30 mm wide, first 20 mm of the length
-    arm                             12 mm wide
+    PCB overall length              92 mm      (tangential, out from the tube)
+    mounting foot                   30 mm wide (along the tube), first 20 mm
+    arm                             12 mm wide (along the tube)
+    PCB thickness                  1.2 mm
     FSV inset from the far end       3 mm      -> 89 mm from the mounting edge
     FSV depth below the chip lid  0.35 mm
     chip package height            0.9 mm     -> FSV sits 0.55 mm above the
-    PCB thickness                  1.2 mm        board's top face
+                                                 board's top face
 
 Tube frame convention
 ---------------------
@@ -38,12 +44,12 @@ Tube frame convention
 
 Chip local frame (before chip_rot_deg)
 --------------------------------------
-    local +X  along the arm, pointing away from the tube
-    local +Z  out of the PCB surface
-    local +Y  completes the right-handed set
+    local +X  along the arm, pointing away from the tube (tangential)
+    local +Z  out of the PCB surface, i.e. along the face's outward normal
+    local +Y  completes the right-handed set (runs along the tube)
 
 WHICH SENSOR IS ON WHICH FACE IS NOT YET VERIFIED on this hardware, and neither
-is `board_plane`. The defaults are assumptions -- see probe_geometry.json.
+is arm_sense -- see the notes in probe_geometry.json.
 """
 
 import json
@@ -66,13 +72,12 @@ FACE_NAMES = ("+X", "+Y", "-X", "-Y")
 
 MAPPINGS = ("face-major", "ring-major")
 
-# Which way the flat of the PCB faces once the arm points radially outward.
-#   axial           the board plane contains the tube axis (boards stand like
-#                   fins along the tube), so the board normal runs around the
-#                   circumference
-#   circumferential the board plane is perpendicular to the tube axis, so the
-#                   board normal runs along the tube
-BOARD_PLANES = ("axial", "circumferential")
+# How a board is attached to its face.
+#   tangential  the board lies flat on the face and reaches out sideways past
+#               the tube edge, staying in the plane of the face  (this probe)
+#   radial      the board stands off the face like a spoke        (kept so the
+#               earlier reading of the build can still be compared against)
+MOUNT_STYLES = ("tangential", "radial")
 
 TUBE_AXIS = np.array([0.0, 0.0, 1.0])
 
@@ -106,26 +111,36 @@ def _default_sensors(mapping):
 class Geometry:
     """Positions and orientations of the 16 chips, loadable from JSON."""
 
-    def __init__(self, tube_width_mm=40.0,
+    def __init__(self, tube_width_mm=25.4,
                  arm_length_mm=ARM_LENGTH_MM,
                  fsv_from_tip_mm=FSV_FROM_TIP_MM,
                  fsv_above_board_mm=FSV_ABOVE_BOARD_MM,
+                 board_thickness_mm=ARM_THICKNESS_MM,
                  mount_standoff_mm=0.0,
+                 mount_inset_mm=0.0,
                  plate_pitch_mm=None,
                  first_sensor_z_mm=30.0,
                  tube_length_mm=None,
-                 board_plane="axial",
-                 mapping="face-major", sensors=None, notes=""):
+                 mount_style="tangential",
+                 arm_sense=1,
+                 mapping="face-major", sensors=None, notes="",
+                 board_plane=None):
         self.notes = notes
         self.tube_width_mm = float(tube_width_mm)
         self.arm_length_mm = float(arm_length_mm)
         self.fsv_from_tip_mm = float(fsv_from_tip_mm)
         self.fsv_above_board_mm = float(fsv_above_board_mm)
+        self.board_thickness_mm = float(board_thickness_mm)
         self.mount_standoff_mm = float(mount_standoff_mm)
+        self.mount_inset_mm = float(mount_inset_mm)
         self.plate_pitch_mm = float(
             ARM_MOUNT_WIDTH_MM + PLATE_GAP_MM if plate_pitch_mm is None
             else plate_pitch_mm)
         self.first_sensor_z_mm = float(first_sensor_z_mm)
+        self.mount_style = mount_style
+        self.arm_sense = 1 if float(arm_sense) >= 0 else -1
+        # board_plane belonged to the older radial reading of the build; accept
+        # it from an old config file so nothing breaks, but it is unused now.
         self.board_plane = board_plane
         self.mapping = mapping
         self.sensors = sensors or _default_sensors(mapping)
@@ -140,11 +155,14 @@ class Geometry:
                 "arm_length_mm": self.arm_length_mm,
                 "fsv_from_tip_mm": self.fsv_from_tip_mm,
                 "fsv_above_board_mm": self.fsv_above_board_mm,
+                "board_thickness_mm": self.board_thickness_mm,
                 "mount_standoff_mm": self.mount_standoff_mm,
+                "mount_inset_mm": self.mount_inset_mm,
                 "plate_pitch_mm": self.plate_pitch_mm,
                 "first_sensor_z_mm": self.first_sensor_z_mm,
                 "tube_length_mm": self.tube_length_mm,
-                "board_plane": self.board_plane,
+                "mount_style": self.mount_style,
+                "arm_sense": self.arm_sense,
                 "mapping": self.mapping,
                 "notes": self.notes,
                 "sensors": self.sensors}
@@ -168,7 +186,7 @@ class Geometry:
                 pass
         return cls()
 
-    # ---- derived quantities ---------------------------------------------
+    # ---- per-sensor frame ------------------------------------------------
     def face(self, sensor_id):
         return self.sensors[sensor_id - 1]["face"]
 
@@ -176,57 +194,104 @@ class Geometry:
         return self.sensors[sensor_id - 1]["slot"]
 
     def normal(self, sensor_id):
-        """Outward radial direction of this chip's face -- the arm's direction."""
+        """Outward normal of the face this board is bolted to."""
         return FACE_NORMALS[self.sensors[sensor_id - 1]["face"]].copy()
 
     def normals(self):
         return np.array([self.normal(i) for i in range(1, N_SENSORS + 1)])
 
+    def sense(self, sensor_id):
+        """Which way round the tube this arm points: +1 or -1."""
+        return float(self.sensors[sensor_id - 1].get("arm_sense", self.arm_sense))
+
+    def arm_dir(self, sensor_id):
+        """Unit vector along the board, from the mounting foot to the chip."""
+        n = self.normal(sensor_id)
+        if self.mount_style == "radial":
+            return n
+        # Tangential: perpendicular to both the face normal and the tube axis,
+        # so it runs across the face and off the edge.
+        t = np.cross(TUBE_AXIS, n) * self.sense(sensor_id)
+        return t / np.linalg.norm(t)
+
+    def board_normal(self, sensor_id):
+        """Unit normal of the PCB surface, pointing away from the tube."""
+        n = self.normal(sensor_id)
+        if self.mount_style == "radial":
+            e = np.cross(n, TUBE_AXIS)
+            return e / np.linalg.norm(e)
+        return n                       # the board lies flat on the face
+
+    def board_width_dir(self, sensor_id):
+        """Across the board -- along the tube for a tangential mount."""
+        return np.cross(self.board_normal(sensor_id), self.arm_dir(sensor_id))
+
+    # ---- positions -------------------------------------------------------
     @property
-    def arm_root_radius_mm(self):
-        """Distance from the tube axis to where an arm leaves the face."""
+    def face_radius_mm(self):
+        """Distance from the tube axis out to a face."""
         return self.tube_width_mm / 2.0 + self.mount_standoff_mm
 
     @property
-    def fsv_radius_mm(self):
-        """Distance from the tube axis to the field sensitive volume."""
-        return (self.arm_root_radius_mm
-                + self.arm_length_mm - self.fsv_from_tip_mm)
+    def fsv_height_mm(self):
+        """How far the FSV stands off the board's mounting surface."""
+        return self.board_thickness_mm + self.fsv_above_board_mm
 
-    def board_normal(self, sensor_id):
-        """Unit normal of the PCB surface, in the tube frame."""
-        n = self.normal(sensor_id)
-        if self.board_plane == "circumferential":
-            e = TUBE_AXIS.copy()
-        else:                                    # 'axial'
-            e = np.cross(n, TUBE_AXIS)
-        norm = np.linalg.norm(e)
-        return e / norm if norm > 0 else TUBE_AXIS.copy()
+    @property
+    def fsv_reach_mm(self):
+        """Distance from the mounting edge of the board to the FSV."""
+        return self.arm_length_mm - self.fsv_from_tip_mm
 
     def slot_z_mm(self, sensor_id):
         return (self.first_sensor_z_mm
                 + self.slot(sensor_id) * self.plate_pitch_mm)
 
+    def mount_edge_offset_mm(self):
+        """
+        Where the board's mounting edge sits along the arm direction, measured
+        from the tube axis. The board starts at the trailing edge of the face
+        and runs across it, so that is -half a tube width.
+        """
+        if self.mount_style == "radial":
+            return self.face_radius_mm
+        return -self.tube_width_mm / 2.0 + self.mount_inset_mm
+
     def arm_root(self, sensor_id):
-        """Where the arm meets the tube face, in the tube frame, mm."""
-        return (self.normal(sensor_id) * self.arm_root_radius_mm
-                + TUBE_AXIS * self.slot_z_mm(sensor_id))
+        """The board's mounting edge, in the tube frame, mm."""
+        a = self.arm_dir(sensor_id)
+        base = TUBE_AXIS * self.slot_z_mm(sensor_id) + a * self.mount_edge_offset_mm()
+        if self.mount_style == "radial":
+            return base
+        return base + self.normal(sensor_id) * self.face_radius_mm
 
     def position(self, sensor_id):
         """The chip's field sensitive volume in the tube frame, mm."""
-        return (self.normal(sensor_id) * self.fsv_radius_mm
-                + TUBE_AXIS * self.slot_z_mm(sensor_id)
-                + self.board_normal(sensor_id) * self.fsv_above_board_mm)
+        a = self.arm_dir(sensor_id)
+        w = self.board_normal(sensor_id)
+        if self.mount_style == "radial":
+            return (a * (self.face_radius_mm + self.fsv_reach_mm)
+                    + TUBE_AXIS * self.slot_z_mm(sensor_id)
+                    + w * self.fsv_above_board_mm)
+        return (self.normal(sensor_id) * (self.face_radius_mm + self.fsv_height_mm)
+                + a * (self.mount_edge_offset_mm() + self.fsv_reach_mm)
+                + TUBE_AXIS * self.slot_z_mm(sensor_id))
 
     def positions(self):
         return np.array([self.position(i) for i in range(1, N_SENSORS + 1)])
 
+    @property
+    def fsv_radius_mm(self):
+        """Largest distance of any chip from the tube axis -- the probe's reach."""
+        p = self.positions()
+        return float(np.max(np.hypot(p[:, 0], p[:, 1])))
+
+    # ---- orientation -----------------------------------------------------
     def rotation(self, sensor_id):
         """
         3x3 matrix R with B_tube = R @ B_chip, for B_chip in the chip's own
         (Bx, By, Bz). Sign flips are folded in by rotations().
         """
-        e1 = self.normal(sensor_id)              # chip +X: out along the arm
+        e1 = self.arm_dir(sensor_id)             # chip +X: out along the arm
         e3 = self.board_normal(sensor_id)        # chip +Z: out of the board
         e2 = np.cross(e3, e1)                    # chip +Y completes the set
         psi = np.deg2rad(self.sensors[sensor_id - 1].get("chip_rot_deg", 0.0))
@@ -275,12 +340,12 @@ class Geometry:
         lines = [
             f"square tube {self.tube_width_mm:g} mm across, "
             f"{self.tube_length_mm:g} mm long",
-            f"arms {self.arm_length_mm:g} mm long, FSV {self.fsv_from_tip_mm:g} mm "
-            f"from the tip -> chips sit {self.fsv_radius_mm:g} mm from the tube "
-            f"axis ({self.fsv_radius_mm - self.arm_root_radius_mm:g} mm clear of "
-            f"the face)",
-            f"mounting plates every {self.plate_pitch_mm:g} mm, board plane "
-            f"'{self.board_plane}', mapping '{self.mapping}'"]
+            f"boards {self.mount_style}: {self.arm_length_mm:g} mm long, FSV "
+            f"{self.fsv_from_tip_mm:g} mm from the tip -> chips reach "
+            f"{self.fsv_radius_mm:.1f} mm from the tube axis, standing "
+            f"{self.fsv_height_mm:g} mm off the face they sit on",
+            f"mounting plates every {self.plate_pitch_mm:g} mm along the tube, "
+            f"arm sense {self.arm_sense:+d}, mapping '{self.mapping}'"]
         for i in range(1, N_SENSORS + 1):
             p = self.position(i)
             lines.append(f"  S{i:<2d} face {FACE_NAMES[self.face(i)]} slot {self.slot(i)}"
@@ -293,13 +358,12 @@ class Geometry:
 # --------------------------------------------------------------------------
 
 def _box(centre, u, v, w, su, sv, sw):
-    """Axis-aligned-in-its-own-frame box -> (verts, faces)."""
+    """Box given its own three axes and sizes -> (verts, faces)."""
     verts = []
     for du in (-su / 2, su / 2):
         for dv in (-sv / 2, sv / 2):
             for dw in (-sw / 2, sw / 2):
                 verts.append(centre + u * du + v * dv + w * dw)
-    # vertex order: (du, dv, dw) with dw fastest
     f = [(0, 1, 3), (0, 3, 2), (4, 6, 7), (4, 7, 5),
          (0, 4, 5), (0, 5, 1), (2, 3, 7), (2, 7, 6),
          (0, 2, 6), (0, 6, 4), (1, 5, 7), (1, 7, 3)]
@@ -323,35 +387,37 @@ def tube_mesh(geom, cap=True):
 
 def arm_mesh(geom, sensor_id):
     """
-    The eval-kit PCB: a wide mounting foot at the tube, a narrower arm reaching
-    out to the chip. Two boxes, merged.
+    The eval-kit PCB lying on its face: a wide foot bolted to the tube, then a
+    narrower arm running out past the edge to the chip. Two boxes, merged.
     """
-    n = geom.normal(sensor_id)                  # along the arm
+    a = geom.arm_dir(sensor_id)                 # along the board
     w = geom.board_normal(sensor_id)            # out of the board
-    v = np.cross(w, n)                          # across the board
+    v = geom.board_width_dir(sensor_id)         # across the board
     root = geom.arm_root(sensor_id)
-    t = ARM_THICKNESS_MM
+    t = geom.board_thickness_mm
+    # The board's underside rests on the face, so the slab centre sits half a
+    # thickness proud of it.
+    lift = w * (t / 2.0)
 
-    foot_c = root + n * (ARM_MOUNT_LENGTH_MM / 2.0)
-    fv, ff = _box(foot_c, n, v, w, ARM_MOUNT_LENGTH_MM, ARM_MOUNT_WIDTH_MM, t)
+    foot_c = root + a * (ARM_MOUNT_LENGTH_MM / 2.0) + lift
+    fv, ff = _box(foot_c, a, v, w, ARM_MOUNT_LENGTH_MM, ARM_MOUNT_WIDTH_MM, t)
 
     rest = geom.arm_length_mm - ARM_MOUNT_LENGTH_MM
-    arm_c = root + n * (ARM_MOUNT_LENGTH_MM + rest / 2.0)
-    av, af = _box(arm_c, n, v, w, rest, ARM_WIDTH_MM, t)
+    arm_c = root + a * (ARM_MOUNT_LENGTH_MM + rest / 2.0) + lift
+    av, af = _box(arm_c, a, v, w, rest, ARM_WIDTH_MM, t)
 
     return (np.vstack([fv, av]).astype(np.float32),
             np.vstack([ff, af + len(fv)]).astype(np.int32))
 
 
 def chip_mesh(geom, sensor_id, size_mm=CHIP_SIZE_MM):
-    """The chip package itself, sitting on the board at the FSV."""
-    n = geom.normal(sensor_id)
+    """The chip package itself, sitting on the board under the FSV."""
+    a = geom.arm_dir(sensor_id)
     w = geom.board_normal(sensor_id)
-    v = np.cross(w, n)
-    centre = (geom.position(sensor_id)
-              - w * geom.fsv_above_board_mm
-              + w * (ARM_THICKNESS_MM / 2.0 + 0.45))
-    return _box(centre, n, v, w, size_mm, size_mm, 0.9)
+    v = geom.board_width_dir(sensor_id)
+    # Centre the package on the board surface beneath the FSV.
+    centre = geom.position(sensor_id) - w * (geom.fsv_above_board_mm - 0.45)
+    return _box(centre, a, v, w, size_mm, size_mm, 0.9)
 
 
 def main():
@@ -360,7 +426,9 @@ def main():
     p.add_argument("--config", default=CONFIG_NAME)
     p.add_argument("--mapping", choices=MAPPINGS,
                    help="rewrite the config with this sensor->face mapping")
-    p.add_argument("--board-plane", choices=BOARD_PLANES)
+    p.add_argument("--mount-style", choices=MOUNT_STYLES)
+    p.add_argument("--arm-sense", type=int, choices=(1, -1),
+                   help="which way round the tube the arms point")
     p.add_argument("--width", type=float, help="tube width across the flats, mm")
     p.add_argument("--pitch", type=float, help="mounting plate pitch along the tube, mm")
     p.add_argument("--arm", type=float, help="PCB length, mm")
@@ -374,8 +442,9 @@ def main():
         g.mapping = a.mapping
         g.sensors = _default_sensors(a.mapping)
         changed = True
-    for attr, val in (("board_plane", a.board_plane), ("tube_width_mm", a.width),
-                      ("plate_pitch_mm", a.pitch), ("arm_length_mm", a.arm)):
+    for attr, val in (("mount_style", a.mount_style), ("arm_sense", a.arm_sense),
+                      ("tube_width_mm", a.width), ("plate_pitch_mm", a.pitch),
+                      ("arm_length_mm", a.arm)):
         if val is not None:
             setattr(g, attr, val)
             changed = True

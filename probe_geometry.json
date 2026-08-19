@@ -3,13 +3,16 @@
   "arm_length_mm": 92.0,
   "fsv_from_tip_mm": 3.0,
   "fsv_above_board_mm": 0.55,
+  "board_thickness_mm": 1.2,
   "mount_standoff_mm": 0.0,
+  "mount_inset_mm": 0.0,
   "plate_pitch_mm": 33.0,
   "first_sensor_z_mm": 30.0,
   "tube_length_mm": 159.0,
-  "board_plane": "circumferential",
+  "mount_style": "tangential",
+  "arm_sense": 1,
   "mapping": "face-major",
-  "notes": "Tube is 1 inch (25.4 mm) outside width, confirmed. Mounting plates pitch 33 mm along the tube (30 mm plate + ~3 mm gap), 4 in a row per face, confirmed. Boards lie perpendicular to the tube axis (board_plane=circumferential), confirmed. Arm dimensions are from the SENIS eval-kit drawing: 92 mm PCB, FSV 3 mm from the tip and 0.55 mm above the board, so each chip sits 89 mm clear of the tube face. NOTE: with the boards perpendicular to the axis the PCB 30 mm width runs circumferentially, so the 33 mm pitch comes from the mounting brackets, not the PCB foot -- and a 30 mm board slightly overhangs a 25.4 mm face. STILL UNVERIFIED: the sensor-to-face mapping below, and each chip_rot_deg / axis_signs. Only the 3D arrangement and the tube-frame rotation depend on those -- |B|, the channel health diagnostics and the raw exports do not. Establish the real order with octobee_idmap.py and a slow magnet pass along one face, correct the face/slot entries, then press Reload geometry in the GUI.",
+  "notes": "Boards lie FLAT ON the tube faces, coplanar with them, and reach out sideways past the tube edge -- tangentially, not radially (confirmed from the bench, hall_probe_setup_2.png). The four arms on a ring therefore form a pinwheel. Because the board lies flat, its 30 mm foot runs along the tube, which is what sets the 33 mm plate pitch (30 mm plate + ~3 mm gap), 4 to a face. Tube is 1 inch (25.4 mm) outside width. Arm dimensions from the SENIS eval-kit drawing: 92 mm PCB, FSV 3 mm from the tip, 0.55 mm above the board, board 1.2 mm thick -- so each chip sits 1.75 mm off its face and reaches 76.3 mm across it. STILL UNVERIFIED: arm_sense (which way round the tube the arms point), the sensor-to-face mapping below, and each chip_rot_deg / axis_signs. Only the 3D arrangement and the tube-frame rotation depend on those -- |B|, the channel health diagnostics and the raw exports do not. Establish the real order with octobee_idmap.py and a slow magnet pass along one face, correct the entries, then press Reload geometry in the GUI.",
   "sensors": [
     {
       "id": 1,

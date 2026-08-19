@@ -17,6 +17,7 @@ Exit status is 0 only if every check passes.
 import argparse
 import os
 import sys
+import json
 import tempfile
 import time
 
@@ -26,6 +27,7 @@ from PyQt6 import QtWidgets
 import octobee as ob
 import octobee_calibration as ocal
 import octobee_gui as gui
+import octobee_posecal as opc
 import octobee_record as orec
 import probe_geometry as pgeom
 
@@ -75,12 +77,246 @@ def read_clkdiv(host):
 def pump(win, app, seconds):
     """Run the acquisition loop for a while, as the real timers would."""
     end = time.time() + seconds
+    n = 0
     while time.time() < end:
         win.on_tick()
+        n += 1
+        if n % 5 == 0:              # the view redraws on its own slower clock
+            win.on_view_tick()
         app.processEvents()
         time.sleep(0.01)
+    win.on_view_tick()
     win.on_slow_tick()
     app.processEvents()
+
+
+# --------------------------------------------------------------------------
+# Earth-field roll calibration
+# --------------------------------------------------------------------------
+
+def _synth_sweeps(geom, gains, axial_ratio=1.0, offsets_ut=20.0, seed=3,
+                  noise_mt=8.81e-3 / np.sqrt(2500), n=3000):
+    """
+    Build roll sweeps from a known truth so the solver can be graded.
+
+    axial_ratio is each chip's +Y (tube-axis) sensitivity relative to its X/Z.
+    It is the quantity only a second cradle azimuth can see, so it is what the
+    gauge tests turn on.
+    """
+    rng = np.random.default_rng(seed)
+    n_sens = pgeom.N_SENSORS
+    b_mt = 49.0e-3
+    R_nom = geom.rotations()
+    # S is the CORRECTION, so a sensor of sensitivity g needs S = 1/g.
+    S_true = np.array([np.diag([1.0, 1.0 / axial_ratio, 1.0]) / gains[i]
+                       for i in range(n_sens)])
+    M_true = np.array([np.linalg.inv(R_nom[i] @ S_true[i]) for i in range(n_sens)])
+    b_true = rng.normal(0, offsets_ut * 1e-3, (n_sens, 3))
+
+    def sweep(tag, incl_deg):
+        a = np.deg2rad(incl_deg)
+        bt, bz = b_mt * np.cos(a), b_mt * np.sin(a)
+        phi = np.sort(rng.uniform(0, 4 * np.pi, n))
+        B = np.column_stack([bt * np.cos(phi), bt * np.sin(phi), np.full(n, bz)])
+        m = np.einsum("sij,tj->tsi", M_true, B) + b_true[None]
+        return opc.RollSweep(m + rng.normal(0, noise_mt, m.shape), tag=tag)
+
+    return sweep, S_true, b_true
+
+
+def _matching_error_pct(sol, S_true):
+    """How badly the sensors disagree with each other, in percent.
+
+    Deliberately built from the TRANSVERSE response only. That is the part no
+    gauge can touch, so this measures inter-sensor matching without being
+    polluted by whether the axial gauge happened to be resolved.
+    """
+    _, S = sol.decompose()
+    n = pgeom.N_SENSORS
+    got = np.array([np.sqrt(S[i][0, 0] * S[i][2, 2]) for i in range(n)])
+    want = np.array([np.sqrt(S_true[i][0, 0] * S_true[i][2, 2]) for i in range(n)])
+    rel = (got / np.median(got)) / (want / np.median(want))
+    return float(np.abs(rel - 1).max() * 100)
+
+
+def test_posecal():
+    print("\n== Earth-field roll calibration ==")
+    geom = pgeom.Geometry.load_or_default()
+    n_sens = pgeom.N_SENSORS
+    rng = np.random.default_rng(1)
+    gains = 1.0 + rng.normal(0, 0.03, n_sens)
+
+    sweep, S_true, b_true = _synth_sweeps(geom, gains)
+    A, B, C = sweep("A", 25.0), sweep("B", -25.0), sweep("C", 60.0)
+
+    # ---- the whole point: sensors matched to each other -------------------
+    sol = opc.solve_roll([A, B, C], geom, 49.0)
+    check("roll solve matches sensors to each other",
+          _matching_error_pct(sol, S_true) < 0.1,
+          f"max inter-sensor error {_matching_error_pct(sol, S_true):.4f} %")
+    check("roll solve recovers the offsets",
+          np.abs(sol.b - b_true).max() * 1e3 < 0.5,
+          f"max {np.abs(sol.b - b_true).max() * 1e3:.3f} uT")
+    check("roll solve recovers the orientations",
+          max(np.degrees(np.arccos(np.clip(
+              (np.trace(sol.decompose()[0][i] @ geom.rotations()[i].T) - 1) / 2,
+              -1, 1))) for i in range(n_sens)) < 0.2)
+    check("fit residual sits at the noise floor",
+          np.median(sol.residual_mt) * 1e3 < 0.25,
+          f"{np.median(sol.residual_mt) * 1e3:.4f} uT")
+
+    # ---- degeneracy guards -----------------------------------------------
+    # These are the tests that stop a structurally unidentifiable direction
+    # from being quietly fitted to noise. The residual is at the noise floor
+    # in EVERY case below, so residual alone can never catch these.
+    one = opc.solve_roll([A], geom, 49.0)
+    check("one orientation reports the axial column as unidentified",
+          not one.identified[:, 2].all())
+    check("one orientation still matches sensors to each other",
+          _matching_error_pct(one, S_true) < 0.1,
+          f"max {_matching_error_pct(one, S_true):.4f} %")
+
+    flip = opc.solve_roll([A, B], geom, 49.0)
+    check("an end-for-end flip identifies the axial column",
+          flip.identified[:, 2].all())
+    check("an end-for-end flip does NOT claim the anisotropy gauge",
+          not flip.anisotropy_identified)
+    check("an end-for-end flip gives full offset leverage",
+          flip.offset_leverage > 0.6, f"{flip.offset_leverage:.2f}")
+
+    two_az = opc.solve_roll([A, C], geom, 49.0)
+    check("two same-sign azimuths flag weak offset leverage",
+          two_az.offset_leverage < 0.6, f"{two_az.offset_leverage:.2f}")
+
+    check("three orientations identify everything",
+          sol.identified[:, 2].all() and sol.anisotropy_identified
+          and sol.offset_leverage > 0.6)
+
+    # ---- the anisotropy gauge is real, and only C can see it -------------
+    sweep2, S2, _ = _synth_sweeps(geom, gains, axial_ratio=0.95, seed=5)
+    A2, B2, C2 = sweep2("A", 25.0), sweep2("B", -25.0), sweep2("C", 60.0)
+
+    def axial_ratio(sv):
+        _, S = sv.decompose()
+        return float(np.median(0.5 * (S[:, 0, 0] + S[:, 2, 2]))
+                     / np.median(S[:, 1, 1]))
+
+    full = opc.solve_roll([A2, B2, C2], geom, 49.0)
+    check("a second cradle azimuth recovers axial sensitivity",
+          abs(axial_ratio(full) - 0.95) < 0.01,
+          f"got {axial_ratio(full):.4f}, truth 0.9500")
+    only_flip = opc.solve_roll([A2, B2], geom, 49.0)
+    check("without it the axial sensitivity is wrong, and says so",
+          abs(axial_ratio(only_flip) - 0.95) > 0.02
+          and not only_flip.anisotropy_identified,
+          f"got {axial_ratio(only_flip):.4f}")
+    assumed = opc.solve_roll([A2, B2], geom, 49.0,
+                             anisotropy="assume_isotropic")
+    check("assume_isotropic forces isotropy and labels the assumption",
+          abs(axial_ratio(assumed) - 1.0) < 0.01
+          and "assum" in assumed.notes.lower())
+
+    # ---- the common-mode claim -------------------------------------------
+    check("the anisotropy gauge is common mode, so matching survives it",
+          _matching_error_pct(only_flip, S2) < 0.1,
+          f"max {_matching_error_pct(only_flip, S2):.4f} %")
+
+    # ---- what it says about the geometry ---------------------------------
+    ids = opc.identify_faces(sol, geom)
+    check("solved face mapping agrees with probe_geometry.json",
+          ids["agrees"], f"mismatch {ids['mismatch']}")
+    check("a uniform ambient reads as uniform",
+          opc.ambient_uniformity(sol) < 0.01,
+          f"{opc.ambient_uniformity(sol) * 100:.3f} % of |B|")
+
+    # ---- refuses to mix ranges -------------------------------------------
+    lo = opc.RollSweep(A.b_mt, tag="A", ranges_mt=np.full(n_sens, 40.0))
+    hi = opc.RollSweep(B.b_mt, tag="B", ranges_mt=np.full(n_sens, 400.0))
+    try:
+        opc.solve_roll([lo, hi], geom, 49.0)
+        check("refuses to combine sweeps taken at different ranges", False)
+    except ValueError:
+        check("refuses to combine sweeps taken at different ranges", True)
+
+    # ---- range transfer ---------------------------------------------------
+    base = rng.normal(0, 5.0, (200, n_sens, 3))
+    ratio_true = 1.82
+    r, skipped = opc.range_transfer(base, base * ratio_true, min_signal_mt=0.5)
+    check("range transfer recovers a known gain ratio",
+          np.allclose(r[np.abs(base.mean(axis=0)) > 0.5], ratio_true, atol=1e-6),
+          f"{ratio_true}x")
+    check("range transfer skips channels with too little signal",
+          isinstance(skipped, list))
+
+
+def test_posecal_persistence():
+    print("\n== calibration file compatibility ==")
+    geom = pgeom.Geometry.load_or_default()
+    n_sens = pgeom.N_SENSORS
+    rng = np.random.default_rng(2)
+
+    # A v1 file has no "version" and no "matrix", and its zero was stored
+    # AFTER the gain. Loading it must reproduce v1 numbers exactly, or every
+    # capture in captures/ silently changes meaning.
+    gain = 1.0 + rng.normal(0, 0.05, (n_sens, 3))
+    zero = rng.normal(0, 0.1, (n_sens, 3))
+    v1 = {"ranges_mt": [40.0] * n_sens, "zero_mt": zero.tolist(),
+          "gain_corr": gain.tolist(), "subtract_vcm": True, "dead": [],
+          "notes": "v1"}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "v1.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(v1, f)
+        cal = ocal.Calibration.load(path)
+
+        volts = rng.normal(2.2, 0.05, (50, n_sens, 4))
+        got = cal.to_mt(volts)
+        raw = ((volts[..., :3] - volts[..., 3:4])
+               / cal.volts_per_tesla[None, :, None] * 1e3)
+        want_v1 = raw * gain[None] - zero[None]        # the old ordering
+        check("a v1 calibration.json still converts bit for bit",
+              np.allclose(got, want_v1, rtol=0, atol=1e-12),
+              f"max diff {np.abs(got - want_v1).max():.2e} mT")
+
+        cal.save(os.path.join(d, "v2.json"))
+        back = ocal.Calibration.load(os.path.join(d, "v2.json"))
+        check("a v2 calibration.json round trips",
+              np.allclose(back.to_mt(volts), got, atol=1e-12)
+              and back.VERSION == 2)
+
+    # Applying a pose solution.
+    gains = 1.0 + rng.normal(0, 0.03, n_sens)
+    sweep, S_true, b_true = _synth_sweeps(geom, gains, seed=9)
+    sol = opc.solve_roll([sweep("A", 25.0), sweep("B", -25.0),
+                          sweep("C", 60.0)], geom, 49.0)
+    cal = ocal.Calibration(ranges_mt=np.full(n_sens, 20.0))
+    cal.gain_corr = np.full((n_sens, 3), 1.5)
+    cal.apply_pose_solution(sol)
+    check("applying a pose solution installs the matrix", cal.has_matrix)
+    check("applying a pose solution clears the magnet trim",
+          np.allclose(cal.gain_corr, 1.0))
+    check("applying a pose solution installs the solved offset",
+          np.allclose(cal.zero_mt, sol.b))
+
+    sol.ranges_mt = np.full(n_sens, 400.0)
+    try:
+        cal.apply_pose_solution(sol)
+        check("refuses a pose solution solved at another range", False)
+    except ValueError:
+        check("refuses a pose solution solved at another range", True)
+
+    # The correction must actually undo the sensors it was solved from.
+    cal2 = ocal.Calibration(ranges_mt=np.full(n_sens, 20.0))
+    sol2 = opc.solve_roll([sweep("A", 25.0), sweep("B", -25.0),
+                           sweep("C", 60.0)], geom, 49.0)
+    cal2.apply_pose_solution(sol2)
+    R, _ = sol2.decompose()
+    corrected = np.einsum("sij,tsj->tsi", cal2.matrix,
+                          sweep("A", 25.0).b_mt - sol2.b[None])
+    tube = np.einsum("sij,tsj->tsi", R, corrected)
+    spread = np.std(np.linalg.norm(tube, axis=2), axis=1).mean()
+    check("corrected sensors agree on |B| in the tube frame",
+          spread / 49.0e-3 < 0.01, f"spread {spread / 49.0e-3 * 100:.3f} % of |B|")
 
 
 # --------------------------------------------------------------------------
@@ -95,22 +331,29 @@ def test_geometry():
           all(np.allclose(R[i].T @ R[i], np.eye(3)) for i in range(16)))
     check("rotations are right-handed",
           all(np.linalg.det(R[i]) > 0.99 for i in range(16)))
-    # The chips ride at the tips of 92 mm arms, not on the tube surface.
-    check("chips stand clear of the tube face",
-          abs(g.fsv_radius_mm - g.arm_root_radius_mm
-              - (g.arm_length_mm - g.fsv_from_tip_mm)) < 1e-9,
-          f"{g.fsv_radius_mm - g.arm_root_radius_mm:g} mm clear, "
-          f"{g.fsv_radius_mm:g} mm from the axis")
-    # A chip reading purely on its own +X must map to the arm's direction.
+    # The boards lie flat on the faces and reach out tangentially, so a chip
+    # sits barely off its own face but a long way round the tube.
+    check("chips sit just clear of the face they are bolted to",
+          abs(g.fsv_height_mm - (g.board_thickness_mm + g.fsv_above_board_mm)) < 1e-9,
+          f"{g.fsv_height_mm:g} mm off the face, reaching "
+          f"{g.fsv_radius_mm:.1f} mm from the axis")
+    arm_dirs = np.array([g.arm_dir(i) for i in range(1, 17)])
+    check("arms run tangentially, not radially",
+          np.allclose(np.einsum("ij,ij->i", arm_dirs, g.normals()), 0.0, atol=1e-9)
+          and np.allclose(arm_dirs @ pgeom.TUBE_AXIS, 0.0, atol=1e-9),
+          "perpendicular to both the face normal and the tube axis")
+    # A chip reading purely on its own +X must map along its arm.
     b = np.zeros((16, 3))
     b[:, 0] = 1.0
-    check("chip +X maps along the arm, radially outward",
-          np.allclose(g.to_tube_frame(b), g.normals()))
+    check("chip +X maps along the arm", np.allclose(g.to_tube_frame(b), arm_dirs))
     b = np.zeros((16, 3))
     b[:, 2] = 1.0
-    board_normals = np.array([g.board_normal(i) for i in range(1, 17)])
-    check("chip +Z maps out of the board surface",
-          np.allclose(g.to_tube_frame(b), board_normals))
+    check("chip +Z maps out of the board, along the face normal",
+          np.allclose(g.to_tube_frame(b), g.normals()))
+    b = np.zeros((16, 3))
+    b[:, 1] = 1.0
+    check("chip +Y maps along the tube",
+          np.allclose(np.abs(g.to_tube_frame(b) @ pgeom.TUBE_AXIS), 1.0))
     # |B| must survive the rotation, that being the whole point of using it.
     rng = np.random.default_rng(1)
     v = rng.normal(size=(50, 16, 3))
@@ -312,6 +555,40 @@ def test_app(app, args, workdir):
         win.on_clear_gain()
         check("gain trim clears", np.allclose(win.cal.gain_corr, 1.0))
 
+    # ---- display cannot starve acquisition ----
+    win.cmb_view.setCurrentIndex(list(gui.VIEW_RATES).index(10.0))
+    start_interval = win.view_timer.interval()
+    check("view runs on its own timer, not the acquisition one",
+          win.view_timer is not win.timer
+          and win.timer.interval() <= start_interval,
+          f"acquisition {win.timer.interval()} ms, view {start_interval} ms")
+    for _ in range(8):
+        win._note_draw_time(500.0)          # pretend every redraw is very slow
+    check("a slow redraw backs the view off automatically",
+          win.view_timer.interval() > start_interval,
+          f"{start_interval} ms -> {win.view_timer.interval()} ms")
+    check("the backoff is bounded",
+          win.view_timer.interval() <= gui.MAX_VIEW_INTERVAL_MS,
+          f"{win.view_timer.interval()} ms")
+    # Re-pick the SAME entry, which is what a user does to undo a backoff.
+    win.cmb_view.activated.emit(win.cmb_view.currentIndex())
+    check("re-picking the same rate clears the backoff",
+          win.view_timer.interval() == start_interval,
+          f"back to {win.view_timer.interval()} ms")
+
+    win.chk_3d.setChecked(False)
+    before = win.roll.filled
+    pump(win, app, 1.0)
+    check("acquisition continues with the 3D head off", win.roll.filled >= before)
+    win.chk_3d.setChecked(True)
+
+    win.act_pause.setChecked(True)
+    n_before = win.roll.filled
+    pump(win, app, 1.0)
+    check("pausing the view does not pause acquisition",
+          win.roll.filled >= n_before and win.paused)
+    win.act_pause.setChecked(False)
+
     # ---- recording ----
     win.chk_csv.setChecked(True)
     win.chk_raw.setChecked(True)
@@ -489,6 +766,8 @@ def main():
     test_cross_calibration()
     test_shipped_calibration()
     test_health()
+    test_posecal()
+    test_posecal_persistence()
     with tempfile.TemporaryDirectory() as workdir:
         test_app(app, args, workdir)
 

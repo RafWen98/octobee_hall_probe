@@ -247,23 +247,39 @@ python octobee_cal.py --range 40 --range 20      # 694 then 695, in --uut order
 
 ### Gain: all 16 now at 3000 (±20 mT), permanently — 2026-08-19
 
-Applied and verified. Two independent mechanisms hold it:
+Applied and verified. **The EEPROM is the single source of truth** — there is no
+boot script setting gain on either box.
 
-1. **EEPROM `EGain_sel` (0x10E) = 0x00** on all 16 chips, with the key (0x1FE)
-   and checksum (0x1FF) rewritten via `activate_EEPROM_config()`. This is what
-   the chip reads at power-up.
-2. **`/mnt/local/rc.user` gain loop on both carriers.** 695 already had one; 694
-   did not (and did not even have `set-device-gain.py`). Both now run the same
-   block, so the gain is re-asserted at every boot even if an EEPROM ever goes
-   invalid.
+Each chip's EEPROM byte `EGain_sel` (0x10E) = `0x00`, with the key (0x1FE) and
+checksum (0x1FF) rewritten via `activate_EEPROM_config()`. At power-up the chip
+validates key+checksum, then loads `EGain_sel` *and* the matching per-gain trim
+set into its registers. Read live from S1 to prove it:
 
-```bash
-# what the boot block does, on both boxes now
-export PYTHONPATH=$PYTHONPATH:/usr/local/senm3dx
-for sensor in 0 1 2 3 4 5 6 7; do
-    /usr/local/CARE/set-device-gain.py $sensor 3000
-done
 ```
+0x10E  EGain_sel = 0x00  ->  X=00 Z=00 Y=00  = gain 3000, selects data set 0
+
+  set 0 (gain 3000, 0x140)  [15, 19, 15, 182, 200, 167, ...]   <- SELECTED
+  set 1 (gain 1500, 0x150)  [16, 21, 16, 200, 175, 201, ...]
+  live registers 0x11-0x1F  [15, 19, 15, 182, 200, 167, ...]   match = True
+```
+
+**The boot-time gain loop was removed from both carriers on 2026-08-19.** 695 had
+one (`set-device-gain.py` in a `for` loop in `/mnt/local/rc.user`); 694 briefly
+got one too before it was taken back out. It is gone on purpose:
+
+- It forces only the **gain**, never the calibration trims. If an EEPROM went
+  invalid the chip would boot to datasheet defaults — `SENS_*`/`OFFSET_*` at 0
+  where a calibrated chip holds 128–255 — and the loop would set the gain back to
+  3000, making the sensor *look* correct while its calibration was silently
+  missing. It masked exactly the fault worth seeing.
+- Two mechanisms meant two places to update. That is literally how the boxes came
+  to differ: D-TACQ added the loop to 695 to force 3000 because its EEPROM said
+  1500, and 694 was left on the EEPROM's 1500.
+
+With no loop, a bad EEPROM shows up immediately as gain 1500 in
+`onbox_gain_config.py verify`. `/mnt/local/rc.user` on both boxes now carries a
+comment block explaining this. `set-device-gain.py` is still installed on both
+(it is a useful manual tool) — it is just not run at boot.
 
 Verified from the data afterwards: the gain-chain noise ratio on 694 moved
 14.5 → 26.7 while 695 stayed at 28.0, so **the two boxes now agree to 1.05×**.

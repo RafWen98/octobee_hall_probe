@@ -24,6 +24,7 @@ oversampled for the physics, and the raw route exists for when you really do
 need every sample.
 """
 
+import hashlib
 import json
 import os
 import time
@@ -43,6 +44,21 @@ def _stamp():
 def default_name(prefix, ext, directory="captures"):
     os.makedirs(directory, exist_ok=True)
     return os.path.join(directory, f"{prefix}_{_stamp()}.{ext}")
+
+
+def calibration_id(cal):
+    """
+    Twelve hex characters identifying the calibration that produced a file.
+
+    Covers every field that changes a converted number -- ranges, VCM, zero,
+    gain trim and the pose matrix -- and nothing that does not, so re-saving
+    calibration.json with a new comment does not invalidate old captures.
+    """
+    h = hashlib.sha256()
+    for part in (cal.ranges_mt, cal.zero_mt, cal.gain_corr, cal.matrix,
+                 np.array([float(cal.subtract_vcm)])):
+        h.update(np.ascontiguousarray(part, dtype=np.float64).tobytes())
+    return h.hexdigest()[:12]
 
 
 # --------------------------------------------------------------------------
@@ -83,6 +99,11 @@ class CsvRecorder:
                 "ranges_mt": self.cal.ranges_mt.tolist(),
                 "tare_applied": bool(np.any(self.cal.zero_mt)),
                 "gain_trim_applied": not bool(np.allclose(self.cal.gain_corr, 1.0)),
+                "pose_matrix_applied": bool(self.cal.has_matrix),
+                # A short digest of everything that affects the numbers below,
+                # so a CSV can be matched back to the calibration that made it
+                # even after calibration.json has moved on.
+                "calibration_id": calibration_id(self.cal),
                 "excluded": sorted(self.cal.dead)}
         info.update(meta)
         for k, v in info.items():

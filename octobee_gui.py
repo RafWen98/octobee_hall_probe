@@ -38,6 +38,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import octobee as ob
 import octobee_calibration as ocal
+import octobee_posecal as opc
 import octobee_record as orec
 import probe_geometry as pgeom
 from probe_view3d import ProbeView3D, color_for
@@ -54,6 +55,13 @@ STREAM_RATES = {"20 kSPS (link-safe)": 20000.0,
 # and its answer changes only when a connector does, so it runs on its own
 # slower clock over a short window. Left on the display clock over the full
 # history it starves the reader threads and the carriers' queues overflow.
+# Redraw rate for the live view. The acquisition tick is independent of this,
+# so turning it down costs you smoothness and nothing else -- no samples, no
+# recorded data. 10 Hz is already far beyond what a hand-passed magnet needs.
+VIEW_RATES = (2.0, 5.0, 10.0, 20.0)
+DEFAULT_VIEW_HZ = 10.0
+MAX_VIEW_INTERVAL_MS = 2000        # slowest the automatic backoff will go
+
 HEALTH_PERIOD_S = 2.0
 HEALTH_WINDOW_S = 1.0
 RAW_HISTORY_S = 5.0
@@ -709,13 +717,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.raw_hist_n = 0
         self.csv_rec = None
         self.raw_rec = None
-        self.collecting = None          # 'tare' | 'magnet' -> list of blocks
+        self.collecting = None          # 'tare' | 'magnet' | 'sweep'
+        self.sweeps = {}                # tag -> opc.RollSweep
+        self.pose_solution = None
         self.collect_target = 0
         self.magnet_peaks = None
         self.last_health = None
         self._last_table = None
         self._last_health_t = 0.0
         self._last_dropped = 0
+        self.paused = False
+        self._draw_ms = 0.0
         self._connect_worker = None
         self._snap_worker = None
 
@@ -724,12 +736,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._apply_dark()
 
+        # Three clocks, fastest first: acquisition must never be blocked by
+        # drawing, drawing should be smooth but is the user's to trade away,
+        # and the diagnostics are slow and expensive.
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.on_tick)
-        self.timer.start(60)
+        self.timer.start(50)
+        self.view_timer = QtCore.QTimer(self)
+        self.view_timer.timeout.connect(self.on_view_tick)
+        self.view_timer.start(int(1000 / DEFAULT_VIEW_HZ))
         self.slow = QtCore.QTimer(self)
         self.slow.timeout.connect(self.on_slow_tick)
-        self.slow.start(500)
+        self.slow.start(1000)
 
         if args.demo:
             self._set_source(DemoSource(self.geom), "demo")
@@ -839,6 +857,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_out.currentIndexChanged.connect(self.on_out_rate)
         tb.addWidget(self.cmb_out)
 
+        tb.addWidget(QtWidgets.QLabel("  refresh "))
+        self.cmb_view = QtWidgets.QComboBox()
+        for r in VIEW_RATES:
+            self.cmb_view.addItem(f"{r:g} Hz", r)
+        self.cmb_view.setCurrentIndex(list(VIEW_RATES).index(DEFAULT_VIEW_HZ))
+        self.cmb_view.setToolTip(
+            "How often the plot, the bars and the 3D head are redrawn. This is "
+            "purely cosmetic: acquisition, recording and the calibration all "
+            "run on their own clock, so turning it down costs smoothness and "
+            "nothing else. Drop it to 2 Hz if the window feels heavy.")
+        self.cmb_view.currentIndexChanged.connect(self.on_view_rate)
+        # 'activated' as well as 'currentIndexChanged': after an automatic
+        # backoff the combo still reads the rate you asked for, so re-picking
+        # that same entry is exactly how you would expect to restore it -- and
+        # currentIndexChanged stays silent when the index has not moved.
+        self.cmb_view.activated.connect(self.on_view_rate)
+        tb.addWidget(self.cmb_view)
+
+        self.act_pause = QtGui.QAction("Pause view", self)
+        self.act_pause.setCheckable(True)
+        self.act_pause.setToolTip(
+            "Stop redrawing entirely. Acquisition and recording carry on -- "
+            "use this while recording if you want every cycle going to the data.")
+        self.act_pause.toggled.connect(self.on_pause)
+        tb.addAction(self.act_pause)
+
         tb.addWidget(QtWidgets.QLabel("  window "))
         self.spin_window = QtWidgets.QDoubleSpinBox()
         self.spin_window.setRange(1.0, 120.0)
@@ -883,6 +927,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_fs.valueChanged.connect(
             lambda v: setattr(self.view3d, "full_scale_mt", v))
         l.addWidget(self.spin_fs)
+        self.chk_3d = QtWidgets.QCheckBox("3D")
+        self.chk_3d.setChecked(True)
+        self.chk_3d.setToolTip(
+            "Draw the probe head. This is the most expensive thing in the "
+            "window -- untick it if the display cannot keep up. Nothing else "
+            "changes: acquisition, calibration and recording are unaffected.")
+        self.chk_3d.toggled.connect(self.on_3d_toggle)
+        l.addWidget(self.chk_3d)
         chk_arrows = QtWidgets.QCheckBox("arrows")
         chk_arrows.setChecked(True)
         chk_arrows.toggled.connect(self.view3d.set_arrows_visible)
@@ -1003,24 +1055,99 @@ class MainWindow(QtWidgets.QMainWindow):
         f2.addWidget(btn_row, 3, 0, 1, 5)
         lay.addWidget(g2)
 
-        g3 = QtWidgets.QGroupBox("3. Calibration file and geometry")
-        f3 = QtWidgets.QHBoxLayout(g3)
+
+        g3 = QtWidgets.QGroupBox(
+            "3. Earth-field roll calibration — match the sensors to each other")
+        f3 = QtWidgets.QGridLayout(g3)
+        blurb = QtWidgets.QLabel(
+            "The Earth's field is uniform to nanotesla across the whole head, so "
+            "every sensor must read the SAME vector. That removes the 1/r³ "
+            "position error the magnet pass above cannot escape.\n"
+            "Roll the tube steadily in its cradle through ≥2 turns per sweep.  "
+            "A: as mounted.  B: lifted out and replaced end-for-end (separates "
+            "offset from axial response).  C: cradle turned to another azimuth "
+            "(pins transverse-vs-axial — the flip alone cannot).")
+        blurb.setWordWrap(True)
+        f3.addWidget(blurb, 0, 0, 1, 6)
+
+        self.spin_sweep_s = QtWidgets.QDoubleSpinBox()
+        self.spin_sweep_s.setRange(5.0, 300.0)
+        self.spin_sweep_s.setValue(60.0)
+        self.spin_sweep_s.setSuffix(" s")
+        f3.addWidget(QtWidgets.QLabel("sweep length"), 1, 0)
+        f3.addWidget(self.spin_sweep_s, 1, 1)
+        col = 2
+        for tag, tip in (("A", "as mounted"),
+                         ("B", "tube lifted out and replaced end-for-end"),
+                         ("C", "cradle turned to another azimuth")):
+            b = QtWidgets.QPushButton(f"Record sweep {tag}")
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _, t=tag: self.start_sweep(
+                t, self.spin_sweep_s.value()))
+            f3.addWidget(b, 1, col)
+            col += 1
+
+        self.lbl_sweeps = QtWidgets.QLabel("no sweeps recorded")
+        f3.addWidget(self.lbl_sweeps, 2, 0, 1, 6)
+
+        self.spin_bearth = QtWidgets.QDoubleSpinBox()
+        self.spin_bearth.setRange(20.0, 70.0)
+        self.spin_bearth.setValue(opc.DEFAULT_B_EARTH_UT)
+        self.spin_bearth.setSuffix(" uT")
+        self.spin_bearth.setDecimals(2)
+        self.spin_bearth.setToolTip(
+            "Total field at your location, from ngdc.noaa.gov/geomag or BGS. "
+            "This sets ABSOLUTE scale only — matching, offsets and "
+            "orientation are all solved without it.")
+        f3.addWidget(QtWidgets.QLabel("|B| here"), 3, 0)
+        f3.addWidget(self.spin_bearth, 3, 1)
+        self.chk_isotropic = QtWidgets.QCheckBox("assume the average chip is isotropic")
+        self.chk_isotropic.setToolTip(
+            "Only used when no second azimuth was recorded. Fixes the "
+            "transverse-vs-axial gauge by assuming the median chip has equal "
+            "sensitivity on all three axes. Fair for a monolithic part, but an "
+            "assumption — record sweep C to measure it instead.")
+        f3.addWidget(self.chk_isotropic, 3, 2, 1, 3)
+
+        self.btn_solve_roll = QtWidgets.QPushButton("Solve")
+        self.btn_solve_roll.setEnabled(False)
+        self.btn_solve_roll.clicked.connect(self.on_solve_roll)
+        self.btn_apply_roll = QtWidgets.QPushButton("Apply to calibration")
+        self.btn_apply_roll.setEnabled(False)
+        self.btn_apply_roll.clicked.connect(self.on_apply_roll)
+        row = QtWidgets.QWidget()
+        rl = QtWidgets.QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(self.btn_solve_roll)
+        rl.addWidget(self.btn_apply_roll)
+        for text, slot in (("Clear sweeps", self.on_clear_sweeps),
+                           ("Save sweeps", self.on_save_sweeps),
+                           ("Load sweeps", self.on_load_sweeps)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(slot)
+            rl.addWidget(b)
+        rl.addStretch(1)
+        f3.addWidget(row, 4, 0, 1, 6)
+        lay.addWidget(g3)
+
+        g4 = QtWidgets.QGroupBox("4. Calibration file and geometry")
+        f4 = QtWidgets.QHBoxLayout(g4)
         for text, slot in (("Save calibration", self.on_save_cal),
                            ("Load calibration", self.on_load_cal),
                            ("Edit geometry", self.on_edit_geometry),
                            ("Reload geometry", self.on_reload_geometry)):
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(slot)
-            f3.addWidget(b)
+            f4.addWidget(b)
         self.chk_vcm = QtWidgets.QCheckBox("subtract VCM")
         self.chk_vcm.setChecked(self.cal.subtract_vcm)
         self.chk_vcm.setToolTip(
             "Each chip's own virtual ground. The 16 differ by up to ~90 mV, "
             "which is ~1.4 mT of fake field at the 20 mT range. Leave this on.")
         self.chk_vcm.toggled.connect(self.on_vcm_toggle)
-        f3.addWidget(self.chk_vcm)
-        f3.addStretch(1)
-        lay.addWidget(g3)
+        f4.addWidget(self.chk_vcm)
+        f4.addStretch(1)
+        lay.addWidget(g4)
 
         self.cal_report = QtWidgets.QPlainTextEdit()
         self.cal_report.setReadOnly(True)
@@ -1253,16 +1380,60 @@ class MainWindow(QtWidgets.QMainWindow):
             self.csv_rec.write(bd)
 
         if self.collecting is not None:
-            self._collect_block(b)
+            self._collect_block(b, grouped)
 
+    # Drawing is deliberately NOT done here. This tick has to keep draining the
+    # reader queues or the carriers overrun and the recording gets holes in it,
+    # and repainting a 3D scene of 16 boards costs far more than the arithmetic
+    # above. Everything visual runs on its own timer.
+
+    def on_view_tick(self):
+        """Redraw the live view. Its rate is the user's to choose."""
+        if self.source is None or self.paused:
+            return
         recent = self.roll.view()
-        if recent.shape[0]:
+        if recent.shape[0] < 2:
+            return
+        t0 = time.perf_counter()
+        if self.chk_3d.isChecked():
             k = min(8, recent.shape[0])
             fs = self.view3d.update_fields(recent[-k:].mean(axis=0))
-            if self.chk_auto.isChecked():
+            if self.chk_auto.isChecked() and abs(fs - self.spin_fs.value()) > 1e-4:
                 self.spin_fs.blockSignals(True)
                 self.spin_fs.setValue(max(fs, 0.001))
                 self.spin_fs.blockSignals(False)
+        self.plot.update_data(recent, self.out_rate)
+        # Peak over a trailing half second, not the instantaneous value: a magnet
+        # passed by hand is over well inside one refresh, so sampling one point
+        # would miss most passes.
+        n = max(2, min(recent.shape[0], int(self.out_rate * self.bars.window_s)))
+        self.bars.update_values(
+            np.linalg.norm(recent[-n:], axis=-1).max(axis=0), self.cal.dead)
+        self._note_draw_time((time.perf_counter() - t0) * 1000.0)
+
+    def _note_draw_time(self, ms):
+        """
+        Watch how long a redraw costs and back off if it cannot keep up.
+
+        A machine without working GPU acceleration falls back to software
+        OpenGL, where painting the 3D head can take seconds. The symptom is a
+        window that seems fine until data starts arriving and then locks solid.
+        Rather than leave that to be diagnosed by hand, measure it and slow the
+        redraw down -- acquisition and recording are on another clock and are
+        not affected either way.
+        """
+        self._draw_ms = 0.75 * self._draw_ms + 0.25 * ms if self._draw_ms else ms
+        interval = self.view_timer.interval()
+        if self._draw_ms > 0.7 * interval and interval < MAX_VIEW_INTERVAL_MS:
+            new = min(MAX_VIEW_INTERVAL_MS, interval * 2)
+            self.view_timer.setInterval(new)
+            self.log.log(
+                f"a redraw is taking {self._draw_ms:.0f} ms, more than the "
+                f"{interval} ms budget -- slowing the view to "
+                f"{1000.0/new:.1f} Hz. Acquisition and recording are unaffected. "
+                f"If this keeps happening, untick '3D': on a machine without "
+                f"GPU acceleration the 3D head is by far the most expensive "
+                f"thing on screen.")
 
     def _keep_raw(self, blocks):
         """Keep the last few seconds of raw counts for the health analysis."""
@@ -1347,13 +1518,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.plot.set_dead(self.cal.dead)
         self.view3d.set_dead(self.cal.dead)
-        self.plot.update_data(recent, self.out_rate)
-        # Peak over a trailing half second, not the instantaneous value: a magnet
-        # passed by hand is over well inside one refresh, so sampling one point
-        # would miss most passes.
-        k = max(2, min(recent.shape[0], int(self.out_rate * self.bars.window_s)))
-        self.bars.update_values(
-            np.linalg.norm(recent[-k:], axis=-1).max(axis=0), self.cal.dead)
 
         # A dropped block is a hole in whatever is being recorded, so say so
         # rather than leaving it as a number in the corner of the status bar.
@@ -1365,7 +1529,14 @@ class MainWindow(QtWidgets.QMainWindow):
                              f"there. Lower the output rate or the stream rate.")
             self._last_dropped = dropped
 
-        st = self.source.stats()
+        st = dict(self.source.stats())
+        if self._draw_ms:
+            st["draw ms"] = round(self._draw_ms, 1)
+        eff = 1000.0 / max(self.view_timer.interval(), 1)
+        want = float(self.cmb_view.currentData())
+        # Show the rate actually being achieved, marked when the automatic
+        # backoff has taken it below what was asked for.
+        st["view Hz"] = f"{eff:.1f}" + (" (auto)" if eff < want * 0.95 else "")
         self.lbl_rate.setText("  |  ".join(
             f"{k} {v:.2f}" if isinstance(v, float) else f"{k} {v}"
             for k, v in st.items()))
@@ -1381,7 +1552,7 @@ class MainWindow(QtWidgets.QMainWindow):
                            "peak": None}
         self.log.log(f"collecting {seconds:g} s for {what}...")
 
-    def _collect_block(self, b):
+    def _collect_block(self, b, grouped=None):
         c = self.collecting
         if c["what"] == "magnet":
             # Deviation from the field that was there when the pass STARTED.
@@ -1392,6 +1563,26 @@ class MainWindow(QtWidgets.QMainWindow):
             c["peak"] = best if c["peak"] is None else np.maximum(c["peak"], best)
             c["n"] += b.shape[0]
             return
+        if c["what"] == "sweep":
+            # A sweep has to be solved from UNCORRECTED field, or the solver
+            # would be fitting on top of whatever trim happens to be loaded and
+            # the answer would depend on where you started. Decimate hard while
+            # we are at it: the information is in the shape of the ellipse, and
+            # a couple of hundred hertz resolves a hand roll a thousand times
+            # over.
+            if grouped is None:
+                return
+            raw = self.cal.to_mt(grouped, apply_zero=False, apply_gain=False,
+                                 apply_matrix=False)
+            c["blocks"].append(ocal.decimate(raw, max(1, c["decim"])))
+            c["n"] += b.shape[0]
+            if c["n"] >= c["need"]:
+                data = np.concatenate(c["blocks"], axis=0)
+                tag = c["tag"]
+                self.collecting = None
+                self._finish_sweep(data, tag)
+            return
+
         c["blocks"].append(ocal.decimate(b, max(1, self.decim)))
         c["n"] += b.shape[0]
         if c["n"] >= c["need"]:
@@ -1408,6 +1599,142 @@ class MainWindow(QtWidgets.QMainWindow):
                      f"(S{int(np.argmax(np.abs(z).max(axis=1)))+1})")
         self._calibration_changed("the zero point")
         self.refresh_cal_report()
+
+
+    # ---- Earth-field roll calibration ------------------------------------
+    def start_sweep(self, tag, seconds):
+        """Record one hand-rolled sweep in the mounting orientation `tag`."""
+        if self.source is None:
+            self.log.log("not connected")
+            return
+        fs = self.source.fs_hz
+        self.collecting = {"what": "sweep", "tag": tag, "blocks": [], "n": 0,
+                           "need": int(seconds * fs), "peak": None,
+                           # aim for a few hundred Hz, whatever the ADC is at
+                           "decim": max(1, int(fs / 200))}
+        self.log.log(f"rolling sweep {tag}: roll the tube steadily through at "
+                     f"least two full turns over the next {seconds:g} s")
+
+    def _finish_sweep(self, data, tag):
+        sw = opc.RollSweep(data, tag=tag,
+                           ranges_mt=self.cal.ranges_mt.copy(),
+                           temps_c=self._last_temps())
+        self.sweeps[tag] = sw
+        amp = sw.amplitudes()
+        quiet = [f"S{i+1}" for i in range(N_SENSORS)
+                 if amp[i] < opc.MIN_SEED_AMPLITUDE_MT
+                 and not self.cal.is_dead(i + 1)]
+        self.log.log(f"sweep {tag}: {len(sw)} points, median transverse swing "
+                     f"{np.median(amp)*1e3:.2f} uT"
+                     + (f"; SAW ALMOST NOTHING: {', '.join(quiet)}" if quiet else ""))
+        self._refresh_sweep_label()
+
+    def _last_temps(self):
+        t = getattr(self, "last_temps_c", None)
+        return None if t is None else np.asarray(t, float)
+
+    def _refresh_sweep_label(self):
+        if not self.sweeps:
+            self.lbl_sweeps.setText("no sweeps recorded")
+            self.btn_solve_roll.setEnabled(False)
+            return
+        bits = [f"{t} ({len(s)} pts)" for t, s in sorted(self.sweeps.items())]
+        self.lbl_sweeps.setText("recorded: " + ", ".join(bits))
+        self.btn_solve_roll.setEnabled(True)
+
+    def on_clear_sweeps(self):
+        self.sweeps.clear()
+        self.pose_solution = None
+        self.btn_apply_roll.setEnabled(False)
+        self._refresh_sweep_label()
+        self.log.log("roll sweeps cleared")
+
+    def on_solve_roll(self):
+        if not self.sweeps:
+            return
+        try:
+            sol = opc.solve_roll(list(self.sweeps.values()), self.geom,
+                                 self.spin_bearth.value(),
+                                 dead=sorted(self.cal.dead),
+                                 anisotropy=("assume_isotropic"
+                                             if self.chk_isotropic.isChecked()
+                                             else "solve"))
+        except (ValueError, np.linalg.LinAlgError) as e:
+            self.log.log(f"roll solve failed: {e}")
+            QtWidgets.QMessageBox.warning(self, "Roll solve", str(e))
+            return
+        self.pose_solution = sol
+        ids = opc.identify_faces(sol, self.geom)
+        text = [sol.report(dead=self.cal.dead), ""]
+        text.append("face mapping: " + ("agrees with probe_geometry.json"
+                                        if ids["agrees"] else
+                                        "DISAGREES at " + ", ".join(ids["mismatch"])))
+        text.append(f"ambient uniformity: {opc.ambient_uniformity(sol)*100:.3f} "
+                    "% of |B|  (a dirty spot shows up here, not in the residual)")
+        self.cal_report.setPlainText("\n".join(text))
+        self.btn_apply_roll.setEnabled(True)
+        self.log.log("roll solve done; review the report before applying")
+
+    def on_apply_roll(self):
+        if self.pose_solution is None:
+            return
+        sol = self.pose_solution
+        warn = []
+        if not sol.identified[:, 2].all():
+            warn.append("The axial column (chip +Y on every sensor here) was "
+                        "NOT identified by the data and will be taken from the "
+                        "nominal geometry.")
+        if not sol.anisotropy_identified:
+            warn.append("Transverse-vs-axial sensitivity was not pinned. "
+                        "Inter-sensor matching is still valid; the absolute "
+                        "axial ratio is not.")
+        if sol.offset_leverage < 0.6:
+            warn.append("The axial field barely changed between orientations, "
+                        "so offsets and axial response are poorly separated.")
+        if warn:
+            r = QtWidgets.QMessageBox.question(
+                self, "Apply roll calibration",
+                "\n\n".join(warn) + "\n\nApply anyway?",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No)
+            if r != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        try:
+            self.cal.apply_pose_solution(sol)
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "Apply roll calibration", str(e))
+            return
+        g = sol.gains()
+        self.log.log("roll calibration applied: matrix + offsets installed, "
+                     f"magnet gain trim cleared; gain spread was "
+                     f"{(np.nanmax(g)-np.nanmin(g))*100:.2f} %")
+        self.chk_vcm.setChecked(self.cal.subtract_vcm)
+        self._calibration_changed("the roll calibration")
+        self.refresh_cal_report()
+
+    def on_save_sweeps(self):
+        if not self.sweeps:
+            return
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Save roll sweeps into", "captures")
+        if not d:
+            return
+        for tag, sw in sorted(self.sweeps.items()):
+            path = sw.save(os.path.join(d, f"rollsweep_{tag}"))
+            self.log.log(f"wrote {path}")
+
+    def on_load_sweeps(self):
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Load roll sweeps", "captures", "Roll sweeps (*.npz)")
+        for f in files:
+            try:
+                sw = opc.RollSweep.load(f)
+            except (OSError, ValueError, KeyError) as e:
+                self.log.log(f"could not load {f}: {e}")
+                continue
+            self.sweeps[sw.tag] = sw
+            self.log.log(f"loaded sweep {sw.tag} from {os.path.basename(f)}")
+        self._refresh_sweep_label()
 
     def on_clear_tare(self):
         self.cal.clear_tare()
@@ -1767,6 +2094,24 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.blockSignals(False)
         self.on_sensor_toggle()
 
+    def on_3d_toggle(self, on):
+        self.view3d.setVisible(bool(on))
+        self._draw_ms = 0.0
+        self.log.log("3D head on" if on else
+                     "3D head off -- everything else carries on unchanged")
+
+    def on_view_rate(self):
+        hz = float(self.cmb_view.currentData())
+        self.view_timer.setInterval(int(1000 / hz))
+        self._draw_ms = 0.0
+        self.log.log(f"view redraw rate {hz:g} Hz "
+                     f"(acquisition and recording are unaffected)")
+
+    def on_pause(self, on):
+        self.paused = bool(on)
+        self.log.log("view paused -- acquisition and recording continue"
+                     if on else "view resumed")
+
     def on_out_rate(self):
         self.out_rate = float(self.cmb_out.currentData())
         self.roll.resize(max(4, int(self.out_rate * self.window_s)))
@@ -1825,6 +2170,7 @@ def main():
                 win.on_tick()
                 app.processEvents()
                 time.sleep(0.02)
+            win.on_view_tick()
             win.on_slow_tick()
             app.processEvents()
             time.sleep(0.2)

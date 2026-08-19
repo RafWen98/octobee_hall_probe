@@ -105,28 +105,61 @@ class Calibration:
                          Per-sensor, not global, because the chips' gain
                          registers have not been audited and may well differ --
                          that is the leading suspect for unequal spike heights.
-    zero_mt     (16, 3)  ambient offset removed after conversion (the tare).
+    zero_mt     (16, 3)  the sensor's own offset, removed BEFORE any gain is
+                         applied, because an offset is a property of the raw
+                         signal chain and not of the corrected field.
     gain_corr   (16, 3)  dimensionless residual gain trim, 1.0 = untouched.
+                         Diagonal, so it can only rescale axes -- it cannot
+                         express non-orthogonality. That is what `matrix` is for.
+    matrix      (16,3,3) full chip-frame response correction from a pose solve
+                         (octobee_posecal). Identity = untouched. Applied last,
+                         still in the CHIP frame: rotating into the tube frame
+                         remains probe_geometry's job, so nothing downstream has
+                         to change its idea of what frame it is holding.
     dead        set      "S16" or "S16.Bx" entries excluded from summaries.
+
+    A note on ordering, because it changed. Up to v1 the tare was subtracted
+    *after* the gain trim, which is wrong the moment the trim is not 1.0: it
+    makes the stored zero depend on the gain. v2 subtracts first. Files without
+    a "version" key are migrated on load (zero_mt /= gain_corr), which is an
+    exact identity, so old captures still reproduce bit for bit.
     """
 
+    VERSION = 2
+
     def __init__(self, ranges_mt=None, zero_mt=None, gain_corr=None,
-                 subtract_vcm=True, dead=None, notes=""):
+                 subtract_vcm=True, dead=None, notes="", matrix=None,
+                 version=None):
         self.ranges_mt = (np.full(N_SENSORS, 20.0) if ranges_mt is None
                           else np.asarray(ranges_mt, float).reshape(N_SENSORS))
         self.zero_mt = (np.zeros((N_SENSORS, 3)) if zero_mt is None
                         else np.asarray(zero_mt, float).reshape(N_SENSORS, 3))
         self.gain_corr = (np.ones((N_SENSORS, 3)) if gain_corr is None
                           else np.asarray(gain_corr, float).reshape(N_SENSORS, 3))
+        self.matrix = (np.tile(np.eye(3), (N_SENSORS, 1, 1)) if matrix is None
+                       else np.asarray(matrix, float).reshape(N_SENSORS, 3, 3))
         self.subtract_vcm = bool(subtract_vcm)
         self.dead = set(dead or ())
         self.notes = notes
 
+        if version is None and np.any(self.zero_mt):
+            # A v1 file: its zero was stored post-gain. Convert it so the new
+            # pre-gain ordering gives numerically identical output.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                z = self.zero_mt / self.gain_corr
+            self.zero_mt = np.where(np.isfinite(z), z, self.zero_mt)
+
+    @property
+    def has_matrix(self):
+        return not np.allclose(self.matrix, np.eye(3))
+
     # ---- persistence ----------------------------------------------------
     def to_dict(self):
-        return {"ranges_mt": self.ranges_mt.tolist(),
+        return {"version": self.VERSION,
+                "ranges_mt": self.ranges_mt.tolist(),
                 "zero_mt": self.zero_mt.tolist(),
                 "gain_corr": self.gain_corr.tolist(),
+                "matrix": self.matrix.tolist(),
                 "subtract_vcm": self.subtract_vcm,
                 "dead": sorted(self.dead),
                 "notes": self.notes}
@@ -156,20 +189,27 @@ class Calibration:
         """(16,) sensitivity, from each sensor's own configured range."""
         return np.array([ob.RANGE_TO_VPT[float(r)] for r in self.ranges_mt])
 
-    def to_mt(self, grouped_volts, apply_zero=True, apply_gain=True):
+    def to_mt(self, grouped_volts, apply_zero=True, apply_gain=True,
+              apply_matrix=True):
         """
         (n, 16, 4) volts from assemble() -> (n, 16, 3) millitesla, chip frame,
         axis order Bx, By, Bz.
+
+        Order is offset, then gain, then the full matrix. Passing all three
+        apply_* False gives the raw nominal conversion, which is exactly what
+        octobee_posecal wants to solve against.
         """
         v = np.asarray(grouped_volts, float)
         field = v[..., :3]
         if self.subtract_vcm:
             field = field - v[..., 3:4]
         b = field / self.volts_per_tesla[None, :, None] * 1e3      # V -> mT
-        if apply_gain:
-            b = b * self.gain_corr[None, :, :]
         if apply_zero:
             b = b - self.zero_mt[None, :, :]
+        if apply_gain:
+            b = b * self.gain_corr[None, :, :]
+        if apply_matrix and self.has_matrix:
+            b = np.einsum("sij,...sj->...si", self.matrix, b)
         return b
 
     def convert(self, ai_by_box, vpc_by_box, apply_zero=True, apply_gain=True):
@@ -208,7 +248,13 @@ class Calibration:
         w = np.ones(N_SENSORS) if weights is None else np.asarray(weights, float)
         corrected = p / np.where(w > 0, w, np.nan)
         if min_response is None:
-            min_response = 0.02 * np.nanmax(corrected)
+            # Gate against the TYPICAL sensor, not the loudest one. Keying this
+            # off the maximum looks reasonable until a real pass on this probe,
+            # where the pinwheel geometry alone spreads the response by two
+            # orders of magnitude: the quietest sensors then fall under a
+            # fraction-of-max threshold and get silently skipped, so the trim
+            # only does half its job while still reporting success.
+            min_response = 0.02 * np.nanmedian(corrected)
         ok = np.isfinite(corrected) & (corrected > min_response)
         skipped = [f"S{i+1}" for i in range(N_SENSORS) if not ok[i]]
         if ok.sum() < 2:
@@ -221,6 +267,43 @@ class Calibration:
 
     def clear_gain(self):
         self.gain_corr = np.ones((N_SENSORS, 3))
+
+    def clear_matrix(self):
+        self.matrix = np.tile(np.eye(3), (N_SENSORS, 1, 1))
+
+    def apply_pose_solution(self, solution, clear_gain=True):
+        """
+        Fold an octobee_posecal.PoseSolution into this calibration.
+
+        The solution's symmetric part becomes `matrix` (gain and
+        non-orthogonality, chip frame) and its offset becomes `zero_mt`. Its
+        rotational part is deliberately NOT taken here -- that is geometry, and
+        it belongs in probe_geometry.json where the 3D view and the tube-frame
+        export can see it. Use octobee_posecal.identify_faces() for that.
+
+        clear_gain resets the magnet-derived diagonal trim, and defaults True
+        on purpose: the pose solve measures the same quantity by a better
+        route, so leaving the old trim in place would count it twice.
+
+        Refuses to apply a solution taken at different ranges, because the
+        EEPROM holds a separate factory dataset per gain.
+        """
+        if (solution.ranges_mt is not None
+                and not np.allclose(solution.ranges_mt, self.ranges_mt)):
+            raise ValueError(
+                f"solution was solved at ranges {solution.ranges_mt.tolist()} "
+                f"but this calibration is set to {self.ranges_mt.tolist()}")
+        _, S = solution.decompose()
+        self.matrix = np.asarray(S, float).reshape(N_SENSORS, 3, 3)
+        self.zero_mt = np.asarray(solution.b, float).reshape(N_SENSORS, 3)
+        if clear_gain:
+            self.clear_gain()
+        if not solution.identified[:, 2].all():
+            self.notes = (self.notes + " WARNING: solved from a single roll "
+                          "direction, so the axial column (chip +Y on this "
+                          "probe) came from nominal geometry, not from data. "
+                          "Record an end-for-end reversed sweep to fix it.").strip()
+        return self.matrix
 
     def is_dead(self, sensor_id, axis=None):
         if f"S{sensor_id}" in self.dead:
@@ -241,8 +324,9 @@ class Calibration:
                       f"except {odd}")
         lines = [f"VCM subtraction: {'on' if self.subtract_vcm else 'OFF'}",
                  ranges,
-                 f"tare: {'set' if np.any(self.zero_mt) else 'not set'}",
-                 f"gain trim: {'applied' if not np.allclose(self.gain_corr, 1) else 'none'}"]
+                 f"zero: {'set' if np.any(self.zero_mt) else 'not set'}",
+                 f"gain trim: {'applied' if not np.allclose(self.gain_corr, 1) else 'none'}",
+                 f"pose matrix: {'applied' if self.has_matrix else 'none'}"]
         if self.dead:
             lines.append(f"excluded: {', '.join(sorted(self.dead))}")
         return "\n".join(lines)

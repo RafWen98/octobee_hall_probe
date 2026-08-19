@@ -2,8 +2,9 @@
 """
 probe_view3d.py -- the little 3D model of the probe head.
 
-Draws the square tube with all 16 chips on it and, on each chip, the field
-vector it is currently reporting. The point is not decoration: this probe is the
+Draws the square tube, the 16 eval-kit boards lying flat on its faces and
+reaching out tangentially, and on each chip the field vector it is currently
+reporting. The point is not decoration: this probe is the
 one case where a plot of 48 traces genuinely hides what is going on, because
 every chip is turned a different way. Once each chip's vector is rotated into
 the tube frame and drawn where the chip physically sits, a magnet passing the
@@ -79,6 +80,7 @@ class ProbeView3D(gl.GLViewWidget):
         self.show_labels = True
         self.show_arrows = True
         self.dead = set()
+        self._hot = -1
         self._items = []
         self.setBackgroundColor(pg.mkColor(18, 20, 26))
         self.rebuild()
@@ -127,7 +129,7 @@ class ProbeView3D(gl.GLViewWidget):
             self._register(tip)
             self.tips.append(tip)
 
-            p = g.position(sid) + g.normal(sid) * 8.0
+            p = g.position(sid) + g.arm_dir(sid) * 7.0
             txt = gl.GLTextItem(pos=p, text=f"S{sid}",
                                 color=(210, 215, 225, 255))
             self._register(txt)
@@ -242,14 +244,23 @@ class ProbeView3D(gl.GLViewWidget):
             self.tips[i].setData(pos=p1[None, :], color=col, size=9.0)
 
         if self.show_labels:
+            # Only touch the text when the marker actually moves. GLTextItem
+            # repaints through QPainter, so re-setting all 16 every frame was
+            # costing more than the entire rest of the scene.
             hot = int(np.argmax(np.where(live, mag, -np.inf))) if live.any() else -1
-            for i, txt in enumerate(self.labels):
-                mark = " <" if i == hot and mag[i] > 0 else ""
-                txt.setData(text=f"S{i+1}{mark}")
+            if mag[hot] <= 0:
+                hot = -1
+            if hot != self._hot:
+                for i in (self._hot, hot):
+                    if 0 <= i < len(self.labels):
+                        self.labels[i].setData(
+                            text=f"S{i+1}{' <' if i == hot else ''}")
+                self._hot = hot
         return fs
 
     def set_labels_visible(self, on):
         self.show_labels = bool(on)
+        self._hot = -1
         for i, txt in enumerate(self.labels):
             txt.setData(text=f"S{i+1}" if on else "")
 
