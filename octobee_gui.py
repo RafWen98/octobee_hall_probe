@@ -67,7 +67,23 @@ HEALTH_PERIOD_S = 2.0
 HEALTH_WINDOW_S = 1.0
 RAW_HISTORY_S = 5.0
 
-pg.setConfigOptions(antialias=True, background=(18, 20, 26), foreground=(210, 214, 222))
+# Antialiasing off, and every plot pen exactly 1 pixel wide. This is not a
+# cosmetic preference, it is the difference between a usable application and an
+# unusable one. Qt strokes a cosmetic pen of non-integer width through a
+# completely different and vastly slower path: measured on a 20 s window of 15
+# traces, a single repaint took 39 SECONDS at width 1.6 with antialiasing, and
+# 74 ms at width 1. Turning antialiasing off as well brings it to 45 ms. The
+# symptom is a live plot that appears to hang the moment real data arrives,
+# with the cost invisible to any timing of our own code because it happens
+# inside Qt's paint.
+PLOT_PEN_WIDTH = 1
+# Points handed to each curve, as a multiple of the plot's width in pixels.
+# 0.5 gives one min/max pair per ~4 pixels, which still renders a hand-passed
+# magnet spike over many bins while costing a third of what 1.0 does. Raise it
+# if you need finer structure on screen and can afford the repaint.
+PLOT_TARGET_MULT = 0.5
+pg.setConfigOptions(antialias=False, background=(18, 20, 26),
+                    foreground=(210, 214, 222))
 
 
 class ProfiledPlot(pg.PlotWidget):
@@ -503,6 +519,8 @@ class LivePlot(QtWidgets.QWidget):
 
     def __init__(self, geom, profiler=None):
         super().__init__()
+        self.profiler = profiler or oprof.Profiler(enabled=False)
+        self.target_mult = PLOT_TARGET_MULT
         self.geom = geom
         self.mode = self.MODES[0]
         self.visible = set(range(N_SENSORS))
@@ -519,16 +537,17 @@ class LivePlot(QtWidgets.QWidget):
 
         self.mag_curves, self.axis_curves = [], []
         for s in range(N_SENSORS):
-            c = self.plot.plot(pen=pg.mkPen(self.colors[s], width=1.6),
-                               name=f"S{s+1}")
+            c = self.plot.plot(
+                pen=pg.mkPen(self.colors[s], width=PLOT_PEN_WIDTH),
+                name=f"S{s+1}")
             self._thin(c)
             self.mag_curves.append(c)
             row = []
             for a, style in enumerate((QtCore.Qt.PenStyle.SolidLine,
                                        QtCore.Qt.PenStyle.DashLine,
                                        QtCore.Qt.PenStyle.DotLine)):
-                cc = self.plot.plot(
-                    pen=pg.mkPen(self.colors[s], width=1.1, style=style))
+                cc = self.plot.plot(pen=pg.mkPen(
+                    self.colors[s], width=PLOT_PEN_WIDTH, style=style))
                 self._thin(cc)
                 row.append(cc)
             self.axis_curves.append(row)
@@ -591,21 +610,60 @@ class LivePlot(QtWidgets.QWidget):
                 if part is not None:
                     part.setVisible(on)
 
+    @staticmethod
+    def _to_screen(t, Y, target):
+        """
+        Reduce (n, ncurves) to about `target` points while keeping the extremes.
+
+        Each output bin contributes its minimum and its maximum, so a magnet
+        spike one sample wide still reaches full height -- which a plain stride
+        would throw away. Sharing one x array across all curves keeps this fully
+        vectorised, at the cost of placing each pair at the bin edges rather
+        than at the exact sample; one bin is about one pixel, so that is not
+        visible.
+
+        Doing this ourselves rather than leaving it to the plotting library
+        makes the repaint cost depend on the width of the window in pixels
+        instead of on the length of the buffer, so a longer time window or a
+        higher output rate no longer costs anything to draw.
+        """
+        n = Y.shape[0]
+        if n <= target:
+            return t, Y
+        bins = max(2, target // 2)
+        k = n // bins
+        m = bins * k
+        Yb = Y[:m].reshape(bins, k, Y.shape[1])
+        out = np.empty((bins * 2, Y.shape[1]), dtype=Y.dtype)
+        out[0::2] = Yb.min(axis=1)
+        out[1::2] = Yb.max(axis=1)
+        tb = t[:m:k]
+        x = np.repeat(tb, 2)
+        x[1::2] = tb + (t[-1] - t[0]) / bins * 0.5
+        return x, out
+
     def update_data(self, b_mt, fs_out):
         n = b_mt.shape[0]
         if n < 2:
             return
         t = (np.arange(n) - n) / fs_out
         shown = self.visible - self.dead
+        self.profiler.note("curves drawn", len(shown) * (1 if self.mode ==
+                                                         self.MODES[0] else 3))
+        self.profiler.note("points buffered", n)
+        target = max(256, int(self.plot.width() * self.target_mult))
         if self.mode == self.MODES[0]:
             mag = np.linalg.norm(b_mt, axis=-1)
+            x, y = self._to_screen(t, mag, target)
             for s in shown:
-                self.mag_curves[s].setData(t, mag[:, s])
+                self.mag_curves[s].setData(x, y[:, s])
         else:
             b = self.geom.to_tube_frame(b_mt) if "tube" in self.mode else b_mt
+            x, y = self._to_screen(t, b.reshape(n, -1), target)
             for s in shown:
                 for a in range(3):
-                    self.axis_curves[s][a].setData(t, b[:, s, a])
+                    self.axis_curves[s][a].setData(x, y[:, s * 3 + a])
+        self.profiler.note("points drawn per curve", len(x))
 
 
 class SensorBars(QtWidgets.QWidget):

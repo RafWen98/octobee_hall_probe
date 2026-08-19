@@ -832,7 +832,34 @@ How to read it:
 | reader queue growing | acquisition is falling behind; recordings will have holes |
 | lag large, every row small | something outside this list is blocking |
 
-Two findings from building it, both now fixed, both worth knowing about:
+#### The one that mattered
+
+A live plot repaint was taking **4.6 seconds** on the bench PC and 39 seconds on
+the slower machine here, while the code asking for it took 5 ms. It was not the
+volume of data. Reproduced and bisected:
+
+| setting | ms per repaint |
+|---|---|
+| pen width **1.6**, antialiasing on | **39 172** |
+| pen width **1** | **74** |
+| + antialiasing off | 45 |
+| + decimate to the screen | 22 |
+
+Qt strokes a cosmetic pen of non-integer width through a completely different
+and vastly slower path. Same data, same point count, 500x. So the live plot now
+uses integer pen widths, antialiasing off, and hands each curve about one
+min/max pair per four pixels instead of the whole buffer -- which makes the
+repaint cost depend on the width of the window in pixels rather than on the
+length of the buffer or the output rate.
+
+Note the decimation keeps each bin's minimum AND maximum rather than taking
+every Nth sample. A plain stride is cheaper still, but it drops a magnet spike
+that happens to fall between the samples it keeps; min/max renders that spike
+at full height. The same reasoning applies upstream: the 20 kSPS stream is
+block-*averaged* down to the output rate, not strided, because averaging also
+suppresses noise instead of aliasing it.
+
+Two more findings, both now fixed:
 
 - pyqtgraph's downsampling has to be set **on the curves**, not just on the
   plot. Without it Qt was rasterising 16 traces x 10 000 points on every

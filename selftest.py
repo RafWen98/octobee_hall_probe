@@ -264,6 +264,65 @@ def test_posecal():
         check("the report calls the dead sensor out",
               "NO RESPONSE" in dsol.report())
 
+    # ---- S16's ACTUAL fault, not a convenient version of it --------------
+    # ch29/30/32 (Bz, By, VCM) pinned at negative full scale while ch31 (Bx)
+    # reads normally. This is nastier than a sensor that saw nothing: the railed
+    # channels are CONSTANT, so the model fits them perfectly with a big offset.
+    # The residual comes back indistinguishable from a healthy sensor and the
+    # condition number stays near 1e4, so neither residual nor conditioning can
+    # see it. Only the solved gain gives it away.
+    cal20 = ocal.Calibration(ranges_mt=np.full(n_sens, 20.0))
+    vpc = 20.0 / 65536
+    rng16 = np.random.default_rng(17)
+    g16 = 1.0 + rng16.normal(0, 0.03, n_sens)
+    R16 = geom.rotations()
+    S16t = np.array([np.eye(3) / g16[i] for i in range(n_sens)])
+    M16 = np.array([np.linalg.inv(R16[i] @ S16t[i]) for i in range(n_sens)])
+
+    def railed_sweep(tag, incl_deg, fault=True, n=2500):
+        a = np.deg2rad(incl_deg)
+        bt, bz = 49.0e-3 * np.cos(a), 49.0e-3 * np.sin(a)
+        phi = np.sort(rng16.uniform(0, 4 * np.pi, n))
+        B = np.column_stack([bt * np.cos(phi), bt * np.sin(phi), np.full(n, bz)])
+        v = np.zeros((n, n_sens, 4))
+        v[..., :3] = (np.einsum("sij,tj->tsi", M16, B) / 1e3
+                      * cal20.volts_per_tesla[None, :, None] + 2.2)
+        v[..., 3] = 2.2
+        if fault:
+            rail = -32768 * vpc
+            v[:, 15, 2] = rail        # Bz
+            v[:, 15, 1] = rail        # By
+            v[:, 15, 3] = rail        # VCM
+            #  Bx (index 0) deliberately left alive
+        v += rng16.normal(0, 3e-5, v.shape)
+        return opc.RollSweep(
+            cal20.to_mt(v, apply_zero=False, apply_gain=False, apply_matrix=False),
+            tag=tag, ranges_mt=cal20.ranges_mt.copy())
+
+    faulted = [railed_sweep(t, i) for t, i in (("A", 25.), ("B", -25.), ("C", 60.))]
+    fsol = opc.solve_roll(faulted, geom, 49.0)          # NOT told about S16
+    check("the real S16 railed fault is caught without being told",
+          fsol.unusable() == ["S16"], f"flagged {fsol.unusable()}")
+    check("neither residual nor conditioning could have caught it",
+          abs(fsol.residual_mt[15] - np.median(fsol.residual_mt[:15]))
+          < 0.5 * np.median(fsol.residual_mt[:15])
+          and np.linalg.cond(fsol.M[15]) < opc.PoseSolution.SINGULAR_COND,
+          f"resid {fsol.residual_mt[15]*1e3:.3f} vs "
+          f"{np.median(fsol.residual_mt[:15])*1e3:.3f} uT, "
+          f"cond {np.linalg.cond(fsol.M[15]):.1e}")
+    tr = np.array([np.sqrt(abs(fsol.decompose()[1][i][0, 0]
+                               * fsol.decompose()[1][i][2, 2])) for i in range(15)])
+    tt = np.array([np.sqrt(S16t[i][0, 0] * S16t[i][2, 2]) for i in range(15)])
+    rel = (tr / np.median(tr)) / (tt / np.median(tt))
+    check("one railed sensor does not poison the other fifteen",
+          np.abs(rel - 1).max() * 100 < 0.5,
+          f"S1-S15 match {np.abs(rel - 1).max() * 100:.4f} %")
+
+    clean = [railed_sweep(t, i, fault=False)
+             for t, i in (("A", 25.), ("B", -25.), ("C", 60.))]
+    check("a healthy probe raises no false alarm",
+          opc.solve_roll(clean, geom, 49.0).unusable() == [])
+
     # ---- refuses to mix ranges -------------------------------------------
     lo = opc.RollSweep(A.b_mt, tag="A", ranges_mt=np.full(n_sens, 40.0))
     hi = opc.RollSweep(B.b_mt, tag="B", ranges_mt=np.full(n_sens, 400.0))

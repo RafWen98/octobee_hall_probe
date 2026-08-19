@@ -284,12 +284,45 @@ class PoseSolution:
         self._singular = bad
         return C
 
+    # A sensor whose gain lands this far from the pack did not measure the field
+    # it was in. Deliberately loose -- this is a broken-channel detector, not a
+    # quality threshold, and a genuinely poor sensor should still be reported
+    # with its real number rather than hidden.
+    GAIN_SANITY = 5.0
+
     @property
     def singular(self):
-        """Sensors whose response could not be inverted -- treat as unusable."""
+        """Sensors whose response matrix could not be inverted."""
         if not hasattr(self, "_singular"):
             self.chip_to_tube()
         return list(self._singular)
+
+    def unusable(self):
+        """
+        Sensors whose solved response cannot be believed.
+
+        Two different faults, because they look nothing alike numerically:
+
+        * rank-deficient -- the sensor saw nothing at all, and the matrix will
+          not invert.
+        * responded, but not to the field -- S16's real fault on this probe is
+          Bz, By and VCM railed at negative full scale while Bx still reads. The
+          railed channels are CONSTANT, so the model fits them perfectly with a
+          large offset: the residual comes out indistinguishable from a healthy
+          sensor, and the condition number stays around 1e4, nowhere near
+          singular. Neither residual nor conditioning catches it. What does is
+          that the solved gain lands orders of magnitude away from the pack,
+          because two of the three axes never moved.
+        """
+        bad = set(self.singular)
+        g = self.gains()
+        med = np.nanmedian(g)
+        if np.isfinite(med) and med > 0:
+            for i in range(N_SENSORS):
+                if not np.isfinite(g[i]) or not (
+                        med / self.GAIN_SANITY < g[i] < med * self.GAIN_SANITY):
+                    bad.add(f"S{i + 1}")
+        return sorted(bad, key=lambda s: int(s[1:]))
 
     def decompose(self):
         """
@@ -416,10 +449,11 @@ class PoseSolution:
                  f"gain spread: {(np.nanmax(g) - np.nanmin(g)) * 100:.2f} % "
                  f"peak-to-peak about the median",
                  ""]
-        bad = set(self.singular)
+        bad = set(self.unusable())
         if bad:
-            lines.append(f"UNUSABLE (no invertible response): "
-                         f"{', '.join(sorted(bad))}")
+            lines.append("UNUSABLE (response is nothing like the rest of the "
+                         "pack -- check the ribbon before believing anything "
+                         f"about these): {', '.join(sorted(bad, key=lambda s: int(s[1:])))}")
             lines.append("")
         lines.append("  sensor   gain    resid_uT   max non-ortho")
         for i in range(N_SENSORS):
@@ -763,7 +797,7 @@ def _anchor_gauge(sol, geometry):
     # Best single rotation about z aligning solved to nominal: maximise
     # sum_i trace(Rz(g)^T R_nom_i R_i^T) -> closed form in atan2.
     s = c = 0.0
-    bad = set(sol.singular)
+    bad = set(sol.unusable())
     for i in range(N_SENSORS):
         if f"S{i + 1}" in bad:
             continue        # a sensor that saw nothing gets no say in the frame
