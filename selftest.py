@@ -95,21 +95,33 @@ def test_geometry():
           all(np.allclose(R[i].T @ R[i], np.eye(3)) for i in range(16)))
     check("rotations are right-handed",
           all(np.linalg.det(R[i]) > 0.99 for i in range(16)))
-    # A chip reading purely on its own +Z must map to its face's outward normal.
+    # The chips ride at the tips of 92 mm arms, not on the tube surface.
+    check("chips stand clear of the tube face",
+          abs(g.fsv_radius_mm - g.arm_root_radius_mm
+              - (g.arm_length_mm - g.fsv_from_tip_mm)) < 1e-9,
+          f"{g.fsv_radius_mm - g.arm_root_radius_mm:g} mm clear, "
+          f"{g.fsv_radius_mm:g} mm from the axis")
+    # A chip reading purely on its own +X must map to the arm's direction.
+    b = np.zeros((16, 3))
+    b[:, 0] = 1.0
+    check("chip +X maps along the arm, radially outward",
+          np.allclose(g.to_tube_frame(b), g.normals()))
     b = np.zeros((16, 3))
     b[:, 2] = 1.0
-    check("chip +Z maps to the face normal",
-          np.allclose(g.to_tube_frame(b), g.normals()))
+    board_normals = np.array([g.board_normal(i) for i in range(1, 17)])
+    check("chip +Z maps out of the board surface",
+          np.allclose(g.to_tube_frame(b), board_normals))
     # |B| must survive the rotation, that being the whole point of using it.
     rng = np.random.default_rng(1)
     v = rng.normal(size=(50, 16, 3))
     check("|B| is invariant under the rotation",
           np.allclose(np.linalg.norm(v, axis=-1),
                       np.linalg.norm(g.to_tube_frame(v), axis=-1)))
-    w = g.expected_response((60.0, 0.0, 100.0))
+    pt = (g.fsv_radius_mm + 20.0, 0.0, 60.0)
+    w = g.expected_response(pt)
     check("geometry weighting favours the nearest chip",
-          int(np.argmax(w)) + 1 == g.nearest_sensor((60.0, 0.0, 100.0)),
-          f"nearest is S{g.nearest_sensor((60.0, 0.0, 100.0))}")
+          int(np.argmax(w)) + 1 == g.nearest_sensor(pt),
+          f"nearest is S{g.nearest_sensor(pt)}, spread {w.max()/w.min():.0f}x")
 
 
 def test_conversion():
@@ -167,7 +179,7 @@ def test_cross_calibration():
     # With a magnet nearer some sensors than others, the geometry weighting must
     # remove the distance effect instead of baking it into the gain.
     g = pgeom.Geometry()
-    w = g.expected_response((60.0, 0.0, 100.0))
+    w = g.expected_response((g.fsv_radius_mm + 20.0, 0.0, 60.0))
     cal2 = ocal.Calibration()
     peaks2 = w * 1.0                      # perfectly matched chips, unequal r
     cal2.cross_calibrate(peaks2, weights=w)

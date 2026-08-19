@@ -57,6 +57,7 @@ def color_for(frac):
 
 DEAD_COLOR = (0.45, 0.10, 0.10, 1.0)
 TUBE_COLOR = (0.62, 0.66, 0.72, 0.35)
+ARM_COLOR = (0.55, 0.36, 0.20, 1.0)      # the eval-kit PCBs, bare board colour
 
 
 class ProbeView3D(gl.GLViewWidget):
@@ -65,7 +66,7 @@ class ProbeView3D(gl.GLViewWidget):
     def __init__(self, geom=None, parent=None):
         super().__init__(parent)
         self.geom = geom or pg_geom.Geometry()
-        self.arrow_scale_mm = 70.0        # length of a full-scale arrow
+        self.arrow_scale_mm = None        # full-scale arrow length; None = auto
         self.full_scale_mt = 1.0          # |B| that maps to full scale
         self.auto_scale = True
         # Rolling maximum over the last few seconds of frames. A plain
@@ -99,7 +100,15 @@ class ProbeView3D(gl.GLViewWidget):
 
         self.pads, self.arrows, self.tips, self.labels = [], [], [], []
         for sid in range(1, n + 1):
-            verts, faces = pg_geom.pad_mesh(g, sid)
+            # The arm is structure, not data: draw it once in board colour so
+            # the eye can see how far off the tube each chip really sits.
+            averts, afaces = pg_geom.arm_mesh(g, sid)
+            self._register(gl.GLMeshItem(
+                meshdata=gl.MeshData(vertexes=averts, faces=afaces),
+                smooth=False, drawEdges=False, color=ARM_COLOR,
+                shader="shaded", glOptions="opaque"))
+
+            verts, faces = pg_geom.chip_mesh(g, sid)
             md = gl.MeshData(vertexes=verts, faces=faces)
             pad = gl.GLMeshItem(meshdata=md, smooth=False, drawEdges=True,
                                 edgeColor=(0.1, 0.1, 0.12, 1.0),
@@ -118,7 +127,7 @@ class ProbeView3D(gl.GLViewWidget):
             self._register(tip)
             self.tips.append(tip)
 
-            p = g.position(sid) + g.normal(sid) * 9.0
+            p = g.position(sid) + g.normal(sid) * 8.0
             txt = gl.GLTextItem(pos=p, text=f"S{sid}",
                                 color=(210, 215, 225, 255))
             self._register(txt)
@@ -140,18 +149,23 @@ class ProbeView3D(gl.GLViewWidget):
                              glOptions="translucent")
         self._register(body)
 
+    @property
+    def extent_mm(self):
+        """Overall size of the probe: the arms reach far past the tube itself."""
+        return max(self.geom.tube_length_mm, 2.0 * self.geom.fsv_radius_mm)
+
     def _add_grid(self):
-        span = max(self.geom.tube_length_mm, 200.0) * 1.1
+        span = self.extent_mm * 1.15
         grid = gl.GLGridItem()
         grid.setSize(span, span)
         grid.setSpacing(span / 14.0, span / 14.0)
-        grid.translate(0, 0, -self.geom.tube_width_mm * 1.6)
+        grid.translate(0, 0, -self.geom.fsv_radius_mm * 0.6)
         grid.setColor((70, 76, 90, 110))
         self._register(grid)
 
     def _add_axes(self):
-        L = self.geom.tube_width_mm * 1.6
-        origin = np.array([0.0, 0.0, -self.geom.tube_width_mm * 0.6])
+        L = self.geom.fsv_radius_mm * 0.55
+        origin = np.array([0.0, 0.0, -self.geom.fsv_radius_mm * 0.25])
         for vec, col, name in ((np.array([L, 0, 0]), (1, .35, .35, 1), "X"),
                                (np.array([0, L, 0]), (.35, 1, .35, 1), "Y"),
                                (np.array([0, 0, L]), (.45, .6, 1, 1), "Z")):
@@ -163,11 +177,12 @@ class ProbeView3D(gl.GLViewWidget):
                 color=QtGui.QColor.fromRgbF(*col)))
 
     def reset_camera(self):
-        L = self.geom.tube_length_mm
-        self.opts["center"] = pg.Vector(0, 0, L / 2.0)
+        self.opts["center"] = pg.Vector(0, 0, self.geom.tube_length_mm / 2.0)
         # Side-on and slightly above: the tube runs across the view, so all four
-        # faces and the whole length are readable at once.
-        self.setCameraPosition(distance=L * 1.15, elevation=16, azimuth=-65)
+        # faces and the whole length are readable at once. Frame the arms, not
+        # the tube -- the chips sit far outside it.
+        self.setCameraPosition(distance=self.extent_mm * 1.5,
+                               elevation=16, azimuth=-65)
 
     # ---- live update -----------------------------------------------------
     def reset_scale(self):
@@ -215,9 +230,11 @@ class ProbeView3D(gl.GLViewWidget):
                 self.arrows[i].setData(pos=np.zeros((2, 3)), color=(0, 0, 0, 0))
                 self.tips[i].setData(pos=np.zeros((1, 3)), color=(0, 0, 0, 0))
                 continue
-            p0 = self.geom.position(sid) + self.geom.normal(sid) * 3.0
+            p0 = self.geom.position(sid)
             direction = b_tube[i] / mag[i]
-            length = self.arrow_scale_mm * min(frac, 1.0)
+            scale = (self.arrow_scale_mm if self.arrow_scale_mm
+                     else 0.45 * self.geom.arm_length_mm)
+            length = scale * min(frac, 1.0)
             p1 = p0 + direction * length
             self.arrows[i].setData(pos=np.array([p0, p1]), color=col, width=3.0)
             self.tips[i].setData(pos=p1[None, :], color=col, size=9.0)

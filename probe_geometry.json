@@ -1,10 +1,15 @@
 {
   "tube_width_mm": 40.0,
-  "sensor_pitch_mm": 60.0,
-  "first_sensor_z_mm": 40.0,
-  "tube_length_mm": 260.0,
+  "arm_length_mm": 92.0,
+  "fsv_from_tip_mm": 3.0,
+  "fsv_above_board_mm": 0.55,
+  "mount_standoff_mm": 0.0,
+  "plate_pitch_mm": 33.0,
+  "first_sensor_z_mm": 30.0,
+  "tube_length_mm": 159.0,
+  "board_plane": "axial",
   "mapping": "face-major",
-  "notes": "UNVERIFIED. The tube dimensions and the sensor-to-face assignment below are plausible defaults, not measurements. Only the 3D view arrangement and the tube-frame rotation depend on them -- |B|, the channel health diagnostics and the raw exports do not. Establish the real order with octobee_idmap.py and a slow magnet pass along one face, correct the face/slot entries here, then press Reload geometry in the GUI. chip_rot_deg and axis_signs are for the chip-on-board orientation once that is known.",
+  "notes": "PARTLY UNVERIFIED. Arm dimensions are from the SENIS eval-kit drawing and are solid: 92 mm PCB, FSV 3 mm from the tip and 0.55 mm above the board, so each chip sits 89 mm clear of the tube face. What is NOT yet confirmed on this probe: tube_width_mm, plate_pitch_mm (30 mm plate + 3 mm gap assumed), board_plane, and above all the sensor-to-face mapping below. Only the 3D arrangement and the tube-frame rotation depend on these -- |B|, the channel health diagnostics and the raw exports do not. Establish the real order with octobee_idmap.py and a slow magnet pass along one face, correct the face/slot entries, then press Reload geometry in the GUI.",
   "sensors": [
     {
       "id": 1,

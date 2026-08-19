@@ -547,10 +547,27 @@ presents on this probe.
 Read the VCM rows first when hunting noise. VCM carries no field, so noise on it
 is analogue pickup in the cabling and grounding rather than a sensor problem.
 
+### The probe geometry
+
+The chips are not on the tube: each rides at the tip of a 92 mm SENIS eval-kit
+PCB standing off radially, so its field sensitive volume sits **89 mm clear of
+the face** it is bolted to (3 mm in from the board's tip, 0.55 mm above the
+board surface). With a 40 mm tube that puts every chip 109 mm from the tube
+axis and 218 mm from the chip opposite it.
+
+That standoff is the single biggest geometric fact about this instrument. A
+magnet 20 mm off one chip is ~240 mm from the far side, and 1/r^3 turns that
+into a **~1800x** difference in what they read from the same magnet. Any
+comparison of spike heights has to divide it out before blaming a register --
+which is what *use geometry weighting* on the Calibration tab does.
+
 ### The geometry file is an assumption
 
-`probe_geometry.json` holds the tube dimensions and which sensor sits on which
-face, and carries that warning in its own `notes` field. **The face assignment has not been verified on this hardware.** Only the
+`probe_geometry.json` holds the tube and arm dimensions and which sensor sits on
+which face, and carries that warning in its own `notes` field. The arm
+dimensions come from the vendor drawing and are solid; the tube width, the
+mounting-plate pitch, the board orientation and above all the sensor-to-face
+mapping are not yet confirmed. **The face assignment has not been verified on this hardware.** Only the
 3D view's arrangement and the tube-frame rotation depend on it — |B|, the health
 diagnostics and the raw exports do not. Fix it with `octobee_idmap.py` and a
 slow magnet pass along one face, then press *Reload geometry*.

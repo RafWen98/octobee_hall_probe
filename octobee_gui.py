@@ -223,7 +223,8 @@ class DemoSource(SourceBase):
         """Dipole moving along +Z, orbiting the tube, seen in each chip's axes."""
         z = (t * 60.0) % (self.geom.tube_length_mm + 120.0) - 60.0
         ang = 2 * np.pi * t / 11.0
-        r = self.geom.tube_width_mm / 2.0 + 35.0
+        # Fly past the chips, which sit at the arm tips -- not past the tube.
+        r = self.geom.fsv_radius_mm + 25.0
         src = np.array([r * np.cos(ang), r * np.sin(ang), z])
         m = np.array([0.0, 0.0, 1.0]) * 6.0e4          # arbitrary strength, mT*mm^3
         pos = self.geom.positions()
