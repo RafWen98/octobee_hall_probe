@@ -119,7 +119,24 @@ def vcm_channel_for(ch0):
 # --------------------------------------------------------------------------
 
 class Uut:
-    """Plain-text key=value command interface to an ACQ400 carrier."""
+    """
+    Plain-text key=value command interface to an ACQ400 carrier.
+
+    On reply timing: the command port answers in about 2 ms and terminates
+    every reply with a newline -- including the empty reply a write gives back.
+    It never closes the connection, so reading "until the socket runs dry" costs
+    a full socket timeout on every single command. That is invisible in a script
+    that reads two knobs and crippling in one that reads fourteen: connecting to
+    both carriers took 85 s, essentially all of it spent waiting for timeouts
+    that were never going to carry data.
+
+    So: poll for the reply to start, then drain until the line goes quiet.
+    A knob read costs a few milliseconds instead of 1.3 s.
+    """
+
+    REPLY_TIMEOUT = 2.0      # longest wait for a reply to begin
+    REPLY_GAP = 0.06         # quiet period that marks the end of one
+    BANNER_WAIT = 0.15       # some ports greet, most do not
 
     def __init__(self, host, timeout=5.0):
         self.host = host
@@ -130,27 +147,35 @@ class Uut:
         if site not in self._sockets:
             s = socket.create_connection((self.host, PORT_SITE0 + site),
                                          timeout=self.timeout)
-            s.settimeout(1.0)
+            s.settimeout(self.BANNER_WAIT)
             try:
-                s.recv(4096)          # drain banner
+                s.recv(4096)          # drain banner if there is one
             except OSError:
                 pass
             self._sockets[site] = s
         return self._sockets[site]
 
-    def cmd(self, knob, site=0, settle=0.30):
+    def cmd(self, knob, site=0, settle=0.0):
         s = self._sock(site)
         s.sendall((knob + "\n").encode())
-        time.sleep(settle)
+        s.settimeout(self.REPLY_GAP)
         buf = b""
-        try:
-            while True:
+        deadline = time.time() + self.REPLY_TIMEOUT
+        while time.time() < deadline:
+            try:
                 d = s.recv(16384)
-                if not d:
-                    break
-                buf += d
-        except OSError:
-            pass
+            except TimeoutError:
+                if buf:
+                    break                    # reply finished
+                continue                     # still waiting for it to start
+            except OSError:
+                break
+            if not d:
+                break                        # peer closed
+            buf += d
+            deadline = time.time() + self.REPLY_GAP
+        if settle:
+            time.sleep(settle)
         return buf.decode(errors="replace").strip()
 
     def value(self, knob, site=0):

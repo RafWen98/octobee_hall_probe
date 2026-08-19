@@ -283,7 +283,18 @@ class DemoSource(SourceBase):
 # ==========================================================================
 
 class ConnectWorker(QtCore.QThread):
+    """
+    Bring both carriers up: release the stream, set the clock, read the frame
+    layout, and start reading.
+
+    The two boxes are prepared concurrently. Every step is a network round trip
+    against an independent box, so doing them one after the other doubled the
+    wait for no reason. What is left is dominated by two deliberate settling
+    delays (stopping the stream, and letting a new clkdiv take), not by chatter.
+    """
+
     done = QtCore.pyqtSignal(object, object, str)     # source, prev_clkdiv, error
+    progress = QtCore.pyqtSignal(str)
 
     def __init__(self, hosts, target_fs, block_samples=2048):
         super().__init__()
@@ -292,42 +303,69 @@ class ConnectWorker(QtCore.QThread):
         self.block_samples = block_samples
 
     def run(self):
-        prev = {}
-        try:
-            import octobee_live as olive
-            for h in self.hosts:
-                ob.stop_live_stream(h)
-            if self.target_fs:
-                for h in self.hosts:
-                    prev[h], _ = olive.set_rate(h, self.target_fs)
-            layouts = [ob.probe_uut(h) for h in self.hosts]
-            streamers = []
-            for h, lay in zip(self.hosts, layouts):
+        import threading
+        prev, layouts, streamers, errors = {}, {}, {}, {}
+
+        def prepare(h):
+            try:
+                self.progress.emit(f"{h}: releasing the stream")
+                if ob.stop_live_stream(h):
+                    self.progress.emit(f"{h}: stopped a running capture")
+                if self.target_fs:
+                    self.progress.emit(f"{h}: setting "
+                                       f"{self.target_fs/1000:g} kSPS")
+                    import octobee_live as olive
+                    prev[h], actual = olive.set_rate(h, self.target_fs)
+                    self.progress.emit(f"{h}: running at {actual/1000:g} kSPS")
+                self.progress.emit(f"{h}: reading the frame layout")
+                lay = ob.probe_uut(h)
+                layouts[h] = lay
+                # take_over=False: the stream was already released above, and
+                # repeating it here cost another round trip per box.
                 st = ob.Streamer(h, lay, block_samples=self.block_samples,
-                                 take_over=True)
+                                 take_over=False)
                 st.start()
-                streamers.append(st)
-            # Wait until every box is actually delivering. The two carriers
-            # start their movers several seconds apart, and the reader only
-            # emits a block once BOTH have data -- so reporting "connected" on
-            # the socket alone leaves the window blank with no explanation.
-            deadline = time.time() + 25
+                streamers[h] = st
+                self.progress.emit(f"{h}: waiting for data")
+            except Exception as e:                    # noqa: BLE001
+                errors[h] = e
+
+        threads = [threading.Thread(target=prepare, args=(h,), daemon=True)
+                   for h in self.hosts]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        try:
+            if errors:
+                h, e = next(iter(errors.items()))
+                raise RuntimeError(f"{h}: {type(e).__name__}: {e}")
+            ordered = [streamers[h] for h in self.hosts]
+            # A carrier takes a few seconds to start pushing after the socket
+            # opens, and the reader only emits a block once BOTH have data --
+            # so reporting success on the socket alone leaves the window blank
+            # with no explanation.
+            deadline = time.time() + 30
             while time.time() < deadline:
-                for h, st in zip(self.hosts, streamers):
-                    if st.error:
-                        raise RuntimeError(f"{h}: {st.error}")
-                if all(st.bytes_read > 0 for st in streamers):
+                for h in self.hosts:
+                    if streamers[h].error:
+                        raise RuntimeError(f"{h}: {streamers[h].error}")
+                if all(st.bytes_read > 0 for st in ordered):
                     break
                 time.sleep(0.1)
-            silent = [h for h, st in zip(self.hosts, streamers)
-                      if st.bytes_read == 0]
+            silent = [h for h in self.hosts if streamers[h].bytes_read == 0]
             if silent:
                 raise RuntimeError(
                     f"connected but no data arrived from {', '.join(silent)}. "
                     f"Something else most likely owns port 4210 there -- check "
                     f"for a running Phoebus 'Streaming Capture' on that box.")
-            self.done.emit(LiveSource(self.hosts, layouts, streamers), prev, "")
+            source = LiveSource(self.hosts, [layouts[h] for h in self.hosts],
+                                ordered)
+            self.done.emit(source, prev, "")
         except Exception as e:                        # noqa: BLE001
+            for st in streamers.values():
+                st.stop()
             self.done.emit(None, prev, f"{type(e).__name__}: {e}")
 
 
@@ -703,9 +741,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _report_calibration_source(self):
         if self.cal_from_file:
-            self.log.log(f"calibration loaded from {self.args.calibration}")
+            self.log.log(f"calibration loaded from {self.args.calibration}: "
+                         + self.cal.summary().replace("\n", "; "))
             if self.cal.notes:
-                self.log.log(f"  {self.cal.notes}")
+                first = self.cal.notes.split(". ")[0]
+                self.log.log(f"  {first}. (full note in "
+                             f"{self.args.calibration})")
         else:
             self.log.log(
                 f"no {self.args.calibration} found -- using built-in defaults, "
@@ -1097,7 +1138,15 @@ class MainWindow(QtWidgets.QMainWindow):
                      + (f", setting {fs/1000:g} kSPS" if fs else ""))
         self._connect_worker = ConnectWorker(self.hosts, fs)
         self._connect_worker.done.connect(self.on_connected)
+        self._connect_worker.progress.connect(self.on_connect_progress)
         self._connect_worker.start()
+
+    def on_connect_progress(self, msg):
+        # Connecting involves several seconds of deliberate settling delays.
+        # Without this the window sits on "connecting..." long enough to look
+        # like it has hung, which is exactly how it was first reported.
+        self.lbl_state.setText(f"connecting -- {msg}")
+        self.log.log(msg)
 
     def on_connected(self, source, prev, error):
         self.act_connect.setEnabled(True)
