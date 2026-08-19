@@ -1,0 +1,21 @@
+{
+  "ranges_mt": [
+    40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0,
+    20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0
+  ],
+  "zero_mt": [
+    [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+  ],
+  "gain_corr": [
+    [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]
+  ],
+  "subtract_vcm": true,
+  "dead": [],
+  "notes": "Ranges are from the SPI register audit (README section 3): acq1001_694 / S1-S8 run G_CTRL=1, gain 1500, +/-40 mT, 34.65 V/T; acq1001_695 / S9-S16 run G_CTRL=0, gain 3000, +/-20 mT, 63 V/T. That 63/34.65 = 1.82x is the main instrument-side reason the two halves of the probe give different spike heights for the same magnet, and setting it here removes it at the conversion step rather than hiding it in a gain trim. If the boxes are ever harmonised with --set-gain, update these to match. 'dead' is left empty on purpose: S16's chip is alive over SPI and only its analogue ribbon is faulty, so the GUI detects the fault at run time and will stop excluding it the moment the ribbon is repaired."
+}

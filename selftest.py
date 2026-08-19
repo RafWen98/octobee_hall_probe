@@ -181,6 +181,33 @@ def test_cross_calibration():
           f"max trim {np.abs(cal3.gain_corr-1).max():.2f}")
 
 
+def test_shipped_calibration():
+    """
+    The repo ships the measured register configuration, not a neutral default.
+
+    Getting this wrong is invisible -- every number on screen is simply scaled
+    by 1.82 -- so it is worth asserting rather than trusting.
+    """
+    print("\nshipped calibration")
+    if not os.path.exists(ocal.CONFIG_NAME):
+        check("calibration.json is present", False)
+        return
+    cal = ocal.Calibration.load(ocal.CONFIG_NAME)
+    check("S1-S8 are on the SPI-audited +/-40 mT range",
+          all(cal.ranges_mt[i] == 40.0 for i in range(8)),
+          f"{cal.ranges_mt[:8]}")
+    check("S9-S16 are on the SPI-audited +/-20 mT range",
+          all(cal.ranges_mt[i] == 20.0 for i in range(8, 16)),
+          f"{cal.ranges_mt[8:]}")
+    vpt = cal.volts_per_tesla
+    check("the two halves differ by the 1.82x the audit predicts",
+          abs(vpt[8] / vpt[0] - 1.818) < 0.01, f"{vpt[8]/vpt[0]:.3f}x")
+    check("VCM subtraction is on", cal.subtract_vcm)
+    check("no sensor is excluded up front", not cal.dead,
+          "S16's fault is detected at run time, so a repaired ribbon "
+          "starts working without editing this file")
+
+
 def test_health():
     print("\nchannel health")
     vpc = 20.0 / 65536.0
@@ -448,6 +475,7 @@ def main():
     test_geometry()
     test_conversion()
     test_cross_calibration()
+    test_shipped_calibration()
     test_health()
     with tempfile.TemporaryDirectory() as workdir:
         test_app(app, args, workdir)

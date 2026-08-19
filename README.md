@@ -434,6 +434,136 @@ Verify VCM still reads ~2.2 V afterwards.
 | `octobee_cal.py` | PC | health + calibration report, optional PNG |
 | `octobee_idmap.py` | PC | proves the channel↔sensor map (SPI sweep or magnet pass) |
 | `onbox_sensor_audit.py` | **carrier** | SPI register audit of all 8 chips; `--id-sweep`, `--set-gain` |
+| `octobee_gui.py` | PC | the application: live view, 3D probe head, calibration, exports |
+| `probe_geometry.py` | PC | chip positions and per-chip rotation matrices on the tube |
+| `probe_view3d.py` | PC | the 3D probe-head widget |
+| `octobee_calibration.py` | PC | counts → tesla, tare, gain trim, channel health |
+| `octobee_record.py` | PC | CSV / raw / report writers |
+| `selftest.py` | PC | end-to-end verification, offline or against the hardware |
 
-Requires `numpy` and `matplotlib` on the PC. Nothing else — no HAPI install, no
-Phoebus, no EPICS.
+The command-line tools need only `numpy` and `matplotlib`. The GUI additionally
+needs `PyQt6`, `pyqtgraph` and `PyOpenGL` — `pip install -r requirements.txt`.
+Nothing else in either case: no HAPI install, no Phoebus, no EPICS.
+
+---
+
+## 6. The GUI
+
+```bash
+pip install -r requirements.txt
+
+python octobee_gui.py                       # the two carriers
+python octobee_gui.py --demo                # synthetic probe, no hardware
+python octobee_gui.py --replay captures/ambient_test.npz
+```
+
+One window, built on the same `octobee.py` decode path as the CLI tools. The
+left half carries the work — live traces, the per-sensor table, calibration,
+diagnostics, exports — and the right half always shows the probe head in 3D
+with a peak-|B| bar chart underneath, so the state of all 16 sensors is visible
+whatever tab you are on.
+
+![The Live tab against the real carriers](docs/gui-live-hardware.png)
+
+*Live, both carriers, no magnet. S16 is excluded automatically and dropped from
+the legend; the bar chart ranks the rest by peak |B| and reproduces the known
+noise pattern — S9 worst, then S15, S13 and S8.*
+
+### Why a 3D view rather than more plots
+
+The chips point in 16 different directions, so a stack of 48 traces cannot show
+you where a field actually is. The 3D view rotates each chip's vector into the
+common tube frame with the matrices from `probe_geometry.py` and draws it where
+that chip physically sits. A magnet passing the probe then reads directly: which
+face it went past, in which direction the field pointed, and — because every
+arrow shares one scale — which sensors answered more strongly than their
+neighbours.
+
+Colour and arrow length are |B|, which is rotation-invariant and therefore the
+only amplitude that can honestly be compared between chips. Excluded chips are
+drawn dark red with no arrow.
+
+![A magnet passing the probe](docs/gui-magnet-pass.png)
+
+*A magnet travelling along the probe (`--demo`). Each sensor answers in turn,
+and the arrows on the 3D model track it.*
+
+### The calibration sequence
+
+1. **Connect.** Drops the ADC clock to 20 kSPS so the link keeps up, and puts
+   the original `clkdiv` back on disconnect. It waits until *both* carriers are
+   actually delivering before reporting success.
+2. **Zero (tare)** with no magnet near the probe. Stores each axis of each chip's
+   ambient reading as its zero point.
+3. **Magnet pass.** Start it, move the magnet along the probe, stop it. The peak
+   |B| per sensor is recorded against the baseline from when the pass started.
+4. If the magnet was not equidistant from every chip — it never is — tick
+   **use geometry weighting** and enter its position. That divides out the
+   1/r³ distance term, which on this tube is worth a factor of ~200 on its own.
+   Whatever spread survives that is electrical: gain register, EEPROM
+   calibration, or Hall bias current.
+5. **Apply gain trim** to equalise what is left, then **Save calibration**.
+
+![The Calibration tab](docs/gui-calibration.png)
+
+Each sensor's measurement range is set per row in the Sensors tab, not globally,
+because on this probe the two halves genuinely differ: the SPI audit in section 3
+found S1-S8 at gain 1500 (+/-40 mT, 34.65 V/T) and S9-S16 at gain 3000
+(+/-20 mT, 63 V/T). The shipped `calibration.json` already encodes that, so the
+1.82x is removed where it belongs -- at the volts-to-tesla conversion -- instead
+of being absorbed into a gain trim that would hide it. If the boxes are ever
+harmonised with `--set-gain`, update that file to match.
+
+If `calibration.json` is missing the GUI falls back to +/-20 mT for everything
+and says so in the Log, because that would silently scale S1-S8 by 1.82x.
+
+### Data output
+
+| what | format | rate |
+|---|---|---|
+| **Record** → calibrated CSV | millitesla, one column per axis plus \|B\|, with a provenance header | the output rate, default 500 Hz |
+| **Record** → raw | flat `int16` `.bin` + `.json` sidecar, wire order, nothing subtracted | the full stream rate |
+| **Snapshot** | `.npz`, lossless | the carriers' own 200 kSPS |
+
+The raw route exists so that a capture taken today survives a later correction
+to the channel map, the VCM handling or the gain registers. The snapshot puts
+the carriers' clock back to full rate first, takes the capture, and leaves them
+there — a short capture is buffered and delivered complete even though a
+sustained one could not be.
+
+Tick **rotate into the common tube frame** to get components that can be
+compared between sensors. Unticked, each chip's Bx/By/Bz are its own and only
+|B| is comparable.
+
+### Diagnostics stay on screen
+
+The per-sensor table and the Diagnostics tab report all 64 raw channels, and
+sensors whose channels are railed or stuck are excluded from every statistic,
+scale and export automatically. A chip whose **VCM reference** is broken counts
+as dead even when its other channels look plausible, because every axis it
+reports is quoted relative to that reference — which is exactly how S16
+presents on this probe.
+
+Read the VCM rows first when hunting noise. VCM carries no field, so noise on it
+is analogue pickup in the cabling and grounding rather than a sensor problem.
+
+### The geometry file is an assumption
+
+`probe_geometry.json` holds the tube dimensions and which sensor sits on which
+face, and carries that warning in its own `notes` field. **The face assignment has not been verified on this hardware.** Only the
+3D view's arrangement and the tube-frame rotation depend on it — |B|, the health
+diagnostics and the raw exports do not. Fix it with `octobee_idmap.py` and a
+slow magnet pass along one face, then press *Reload geometry*.
+
+### Verifying it still works
+
+```bash
+python selftest.py                     # synthetic probe, no hardware
+python selftest.py --replay captures/ambient_test.npz
+python selftest.py --live              # against the real carriers
+```
+
+It drives the whole pipeline and then reads the written files back to check the
+numbers, rather than checking that files merely exist. The live run also asserts
+that no blocks were dropped and that the carriers are left at the clock they
+were found at.

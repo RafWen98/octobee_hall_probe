@@ -660,6 +660,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hosts = list(args.uut) if args.uut else list(ob.DEFAULT_UUTS)
         self.geom = pgeom.Geometry.load_or_default(args.geometry)
         self.cal = ocal.Calibration.load_or_default(args.calibration)
+        self.cal_from_file = os.path.exists(args.calibration)
         self.source = None
         self.prev_clkdiv = {}
         self.out_rate = 500.0
@@ -698,6 +699,20 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.log.log("ready -- press Connect to take over the stream from "
                          "Phoebus and start reading both carriers")
+        self._report_calibration_source()
+
+    def _report_calibration_source(self):
+        if self.cal_from_file:
+            self.log.log(f"calibration loaded from {self.args.calibration}")
+            if self.cal.notes:
+                self.log.log(f"  {self.cal.notes}")
+        else:
+            self.log.log(
+                f"no {self.args.calibration} found -- using built-in defaults, "
+                f"which put every sensor on the +/-20 mT range. On this probe "
+                f"S1-S8 actually run +/-40 mT, so their readings will be out by "
+                f"1.82x until you set the range per sensor in the Sensors tab "
+                f"and save the calibration.")
 
     # ---- construction ----------------------------------------------------
     def _build_ui(self):

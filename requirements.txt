@@ -1,0 +1,8 @@
+# Command-line tools (octobee.py, octobee_cal.py, octobee_live.py, ...)
+numpy>=1.24
+matplotlib>=3.7
+
+# Additionally required by the GUI (octobee_gui.py)
+PyQt6>=6.5
+pyqtgraph>=0.13
+PyOpenGL>=3.1

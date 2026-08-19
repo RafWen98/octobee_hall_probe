@@ -1,0 +1,186 @@
+{
+  "tube_width_mm": 40.0,
+  "sensor_pitch_mm": 60.0,
+  "first_sensor_z_mm": 40.0,
+  "tube_length_mm": 260.0,
+  "mapping": "face-major",
+  "notes": "UNVERIFIED. The tube dimensions and the sensor-to-face assignment below are plausible defaults, not measurements. Only the 3D view arrangement and the tube-frame rotation depend on them -- |B|, the channel health diagnostics and the raw exports do not. Establish the real order with octobee_idmap.py and a slow magnet pass along one face, correct the face/slot entries here, then press Reload geometry in the GUI. chip_rot_deg and axis_signs are for the chip-on-board orientation once that is known.",
+  "sensors": [
+    {
+      "id": 1,
+      "face": 0,
+      "slot": 0,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 2,
+      "face": 0,
+      "slot": 1,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "face": 0,
+      "slot": 2,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 4,
+      "face": 0,
+      "slot": 3,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "face": 1,
+      "slot": 0,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 6,
+      "face": 1,
+      "slot": 1,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 7,
+      "face": 1,
+      "slot": 2,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 8,
+      "face": 1,
+      "slot": 3,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 9,
+      "face": 2,
+      "slot": 0,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 10,
+      "face": 2,
+      "slot": 1,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 11,
+      "face": 2,
+      "slot": 2,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 12,
+      "face": 2,
+      "slot": 3,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 13,
+      "face": 3,
+      "slot": 0,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 14,
+      "face": 3,
+      "slot": 1,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 15,
+      "face": 3,
+      "slot": 2,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": 16,
+      "face": 3,
+      "slot": 3,
+      "chip_rot_deg": 0.0,
+      "axis_signs": [
+        1,
+        1,
+        1
+      ]
+    }
+  ]
+}

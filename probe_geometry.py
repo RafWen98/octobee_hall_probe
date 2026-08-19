@@ -77,7 +77,8 @@ class Geometry:
 
     def __init__(self, tube_width_mm=40.0, sensor_pitch_mm=60.0,
                  first_sensor_z_mm=40.0, tube_length_mm=None,
-                 mapping="face-major", sensors=None):
+                 mapping="face-major", sensors=None, notes=""):
+        self.notes = notes
         self.tube_width_mm = float(tube_width_mm)
         self.sensor_pitch_mm = float(sensor_pitch_mm)
         self.first_sensor_z_mm = float(first_sensor_z_mm)
@@ -95,6 +96,7 @@ class Geometry:
                 "first_sensor_z_mm": self.first_sensor_z_mm,
                 "tube_length_mm": self.tube_length_mm,
                 "mapping": self.mapping,
+                "notes": self.notes,
                 "sensors": self.sensors}
 
     def save(self, path=CONFIG_NAME):
