@@ -47,9 +47,14 @@ from probe_view3d import ProbeView3D, color_for
 N_SENSORS = pgeom.N_SENSORS
 AXES = ("Bx", "By", "Bz")
 OUT_RATES = (100.0, 200.0, 500.0, 1000.0, 2000.0)
-STREAM_RATES = {"20 kSPS (link-safe)": 20000.0,
-                "50 kSPS": 50000.0,
-                "200 kSPS (full, may drop)": 200000.0,
+# Reducing the ADC clock is NOT free. The SENM3Dx analog low-pass sits at
+# 100 kHz (PWM_CTRL bits 5:4, already at its narrowest setting), so sampling
+# below 200 kSPS folds noise from 0-100 kHz into 0-fs/2. The density penalty is
+# sqrt(100kHz / (fs/2)) -- measured 3.1x at 20 kSPS, matching the predicted 3.16x.
+# You trade noise for stream bandwidth; the label states the cost.
+STREAM_RATES = {"200 kSPS (no aliasing, best noise)": 200000.0,
+                "50 kSPS (2.0x noise, aliased)": 50000.0,
+                "20 kSPS (3.2x noise, aliased)": 20000.0,
                 "leave the box alone": 0.0}
 
 # The per-channel health scan is the most expensive thing in the refresh loop
@@ -154,8 +159,33 @@ class LiveSource(SourceBase):
         self.gaps = 0
         self.lost = 0
         self.bytes0 = 0
-        self.t0 = time.time()
         self.error = None
+        self._discard_startup_backlog()
+        self.t0 = time.time()
+
+    def _discard_startup_backlog(self):
+        """
+        Throw away whatever queued up before anyone was consuming, and zero the
+        counters.
+
+        The reader threads start as soon as each carrier is ready, but the two
+        come up several seconds apart and the GUI only begins draining once
+        both are live. In that gap the first box fills its queue and starts
+        shedding blocks -- around 70 of them, every single session. None of it
+        matters: nothing is being recorded or displayed yet. But it left
+        "dropped blocks" showing a permanent non-zero count, which is precisely
+        the number that is supposed to mean "the data you are recording has
+        holes in it". A warning that is always on is not a warning.
+        """
+        import queue
+        for st in self.streamers:
+            while True:
+                try:
+                    st.q.get_nowait()
+                except queue.Empty:
+                    break
+            st.dropped = 0
+            st.bytes_read = 0
 
     def read(self):
         for h, st in zip(self.hosts, self.streamers):
@@ -378,8 +408,14 @@ class ConnectWorker(QtCore.QThread):
                 layouts[h] = lay
                 # take_over=False: the stream was already released above, and
                 # repeating it here cost another round trip per box.
+                # Deeper queue than the default. The reader refills at link
+                # speed, roughly five times real time, so the nominal seconds
+                # of buffering are worth about a fifth of that against a stall
+                # on the main thread. 128 blocks is ~25 MB per box and buys a
+                # couple of seconds, which covers any single operation the GUI
+                # performs.
                 st = ob.Streamer(h, lay, block_samples=self.block_samples,
-                                 take_over=False)
+                                 take_over=False, queue_depth=128)
                 st.start()
                 streamers[h] = st
                 self.progress.emit(f"{h}: waiting for data")
@@ -909,10 +945,13 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.log.log(
                 f"no {self.args.calibration} found -- using built-in defaults, "
-                f"which put every sensor on the +/-20 mT range. On this probe "
-                f"S1-S8 actually run +/-40 mT, so their readings will be out by "
-                f"1.82x until you set the range per sensor in the Sensors tab "
-                f"and save the calibration.")
+                f"which put every sensor on +/-20 mT / 63 V/T. That matches "
+                f"the probe as audited on 2026-08-19, when all 16 chips were "
+                f"harmonised to gain 3000, but nothing here checks it at run "
+                f"time. If the gain has been changed since, set the range per "
+                f"sensor in the Sensors tab and save the calibration -- a "
+                f"wrong range is invisible on screen and simply rescales "
+                f"everything.")
 
     # ---- construction ----------------------------------------------------
     def _build_ui(self):
@@ -984,10 +1023,18 @@ class MainWindow(QtWidgets.QMainWindow):
         for k in STREAM_RATES:
             self.cmb_rate.addItem(k, STREAM_RATES[k])
         self.cmb_rate.setToolTip(
-            "The link tops out near 9.8 MB/s but each box makes 19.2 MB/s at "
-            "200 kSPS, so a sustained full-rate stream cannot keep up. 20 kSPS "
-            "streams cleanly and is still ~10000x oversampled for a hand-passed "
-            "magnet. The original clkdiv is restored on disconnect.")
+            "Each carrier produces 19.2 MB/s at 200 kSPS but its stream path "
+            "delivers only ~10-15 MB/s (the Ethernet is 1 Gbps and not the "
+            "limit -- reading localhost:4210 on the box itself tops out at "
+            "15 MB/s), so a sustained full-rate stream falls behind.\n\n"
+            "Lowering the clock is a trade, not a free win: the sensor's analog "
+            "low-pass is fixed at 100 kHz, so anything below 200 kSPS aliases "
+            "and the noise density rises by sqrt(100kHz/(fs/2)) -- 2x at "
+            "50 kSPS, 3.2x at 20 kSPS (measured 3.1x).\n\n"
+            "For short captures prefer 200 kSPS: the box buffers and delivers "
+            "every sample, just slower than real time (a 3 s capture from both "
+            "boxes came back with zero lost samples). The original clkdiv is "
+            "restored on disconnect.")
         tb.addWidget(self.cmb_rate)
 
         tb.addWidget(QtWidgets.QLabel("  output rate "))
@@ -2153,7 +2200,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 p = os.path.join("captures", f"octobee_{stamp}.bin")
                 self.raw_rec = orec.RawRecorder(
                     p, self.source.hosts, self.source.vpc,
-                    [self.source.fs_hz] * len(self.source.hosts))
+                    [self.source.fs_hz] * len(self.source.hosts),
+                    cal=self.cal)
                 self.log.log(f"recording raw counts to {p}")
             if self.csv_rec is None and self.raw_rec is None:
                 self.log.log("nothing selected to record -- see the Data output tab")
@@ -2272,10 +2320,12 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         Build the per-sensor factor that takes millitesla to the chosen unit.
 
-        It is per-sensor because the two halves of the probe run different
-        amplifier gains: 34.65 V/T on S1-S8 and 63 V/T on S9-S16. One field
-        therefore is not one voltage, and a single global factor would quietly
-        misreport half the probe.
+        All 16 chips currently run gain 3000, so the factor is the same for
+        every sensor. It stays per-sensor anyway because the range is a
+        per-sensor setting and the two halves genuinely have differed -- they
+        were 34.65 and 63 V/T until the 2026-08-19 harmonisation. Under a split
+        gain one field is not one voltage, and a single global factor would
+        quietly misreport half the probe.
         """
         name = self.cmb_units.currentText()
         vpt = self.cal.volts_per_tesla                     # V/T, per sensor

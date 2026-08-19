@@ -176,7 +176,8 @@ class RawRecorder:
     read back, including by a future version that has corrected the channel map.
     """
 
-    def __init__(self, path, hosts, vpc, fs_hz, nchan_per_box=32, meta=None):
+    def __init__(self, path, hosts, vpc, fs_hz, nchan_per_box=32, meta=None,
+                 cal=None):
         self.path = path
         self.hosts = list(hosts)
         self.nchan = nchan_per_box * len(hosts)
@@ -191,6 +192,17 @@ class RawRecorder:
                      "nchan_per_box": nchan_per_box,
                      "channel_names": _channel_names(len(hosts), nchan_per_box),
                      "note": "raw ACQ423 counts, wire order, nothing subtracted"}
+        if cal is not None:
+            # Counts alone are not interpretable: turning them into tesla needs
+            # the amplifier gain each chip was running AT THE TIME. That lives
+            # in a register, not in the data, and it does get changed -- when
+            # the two halves of this probe were harmonised from 1500/3000 to
+            # 3000, every capture taken before that silently became 1.82x wrong
+            # on half the channels if read back with the new settings. So stamp
+            # it into the sidecar.
+            self.meta["ranges_mt"] = list(map(float, cal.ranges_mt))
+            self.meta["volts_per_tesla"] = list(map(float, cal.volts_per_tesla))
+            self.meta["vcm_subtracted_by_reader"] = bool(cal.subtract_vcm)
         self.meta.update(meta or {})
 
     def write(self, ai_by_box):

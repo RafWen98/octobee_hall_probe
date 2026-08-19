@@ -479,6 +479,43 @@ def _cmd_capture(hosts, seconds, out):
     print(f"saved {out}")
 
 
+def alias_penalty(fs_hz, lpf_hz=100000.0):
+    """
+    Noise-density penalty from sampling below Nyquist for the sensor's analog
+    low-pass. The SENM3Dx LPF is fixed at 100 kHz (PWM_CTRL bits 5:4, already at
+    its narrowest), so anything under 200 kSPS folds 0-100 kHz into 0-fs/2.
+    Measured 3.1x at 20 kSPS against the 3.16x this predicts.
+    """
+    nyq = fs_hz / 2.0
+    return 1.0 if nyq >= lpf_hz else (lpf_hz / nyq) ** 0.5
+
+
+def _cmd_rate(hosts, fs_hz):
+    """Report, and optionally set, the ADC sample rate on every box."""
+    if fs_hz:
+        for h in hosts:
+            u = Uut(h)
+            try:
+                clk_mb = float(u.value("SIG:CLK_MB:FREQ").split()[-1])
+                u.cmd(f"clkdiv {max(1, int(round(clk_mb / fs_hz)))}", site=1)
+            finally:
+                u.close()
+        time.sleep(4)
+    for h in hosts:
+        u = Uut(h)
+        try:
+            fs = float(u.value("SIG:CLK_S1:FREQ").split()[-1])
+            ssb = int(u.value("ssb"))
+            div = u.value("clkdiv", site=1)
+            pen = alias_penalty(fs)
+            note = "" if pen <= 1.05 else "  <- aliased, sensor LPF is 100 kHz"
+            print(f"{h}: {fs:>9.0f} Hz  clkdiv {div:>5}  "
+                  f"{fs*ssb/1e6:5.2f} MB/s  noise x{pen:.2f}{note}")
+        finally:
+            u.close()
+    print("carrier stream path delivers ~10-15 MB/s; the 1 Gbps link is not the limit.")
+
+
 def _cmd_restore(hosts, fs_hz):
     """
     Put the site-1 ADC clock back. octobee_live.py restores it on a clean exit,
@@ -514,6 +551,10 @@ def main():
     r = sub.add_parser("restore", help="put the ADC clock back to its normal rate "
                                        "(use if a live session was killed)")
     r.add_argument("--fs", type=float, default=200000.0)
+    rt = sub.add_parser("rate", help="report, or set, the ADC sample rate. "
+                                     "Lowering it aliases -- the cost is printed.")
+    rt.add_argument("--fs", type=float, default=0.0,
+                    help="sample rate in Hz; omit to just report")
     c = sub.add_parser("capture", help="capture raw data from every box to an .npz")
     c.add_argument("--seconds", type=float, default=2.0)
     c.add_argument("-o", "--out", default="octobee_capture.npz")
@@ -524,6 +565,8 @@ def main():
         _cmd_info(hosts)
     elif a.cmd == "restore":
         _cmd_restore(hosts, a.fs)
+    elif a.cmd == "rate":
+        _cmd_rate(hosts, a.fs)
     else:
         _cmd_capture(hosts, a.seconds, a.out)
 

@@ -65,8 +65,11 @@ python octobee_cal.py --seconds 5       # health + calibration report
 
 ### Sample rate while streaming live
 
-The boxes produce 19.2 MB/s each at 200 kSPS, but the Ethernet link to this PC
-measures **9.8 MB/s**. A sustained 200 kSPS live stream therefore cannot keep up.
+Each carrier produces 19.2 MB/s at 200 kSPS but its stream path delivers only
+about 10–15 MB/s, so a sustained full-rate live stream cannot keep up. **This is
+not the Ethernet** — both carriers and this PC negotiate 1 Gbps full duplex, and
+reading `localhost:4210` on the carrier itself tops out at 15 MB/s. The limit is
+the carrier's streaming daemon and its dual-core ARM.
 `octobee_live.py` drops the ADC clock to 20 kSPS while it runs (`--fs`) and puts
 the original clock back on exit; measured broadband noise is unchanged, and a
 hand-passed magnet is a sub-Hz signal anyway.
@@ -585,20 +588,41 @@ solver flags this as weak offset leverage.
   ferrous structure close enough to matter and the calibration taken there is not
   trustworthy.
 
-#### Resolution: switch the ADC to 0–5 V first
+#### Resolution: do NOT reach for the 0–5 V ADC range
 
-Earth's field is small compared to the range, so this matters more here than
-anywhere else:
+It looks like it should help — Earth's field is only ~10 counts at ±10 V — and it
+does not. Measured on the bench 2026-08-19, ambient, median over the clean
+sensors:
 
-| ADC range | µT/count at ±20 mT | Earth (49 µT) |
-|---|---|---|
-| ±10 V (default) | 4.84 | 10 counts |
-| **0–5 V** | **1.21** | **40 counts** |
+| ADC range | µT/count | noise (counts) | **noise (µT)** | after 1000× averaging |
+|---|---|---|---|---|
+| ±10 V | 4.84 | 16.8 | **81.5** | 2.845 µT |
+| 0–5 V | 1.21 | 62.5 | **75.6** | 2.919 µT |
 
-See *Worth doing anyway: use the ADC range* below — it is free, and it is a 4×
-improvement in exactly the regime this step works in. At the ±400 mT range Earth
-is 0.6 counts and this whole method is unusable; carry the calibration up with
-`range_transfer()` instead (park a magnet to make 15–30 mT, capture at both
+The LSB really does get 4× finer, and the noise in counts rises 3.7× to cancel it
+exactly. **Quantisation was never the limit**: the analog noise is ~67× the
+quantisation floor, and a spectrum puts 98.7 % of its power above 1 kHz — broadband
+sensor and amplifier noise shaped by the SENM3Dx's 100 kHz low-pass, not pickup
+and not mains (50 Hz is 0.0 % of the power). §8 covers why 100 kHz is already the
+narrowest corner the part offers.
+
+There is also a code reason to stay bipolar: `Layout.volts_per_count` is
+`span/65536` with **no offset term**. That is correct for ±10 V (0 counts = 0 V),
+but a unipolar 0–5 V range puts 0 V at −32768, so true volts are
+`counts*vpc + 2.5`. Field readings survive — subtracting VCM cancels the missing
+pedestal — but every raw channel would read 2.5 V low, and
+`PLAUSIBLE_V = (-0.5, 5.5)` in `channel_health()` would call all 64 healthy
+channels broken.
+
+What *does* work is averaging: this noise is white, and falls as 1/√N almost
+perfectly (81.5 → 27.4 → 8.8 → 2.8 → 1.1 µT at 1/10/100/1000/10000×). So the
+lever is sampling **fast** and averaging, not quantising finely — and per §8,
+sampling at 200 kSPS and averaging on the host beats dropping the ADC clock by
+~3×, because then the ADC does the anti-aliasing for you. Prefer a full-rate
+capture over a live-stream recording when taking sweeps.
+
+At the ±400 mT range Earth is 0.6 counts and this whole method is unusable;
+carry the calibration up with `range_transfer()` instead (park a magnet to make 15–30 mT, capture at both
 gains without moving anything, take the ratio — the magnet's absolute value never
 enters, only that it held still).
 
@@ -732,16 +756,26 @@ and the arrows on the 3D model track it.*
 
 ![The Calibration tab](docs/gui-calibration.png)
 
-Each sensor's measurement range is set per row in the Sensors tab, not globally,
-because on this probe the two halves genuinely differ: the SPI audit in section 3
-found S1-S8 at gain 1500 (+/-40 mT, 34.65 V/T) and S9-S16 at gain 3000
-(+/-20 mT, 63 V/T). The shipped `calibration.json` already encodes that, so the
-1.82x is removed where it belongs -- at the volts-to-tesla conversion -- instead
-of being absorbed into a gain trim that would hide it. If the boxes are ever
-harmonised with `--set-gain`, update that file to match.
+Each sensor's measurement range is set per row in the Sensors tab rather than
+globally, because the range is a per-chip register and the two halves of this
+probe genuinely have differed. As of the 2026-08-19 harmonisation (section 3)
+all 16 run gain 3000, +/-20 mT, 63 V/T, and the shipped `calibration.json`
+records exactly that -- re-read live off both carriers with:
+
+```bash
+ssh root@acq1001_694 'python3 /tmp/onbox_gain_config.py show'
+ssh root@acq1001_695 'python3 /tmp/onbox_gain_config.py show'
+```
+
+Before that harmonisation S1-S8 sat at gain 1500 (+/-40 mT, 34.65 V/T), which
+made the same magnet read 1.82x taller on one half than the other. Keep the file
+and the registers in step: **if the gain is ever changed, change the ranges in
+the same commit.** A wrong range is invisible -- a uniformly rescaled half looks
+entirely normal on screen.
 
 If `calibration.json` is missing the GUI falls back to +/-20 mT for everything
-and says so in the Log, because that would silently scale S1-S8 by 1.82x.
+and says so in the Log. That default happens to match the probe today, but
+nothing checks it at run time.
 
 ### Data output
 
@@ -784,13 +818,14 @@ and which are assumed. Worked through on one real channel, S1 Bx:
 | raw ADC counts | Bx 7300.4, VCM 7313.7 | measured |
 | x volts/count = 20 V / 65536 = 305.176 uV | 2.227914 V, 2.231977 V | the ADC range is read off the box at run time |
 | - that chip's own VCM | **-4.0637 mV** | measured; this is what the chip is actually saying |
-| / sensitivity 34.65 V/T | **-0.1173 mT** | **assumed** -- datasheet nominal for gain 1500 |
+| / sensitivity 63 V/T | **-0.0645 mT** | **assumed** -- datasheet nominal for gain 3000 |
 | x gain trim, - tare | unchanged unless you set them | yours |
 
 So everything up to the differential millivolts is measurement. The last step
 divides by a **datasheet nominal sensitivity**, picked per sensor from the
 amplifier gain that was actually read out of each chip's `G_CTRL` register over
-SPI -- 34.65 V/T for S1-S8 at gain 1500, 63 V/T for S9-S16 at gain 3000.
+SPI -- currently 63 V/T on all 16, every chip reporting `G_CTRL = [0,0,0]`,
+`EGain_sel = 0x00` and a valid EEPROM key.
 
 That makes the mT scale traceable to the datasheet and to a register read, not
 to a reference magnet. Nothing here has been calibrated against a known field.
@@ -800,13 +835,23 @@ In practice:
   chips once the magnet-pass gain trim has equalised them;
 - **absolute** accuracy is datasheet nominal, so treat it as a few percent
   rather than metrology until someone puts a known field on it;
-- a wrong range setting is invisible and rescales everything by exactly 1.82,
-  which is why `calibration.json` carries the audited registers.
+- a wrong range setting is **invisible**: it simply rescales the affected
+  sensors, and nothing on screen looks wrong. That is why `calibration.json`
+  carries the audited registers, and why the selftest asserts them.
+
+A corollary worth remembering: **a raw capture stores counts, not field.**
+Reading one back needs the gain the chips were running at the time, and that
+lives in a register rather than in the data. Any `.npz` or `.bin` taken before
+the 2026-08-19 harmonisation is 1.82x wrong on S1-S8 if converted with today's
+settings. The `.bin` sidecar now stamps `ranges_mt` and `volts_per_tesla` into
+itself for exactly this reason; the `.npz` snapshot format does not, so date
+those by hand.
 
 The **in** selector next to the plot mode walks the chain back so you can look
 at any of it directly: `mT`, `uT`, `mV (chip output)` -- the differential volts
 above, with VCM subtracted -- or `ADC counts`, what came off the wire. The
-factor is per sensor, because the two halves of the probe run different gains
+factor is per sensor, because the range is a per-chip setting and the halves
+have run different gains before
 and one field is therefore not one voltage. The peak bars stay in mT on purpose
 for the same reason: equal millivolts on the two halves are not equal fields.
 
@@ -1000,3 +1045,86 @@ reject common drift.
    averaging time (2.7 µT vs 0.7 µT at 1 Hz). That is cabling, not silicon.
 3. **S16's open analog lines** — no useful field data at all until fixed.
 4. Not the ADC. See the corrected note in §4.
+
+---
+
+## 8. Reducing the data rate
+
+Three places to do it, with very different consequences.
+
+### The rule that governs all of them
+
+The SENM3Dx analog low-pass is **fixed at 100 kHz** (`PWM_CTRL` bits 5:4 select
+100/150/200/220 kHz; every chip is already on the narrowest, 0). Nothing between
+the sensor and the ADC filters further. So sampling below 200 kSPS folds all the
+noise in 0–100 kHz into 0–fs/2, and noise density rises by `sqrt(100kHz/(fs/2))`:
+
+| rate | stream | aliasing penalty | measured |
+|---|---|---|---|
+| 200 kSPS | 19.2 MB/s | 1.00× (critically sampled) | baseline |
+| 50 kSPS | 4.8 MB/s | 2.00× | — |
+| 20 kSPS | 1.9 MB/s | 3.16× | **3.1×** |
+
+**Averaging on the host after sampling at 200 kSPS is strictly better than
+sampling slower**, because the ADC does the anti-aliasing for you. Only drop the
+clock when stream bandwidth is genuinely the binding constraint.
+
+### 1. Clock divider — works, costs noise
+
+```bash
+python octobee.py rate                    # report rate, load and aliasing cost
+python octobee.py rate --fs 50000         # set 50 kSPS on both boxes
+python octobee.py restore                 # back to 200 kSPS
+```
+
+On the carrier itself:
+
+```bash
+/usr/local/CARE/set-sample-rate.sh          # report
+/usr/local/CARE/set-sample-rate.sh 50000    # set
+```
+
+Both print the aliasing penalty so the trade is never silent. The GUI's
+**stream rate** dropdown does the same thing and now states the cost in each
+option label.
+
+### 2. FPGA oversampling filter (`nacc`) — the right answer, but inert here
+
+D-TACQ's documented accumulate/decimate filter (manual §13.1) would do this
+properly: decimate in the FPGA, no aliasing, √N less noise, data rate ÷N, zero
+CPU. It does not work on these boxes:
+
+```
+NACC:DISA was TRUE at site 0; setting it FALSE and then nacc=8 / nacc=32
+reads back 8,3,0,1 / 32,5,0,1 -- but the output rate stays 200 kSPS
+(uSec counter still +5 per sample) and the noise stays at 63 uT rms.
+```
+
+The FPGA is a **custom OCTO-BEE bitstream**, `ACQ1001_TOP_09_74_32B-OCTOBEE`,
+so the oversampling block is most likely simply not in this build. **Worth asking
+D-TACQ to include it** — it is the clean fix and it is their own feature.
+
+### 3. Decimate on the carrier before the network
+
+The carrier runs numpy 1.18.2 on a dual-core ARMv7. Benchmarked reading its own
+`localhost:4210` and boxcar-averaging by 32:
+
+```
+naive (float mean, bytearray del)   13.4 MB/s in,  39% CPU
+tuned (recv_into, int32 sum)        15.0 MB/s in,  25% CPU
+```
+
+15.0 of the 19.2 MB/s produced, so it still falls ~20 % short at full rate — the
+remaining bottleneck is the loopback socket, not numpy. Viable if paired with a
+small clock trim (150 kSPS costs only 1.15× in noise), or by reading D-TACQ's
+raw buffer devices instead of the TCP loopback. Not implemented here; noted
+because it is the best option that needs no firmware change.
+
+### What to actually do
+
+- **Short captures:** stay at 200 kSPS. The box buffers and delivers every
+  sample — a 3 s capture from both boxes came back with zero lost samples.
+- **Live viewing:** the GUI/`octobee_live.py` default of 20 kSPS is fine. You are
+  watching a hand-passed magnet; 3.2× on a noise floor of ~1 µT does not matter.
+- **Quantitative work:** 200 kSPS, then average to the bandwidth you need (§7).
+- **Long continuous logging:** ask D-TACQ about `nacc` in the OCTO-BEE build.
