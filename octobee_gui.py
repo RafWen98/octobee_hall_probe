@@ -516,11 +516,18 @@ class LivePlot(QtWidgets.QWidget):
     """Rolling traces. |B| per sensor by default, since that is comparable."""
 
     MODES = ("|B| per sensor", "all axes (chip frame)", "all axes (tube frame)")
+    # What the y axis shows. The pipeline always works in millitesla; these
+    # walk that back down the conversion chain so the electrical signal can be
+    # inspected directly -- useful when you want to know whether a number is
+    # the sensor talking or the conversion assuming.
+    UNITS = ("mT", "uT", "mV (chip output)", "ADC counts")
 
     def __init__(self, geom, profiler=None):
         super().__init__()
         self.profiler = profiler or oprof.Profiler(enabled=False)
         self.target_mult = PLOT_TARGET_MULT
+        self.unit_scale = np.ones(N_SENSORS)
+        self.unit_name = "mT"
         self.geom = geom
         self.mode = self.MODES[0]
         self.visible = set(range(N_SENSORS))
@@ -576,9 +583,19 @@ class LivePlot(QtWidgets.QWidget):
 
     def set_mode(self, mode):
         self.mode = mode
-        mag = mode == self.MODES[0]
-        self.plot.setLabel("left", "|B|" if mag else "B", units="mT")
+        self._relabel()
         self._apply_visibility()
+
+    def set_units(self, scale, name):
+        """Per-sensor scale factor taking millitesla to the displayed unit."""
+        self.unit_scale = np.asarray(scale, float).reshape(N_SENSORS)
+        self.unit_name = name
+        self._relabel()
+
+    def _relabel(self):
+        mag = self.mode == self.MODES[0]
+        self.plot.setLabel("left", "|B|" if mag else "B",
+                           units=self.unit_name)
 
     def set_visible_sensors(self, sensors):
         self.visible = set(sensors)
@@ -652,13 +669,17 @@ class LivePlot(QtWidgets.QWidget):
                                                          self.MODES[0] else 3))
         self.profiler.note("points buffered", n)
         target = max(256, int(self.plot.width() * self.target_mult))
+        k = self.unit_scale
         if self.mode == self.MODES[0]:
-            mag = np.linalg.norm(b_mt, axis=-1)
+            # |k B| == k |B| for positive k, so scaling the magnitude is the
+            # same as scaling the components first.
+            mag = np.linalg.norm(b_mt, axis=-1) * k[None, :]
             x, y = self._to_screen(t, mag, target)
             for s in shown:
                 self.mag_curves[s].setData(x, y[:, s])
         else:
             b = self.geom.to_tube_frame(b_mt) if "tube" in self.mode else b_mt
+            b = b * k[None, :, None]
             x, y = self._to_screen(t, b.reshape(n, -1), target)
             for s in shown:
                 for a in range(3):
@@ -1078,6 +1099,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_mode.addItems(LivePlot.MODES)
         self.cmb_mode.currentTextChanged.connect(self.plot.set_mode)
         top.addWidget(self.cmb_mode)
+        top.addWidget(QtWidgets.QLabel(" in "))
+        self.cmb_units = QtWidgets.QComboBox()
+        self.cmb_units.addItems(LivePlot.UNITS)
+        self.cmb_units.setToolTip(
+            "The pipeline always works in millitesla. These walk that back "
+            "down the conversion chain so you can see the electrical signal "
+            "itself: 'mV (chip output)' is the chip's own output with its VCM "
+            "reference subtracted, and 'ADC counts' is what came off the wire. "
+            "Any tare or gain trim in force is still applied.")
+        self.cmb_units.currentTextChanged.connect(self.on_units)
+        top.addWidget(self.cmb_units)
         top.addSpacing(12)
         self.chk_sensors = []
         for s in range(N_SENSORS):
@@ -1423,6 +1455,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # the numbers makes a healthy session look blocked.
         self.prof.reset()
         self.lag.reset()
+        # counts-per-volt is read off the box, so the counts scale is only
+        # known once a source exists.
+        if hasattr(self, "cmb_units"):
+            self.on_units()
         self.act_disconnect.setEnabled(True)
         self.act_connect.setEnabled(kind != "live")
         self.lbl_state.setText(f"{kind}: {', '.join(source.hosts)} "
@@ -1469,6 +1505,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self.roll.clear()
         self.view3d.reset_scale()
+        if hasattr(self, "cmb_units"):
+            self.on_units()
         if self.collecting is not None and self.collecting["what"] == "magnet":
             self.btn_magnet.setChecked(False)
             self.log.log(f"magnet pass abandoned: {what} changed mid-pass")
@@ -2229,6 +2267,30 @@ class MainWindow(QtWidgets.QMainWindow):
             bad = f"S{s+1}" in dead
             cb.setStyleSheet("color:#c05050;" if bad else "")
             cb.setToolTip("excluded: railed or stuck channels" if bad else "")
+
+    def on_units(self, *_):
+        """
+        Build the per-sensor factor that takes millitesla to the chosen unit.
+
+        It is per-sensor because the two halves of the probe run different
+        amplifier gains: 34.65 V/T on S1-S8 and 63 V/T on S9-S16. One field
+        therefore is not one voltage, and a single global factor would quietly
+        misreport half the probe.
+        """
+        name = self.cmb_units.currentText()
+        vpt = self.cal.volts_per_tesla                     # V/T, per sensor
+        if name == "mT":
+            k = np.ones(N_SENSORS)
+        elif name == "uT":
+            k = np.full(N_SENSORS, 1e3)
+        elif name.startswith("mV"):
+            k = vpt                                        # mT * V/T -> mV
+        else:                                              # ADC counts
+            vpc = np.array([(self.source.vpc[0] if s < 8 else self.source.vpc[-1])
+                            if self.source else 20.0 / 65536.0
+                            for s in range(N_SENSORS)])
+            k = vpt * 1e-3 / vpc                           # mT -> volts -> counts
+        self.plot.set_units(k, {"uT": "µT"}.get(name, name))
 
     def on_sensor_toggle(self, _=None):
         self.plot.set_visible_sensors(
