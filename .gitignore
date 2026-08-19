@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# captured data and generated reports
+*.npz
+*.csv
+*.h5
+captures/
+octobee_cal.png
+smoketest*.png
+
+# local overrides
+probe_geometry_local.json
+calibration_local.json

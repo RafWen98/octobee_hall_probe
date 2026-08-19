@@ -1,0 +1,274 @@
+# OCTO-BEE Hall probe — setup, live view, and calibration
+
+Tooling that replaces the Phoebus Data Browser round-trip for the 16-sensor
+3D Hall probe, plus what the hardware actually reports today.
+
+Everything here was verified against the live hardware on 2026-08-19.
+
+---
+
+## 1. What the system actually is
+
+You have **two** carriers, not one. That is why you were only ever seeing 32
+channels: Phoebus was pointed at one box.
+
+| carrier | IP | ACQ423 s/n | sensors | stream frame |
+|---|---|---|---|---|
+| `acq1001_694` | 192.168.1.82 | E42310297 | S1–S8 | 96 B (24 LW), 1 encoder word |
+| `acq1001_695` | 192.168.1.83 | E42310298 | S9–S16 | 104 B (26 LW), 3 encoder words |
+
+Both: ACQ423ELF, 32 ch, 16-bit packed, ±10 V, 200 kSPS, SPAD = 7 longwords.
+The two boxes have **different frame layouts**, so anything that decodes the raw
+stream has to read the geometry off the box rather than hard-code it. The tools
+here do that.
+
+The carriers are **not** synchronised — each free-runs on its own oscillator
+(measured 200001 Hz vs 199999 Hz). The two halves of the probe drift relative to
+each other by about 1 sample per 100 k. Fine for amplitude work, not for phase.
+
+### Channel map
+
+Per box, each SENIS eval kit takes 4 consecutive ACQ423 channels:
+
+```
+ch 4k+1 = Bz    ch 4k+2 = By    ch 4k+3 = Bx    ch 4k+4 = VCM
+```
+
+so kit 1 → ch 1–4, kit 2 → ch 5–8, … kit 8 → ch 29–32, on each box.
+
+**VCM is not a field channel.** It is that chip's own virtual-ground reference
+(~2.2 V), and it must be subtracted from that same chip's Bx/By/Bz before any
+field number is quoted. The 16 chips' VCMs differ by up to ~90 mV.
+
+This map comes from the OCTO-BEE guide §3.7. It is documentation, not
+measurement — confirm it on your hardware with `octobee_idmap.py` (§4).
+
+---
+
+## 2. Quick start
+
+```bash
+python octobee.py info                  # live config + channel map, both boxes
+python octobee_live.py                  # LIVE PLOT, all 16 sensors, one window
+python octobee_cal.py --seconds 5       # health + calibration report
+```
+
+`octobee_live.py` modes:
+
+| flag | view |
+|---|---|
+| *(default)* `--mode stack` | 48 field traces stacked, labelled `S1 Bz` … `S16 Bx` |
+| `--mode overlay` | all traces on one pair of axes — use this to compare spike heights |
+| `--mode grid` | one subplot per sensor, with a black \|B\| trace |
+| `--show-vcm` | adds the 16 VCM references |
+| `--range 20` | y-axis in mT instead of volts |
+
+### Sample rate while streaming live
+
+The boxes produce 19.2 MB/s each at 200 kSPS, but the Ethernet link to this PC
+measures **9.8 MB/s**. A sustained 200 kSPS live stream therefore cannot keep up.
+`octobee_live.py` drops the ADC clock to 20 kSPS while it runs (`--fs`) and puts
+the original clock back on exit; measured broadband noise is unchanged, and a
+hand-passed magnet is a sub-Hz signal anyway.
+
+Short offline captures at the full 200 kSPS are unaffected — the box buffers and
+delivers every sample, just slower than real time. A 2 s capture from both boxes
+came back with **zero** lost samples.
+
+### Phoebus interaction
+
+Phoebus' *Streaming Capture* button starts a `CONTINUOUS` stream that owns the
+data mover; while it runs, port 4210 gives an immediate EOF. All the tools here
+stop it automatically. To go back to Phoebus, just press its start button again.
+
+---
+
+## 3. What the hardware is telling us right now
+
+From a 2 s capture of both boxes, ambient field, no magnet:
+
+**Dead sensor.** `acq1001_695` ch29/30/32 (S16 Bz, By, VCM) are pinned at
+−32768 counts — negative full scale, zero variance. ch31 (Bx) reads normally.
+Three of four lines dead but one alive points at the port-8 ribbon/connector on
+that concentrator, not a dead chip. **Fix this before calibrating.**
+
+**Noise rises steadily along the ribbon.** The VCM channel carries no field, so
+its noise is pure analog-path pickup. Per box it climbs monotonically with port
+number:
+
+```
+694 VCM noise [counts]:  S1 0.52  S2 0.54  S3 0.55  S4 1.26
+                         S5 0.97  S6 2.00  S7 3.33  S8 12.47
+695 worst:               S9 13.26   (S9 field channels: 136–311 counts std)
+```
+
+That is a cabling/grounding signature — longer runs and later connector
+positions picking up more. It is not a sensor calibration problem, and no amount
+of gain trimming will fix it. Worth reseating and checking the ribbon
+grounding on the high-numbered ports.
+
+**VCM spread.** 2.2324 V (S1) down to 2.1420 V (S8). ~90 mV = ~295 counts =
+about 1.4 mT of *apparent* field at the 20 mT range if you plot raw channels.
+This shifts baselines, not amplitudes — but it will wreck any absolute reading.
+
+**ASIC temperatures look wrong.** Several read 8–14 °C, below plausible room
+temperature. Either the AMUX channel mapping on the CELF differs from the guide,
+or those inputs are not connected. Treat the temperature column as unverified.
+
+**PWR_GOOD** reads `0xff000fff` (694) and `0xffffff00` (695), not `0xffffffff`.
+Per the guide it only latches at boot, so it may be stale — but it is worth a
+reboot to see whether it agrees with the S16 fault.
+
+---
+
+## 4. Calibration procedure
+
+### The geometry problem
+
+The 16 sensors are mounted on a square tube, 4 per face, pointing outwards. Two
+consequences dominate everything else:
+
+1. **Every chip has a different orientation.** A chip on face 1 and a chip on
+   face 3 are rotated 180° about the tube axis, so their `Bx` point in opposite
+   lab directions. *Comparing a single axis across sensors is meaningless.*
+   Compare `|B| = √(Bx²+By²+Bz²)`, which is rotation-invariant. The tools do.
+
+2. **"Same distance from the probe" is not the same distance from each sensor.**
+   A magnet held at a fixed point sits at very different distances from sensors
+   on the near face and the far face, and at different distances from the four
+   positions along a face. Field from a small magnet falls off roughly as 1/r³,
+   so a 10 % distance error is a 30 % amplitude error. **This alone can produce
+   the unequal spike heights you are seeing, with perfectly calibrated sensors.**
+
+So the calibration has to present the magnet *per sensor*, normal to that
+sensor's own face, at a fixed distance from that sensor's package centre. The
+field-sensitive volume is at the centre of the QFN28 package, 100 × 100 × 10 µm.
+
+### Step 0 — fix the hardware first
+
+Repair the S16 port. Reseat the high-numbered ribbons. Re-run
+`python octobee_cal.py --seconds 5` and confirm all 16 sensors show VCM noise
+below ~1 count before going further. Calibrating over a cabling fault just bakes
+the fault into your coefficients.
+
+### Step 1 — make the chips identical (this is the likely culprit)
+
+Gain, Hall bias current and EEPROM calibration status live inside the ASIC and
+are reachable only over SPI from the carrier. A chip at gain 1500 gives exactly
+half the response of one at 3000, for the same field.
+
+```bash
+scp onbox_sensor_audit.py root@acq1001_694:/tmp/
+ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py'
+ssh root@acq1001_695 'python3 /tmp/onbox_sensor_audit.py'
+```
+
+Read the `!!` lines. They flag any register that differs between chips:
+`gain`, `DAC_X/Z/Y` (bias current = sensitivity), `SENS_*` (fine gain), and
+**`EE valid`** — if a chip's EEPROM key/checksum is invalid the factory
+calibration is *not loaded* and it runs on datasheet defaults.
+
+To harmonise gain across a box:
+
+```bash
+ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py --set-gain 3000'
+```
+
+That writes registers only, so it is lost at power cycle. Make it permanent by
+writing the same values to EEPROM and calling `activate_EEPROM_config()`.
+
+### Step 2 — verify the channel map
+
+```bash
+# terminal 1
+ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py --id-sweep 4'
+# terminal 2, started right after
+python octobee_idmap.py --uut acq1001_694 --seconds 70
+```
+
+The sweep mutes each sensor's Bx/By/Bz in turn over SPI; the host tool reports
+which ACQ423 channels went quiet, in order, and prints CONFIRMED or the measured
+map. No clock sync needed — only the order matters. Repeat for `_695`.
+
+### Step 3 — build the physical map
+
+SPI position ≠ position on the tube. Pass a magnet slowly along one face:
+
+```bash
+python octobee_idmap.py --uut acq1001_694 --seconds 60 --magnet
+```
+
+It ranks the sensor groups by when they peaked, which is the physical order.
+Record the result as a table: *tube face × position → sensor → channels*.
+
+### Step 4 — zero-field offsets
+
+Capture with no magnet nearby and the probe away from anything ferrous:
+
+```bash
+python octobee.py capture --seconds 10 -o zero_field.npz
+python octobee_cal.py --load zero_field.npz
+```
+
+The `off Bz/By/Bx` columns are each axis' residual offset after VCM subtraction.
+Store them as your offset table. For a proper zero you want either a zero-gauss
+chamber, or the flip method: rotate the probe 180° and average the two readings,
+which cancels the ambient field and leaves the offset.
+
+### Step 5 — cross-calibration
+
+With gains harmonised and offsets known, present the *same* magnet to each
+sensor in turn, normal to that sensor's face, at a fixed distance — use a
+machined spacer or jig so the geometry repeats to well under a millimetre.
+
+```bash
+python octobee_cal.py --seconds 20 --range 20 --plot
+```
+
+The report gives each sensor's peak `|B|` and its ratio to the median. Those
+ratios are your per-sensor scale factors `k_i = B_ref / |B|_i`. After Step 1 they
+should land inside a few percent; anything still outside ±10 % means that chip's
+EEPROM calibration is suspect or its mounting differs.
+
+### Step 6 — absolute scale and orientation (when you need lab-frame vectors)
+
+Relative cross-calibration is all you can get from a hand-held magnet. For
+absolute field and a common coordinate frame you need a known uniform field —
+a Helmholtz coil large enough to swallow the tube, or a calibrated reference
+magnetometer:
+
+- **Absolute scale:** apply a known `B`, read each sensor, `k_i = B_known/|B|_i`.
+- **Orientation matrix `R_i`:** with the tube in a known uniform field, each
+  sensor's (Bx,By,Bz) is `R_i` applied to that field. Repeat for three
+  independent field directions (or rotate the tube about its axis to three known
+  angles) and solve for `R_i` per sensor. After that every sensor reports in the
+  tube frame and the four faces become directly comparable.
+- Log `TCH1..8` alongside — sensitivity TC is <100 ppm/°C, so a 10 °C spread is
+  a 0.1 % effect, small but free to record.
+
+### Worth doing anyway: use the ADC range
+
+The ACQ423 is set to ±10 V but the SENIS analog output only spans 0.125–4.380 V.
+Switching to the `0-5V` range gives 4× finer resolution for free:
+
+```bash
+python -c "import octobee as ob; u=ob.Uut('acq1001_694'); print(u.cmd('GAIN:ALL 0-5V',1)); u.close()"
+```
+
+At 20 mT range that takes the quantisation from 4.8 µT/count to 1.2 µT/count.
+Verify VCM still reads ~2.2 V afterwards.
+
+---
+
+## 5. Files
+
+| file | runs on | purpose |
+|---|---|---|
+| `octobee.py` | PC | core library: UUT knobs, frame decode, capture. `info` / `capture` CLI |
+| `octobee_live.py` | PC | live plot of all 16 sensors, both boxes, one window |
+| `octobee_cal.py` | PC | health + calibration report, optional PNG |
+| `octobee_idmap.py` | PC | proves the channel↔sensor map (SPI sweep or magnet pass) |
+| `onbox_sensor_audit.py` | **carrier** | SPI register audit of all 8 chips; `--id-sweep`, `--set-gain` |
+
+Requires `numpy` and `matplotlib` on the PC. Nothing else — no HAPI install, no
+Phoebus, no EPICS.
