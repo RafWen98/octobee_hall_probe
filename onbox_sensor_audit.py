@@ -28,7 +28,9 @@ import argparse
 import sys
 import time
 
-sys.path.append("/usr/local/CARE")
+for _p in ("/usr/local/senm3dx", "/usr/local/CARE"):
+    if _p not in sys.path:
+        sys.path.append(_p)
 
 import ThreeDHALLInterface as tdhi          # noqa: E402
 
@@ -62,8 +64,18 @@ def open_sensor(pos):
     return dx
 
 
-def decode_gain(g_ctrl):
-    """G_CTRL register byte -> nominal gain, honouring the 2-bit/4-bit select."""
+def decode_gain(dx, g_ctrl):
+    """
+    G_CTRL register byte -> nominal gain. Prefers the vendor helper when the
+    installed ThreeDHALLInterface provides it, else decodes per datasheet
+    Table 22, honouring the 2-bit/4-bit selection method.
+    """
+    helper = getattr(dx, "extract_gain_from_gain_ctrl_reg_val", None)
+    if helper is not None:
+        try:
+            return helper(g_ctrl)
+        except Exception:                            # noqa: BLE001
+            pass
     if g_ctrl & 0x08:                                # bit 3: 4-bit selection
         pre = 1 if (g_ctrl >> 4) & 1 else 10
         main = {3: 2.5, 1: 5, 0: 10}.get((g_ctrl >> 5) & 3, float("nan"))
@@ -97,6 +109,8 @@ def audit():
 
     print("-" * (14 + 8 * NSENS))
     row("SPI ok", lambda d: "yes")
+    row("chip ID", lambda d: d.get_ID(), "{:>8.8}")
+    row("meas range", lambda d: d.get_meas_range())
     row("STATUS", lambda d: f"0x{d.read_reg_val(reg_address=0x3F):02x}")
     row("EE key", lambda d: f"0x{d.read_EEPROM_key_byte_reg():02x}")
     row("EE cksum", lambda d: f"0x{d.read_EEPROM_check_sum_reg():02x}")
@@ -109,9 +123,9 @@ def audit():
     for name, addr in REGS:
         row(name, lambda d, a=addr: d.read_reg_val(reg_address=a))
     print("-" * (14 + 8 * NSENS))
-    row("gain X", lambda d: decode_gain(d.read_reg_val(reg_address=0x0E)))
-    row("gain Z", lambda d: decode_gain(d.read_reg_val(reg_address=0x0F)))
-    row("gain Y", lambda d: decode_gain(d.read_reg_val(reg_address=0x10)))
+    row("gain X", lambda d: decode_gain(d, d.read_reg_val(reg_address=0x0E)))
+    row("gain Z", lambda d: decode_gain(d, d.read_reg_val(reg_address=0x0F)))
+    row("gain Y", lambda d: decode_gain(d, d.read_reg_val(reg_address=0x10)))
 
     # ---- verdict --------------------------------------------------------
     print()
@@ -120,31 +134,76 @@ def audit():
         print(f"!! sensors not answering on SPI: "
               f"{[p for p in range(1, NSENS+1) if p not in live]}")
 
-    def spread(label, fn):
+    def read_all(fn):
         vals = {}
         for p in live:
             try:
                 vals[p] = fn(devs[p])
             except Exception:                        # noqa: BLE001
                 pass
+        return vals
+
+    # --- registers that MUST be identical: these are operating-mode settings.
+    #     A difference here means the chips are configured differently and will
+    #     give different amplitudes for the same field.
+    print("configuration registers -- these SHOULD be identical across chips:")
+    for label, fn in (
+            ("amplifier gain", lambda d: d.get_gain()),
+            ("PWM_CTRL (LPF corner)", lambda d: d.read_reg_val(reg_address=0x08)),
+            ("CHANNEL_CTRL", lambda d: d.read_reg_val(reg_address=0x09)),
+            ("OSC_trim", lambda d: d.read_reg_val(reg_address=0x0A)),
+            ("EEPROM calibration valid",
+             lambda d: d.verify_EEPROM_data_for_config()),
+    ):
+        vals = read_all(fn)
         uniq = set(vals.values())
         if len(uniq) > 1:
-            print(f"!! {label} DIFFERS between chips: " +
+            print(f"!! {label} DIFFERS: " +
                   ", ".join(f"S{p}={v}" for p, v in sorted(vals.items())))
         elif uniq:
-            print(f"   {label} identical on all responding chips: {uniq.pop()}")
+            print(f"   {label}: {uniq.pop()} on all {len(vals)} chips")
 
-    spread("amplifier gain", lambda d: d.get_gain())
-    spread("EEPROM calibration valid", lambda d: d.verify_EEPROM_data_for_config())
-    for nm, a in (("DAC_X (Bx bias)", 0x11), ("DAC_Z (Bz bias)", 0x12),
-                  ("DAC_Y (By bias)", 0x13)):
-        spread(nm, lambda d, aa=a: d.read_reg_val(reg_address=aa))
-    for nm, a in (("SENS_X", 0x14), ("SENS_Z", 0x15), ("SENS_Y", 0x16)):
-        spread(nm + " (fine gain)", lambda d, aa=a: d.read_reg_val(reg_address=aa))
+    # --- registers that are EXPECTED to differ: per-chip factory calibration
+    #     trims loaded from EEPROM. Different values here are what make the
+    #     chips agree, not what makes them disagree. Only a value that has
+    #     dropped out (0 where every sibling is non-zero) is a real fault.
+    print("\ncalibration trims -- these are per-chip and SHOULD differ:")
+    for label, addr, unit in (
+            ("DAC_X  (Bx Hall bias)", 0x11, "mA"),
+            ("DAC_Z  (Bz Hall bias)", 0x12, "mA"),
+            ("DAC_Y  (By Hall bias)", 0x13, "mA"),
+            ("SENS_X (Bx fine gain)", 0x14, ""),
+            ("SENS_Z (Bz fine gain)", 0x15, ""),
+            ("SENS_Y (By fine gain)", 0x16, ""),
+            ("OFFSET_X", 0x1A, ""), ("OFFSET_Z", 0x1B, ""),
+            ("OFFSET_Y", 0x1C, ""),
+    ):
+        vals = read_all(lambda d, a=addr: d.read_reg_val(reg_address=a))
+        if not vals:
+            continue
+        zeros = [p for p, v in vals.items() if v == 0]
+        nonzero = [v for v in vals.values() if v != 0]
+        rng = f"{min(vals.values())}..{max(vals.values())}"
+        if addr in (0x11, 0x12, 0x13):
+            cur = {p: 0.5 + v * 0.1172 for p, v in vals.items()}   # datasheet 9.2.7
+            spreadpc = (max(cur.values()) / min(cur.values()) - 1) * 100
+            note = (f"{min(cur.values()):.2f}-{max(cur.values()):.2f} mA, "
+                    f"{spreadpc:.0f}% spread")
+        else:
+            note = f"raw {rng}"
+        print(f"   {label:22s} {note}")
+        if zeros and nonzero:
+            print(f"!!   -> S{', S'.join(str(p) for p in zeros)} reads 0 while every "
+                  f"other chip is {min(nonzero)}..{max(nonzero)}")
+            if addr in (0x14, 0x15, 0x16):
+                print("        SENS bit7=0 means AUTO LINEARITY instead of manual fine")
+                print("        gain: that axis is in a different correction mode.")
 
-    print("\nAny line starting '!!' is a reason the same magnet can give different")
-    print("amplitudes on different sensors. Gain and DAC_* set sensitivity directly;")
-    print("EEPROM invalid means the factory calibration is NOT loaded on that chip.")
+    print("\nHow to read this:")
+    print("  '!!' on a configuration register = the chips are set up differently,")
+    print("  which changes amplitude directly. '!!' on a calibration trim = that")
+    print("  axis lost its factory trim. Differing trim VALUES on their own are")
+    print("  normal and are what equalise the chips.")
     return devs
 
 

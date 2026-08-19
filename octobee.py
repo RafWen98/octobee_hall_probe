@@ -454,6 +454,30 @@ def _cmd_capture(hosts, seconds, out):
     print(f"saved {out}")
 
 
+def _cmd_restore(hosts, fs_hz):
+    """
+    Put the site-1 ADC clock back. octobee_live.py restores it on a clean exit,
+    but a killed process (or a lost connection) leaves the box at the reduced
+    rate -- this is the undo.
+    """
+    for h in hosts:
+        u = Uut(h)
+        try:
+            clk_mb = float(u.value("SIG:CLK_MB:FREQ").split()[-1])
+            div = max(1, int(round(clk_mb / fs_hz)))
+            u.cmd(f"clkdiv {div}", site=1)
+        finally:
+            u.close()
+    time.sleep(4)
+    for h in hosts:
+        u = Uut(h)
+        try:
+            print(f"{h}: clkdiv {u.value('clkdiv', 1)}, "
+                  f"{u.value('SIG:CLK_S1:FREQ').split()[-1]} Hz")
+        finally:
+            u.close()
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(description="OCTO-BEE stream utilities")
@@ -462,6 +486,9 @@ def main():
                         f"(default: {' '.join(DEFAULT_UUTS)})")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info", help="print live configuration of every box")
+    r = sub.add_parser("restore", help="put the ADC clock back to its normal rate "
+                                       "(use if a live session was killed)")
+    r.add_argument("--fs", type=float, default=200000.0)
     c = sub.add_parser("capture", help="capture raw data from every box to an .npz")
     c.add_argument("--seconds", type=float, default=2.0)
     c.add_argument("-o", "--out", default="octobee_capture.npz")
@@ -470,6 +497,8 @@ def main():
 
     if a.cmd == "info":
         _cmd_info(hosts)
+    elif a.cmd == "restore":
+        _cmd_restore(hosts, a.fs)
     else:
         _cmd_capture(hosts, a.seconds, a.out)
 

@@ -75,6 +75,14 @@ Short offline captures at the full 200 kSPS are unaffected — the box buffers a
 delivers every sample, just slower than real time. A 2 s capture from both boxes
 came back with **zero** lost samples.
 
+If a live session is killed rather than closed, the reduced clock is left in
+place. Undo it with:
+
+```bash
+python octobee.py restore        # puts both boxes back to 200 kSPS
+python octobee.py info           # confirm
+```
+
 ### Phoebus interaction
 
 Phoebus' *Streaming Capture* button starts a `CONTINUOUS` stream that owns the
@@ -119,6 +127,134 @@ or those inputs are not connected. Treat the temperature column as unverified.
 Per the guide it only latches at boot, so it may be stale — but it is worth a
 reboot to see whether it agrees with the S16 fault.
 
+**The two boxes' chips are configured differently.** `octobee_cal.py` includes an
+SPI-free check for this. The VCM channel is the control: it leaves the same
+package, travels the same ribbon into the same ADC, but carries no Hall signal
+and no amplifier gain. So `noise(field) / noise(VCM)` isolates the amplifier
+chain with the shared cable pickup divided out. On the sensors whose VCM is
+clean:
+
+```
+acq1001_694  S1 14.9   S2 15.2   S3 14.2   S5  9.3        median 14.5
+acq1001_695  S10 20.9  S11 27.2  S12 26.3  S13 38.6  S14 28.4  S15 28.8   median 27.8
+```
+
+A consistent **1.9×** split between the boxes, with matching VCM noise. That is a
+register difference — amplifier gain (`G_CTRL_X/Z/Y`) and/or low-pass corner
+(`PWM_CTRL` bits 5:4) — not cabling. A chip at higher gain gives a proportionally
+bigger spike for the same field. Sensors whose VCM is already noisy (S4, S6–S9)
+cannot be assessed this way; the report says so rather than guessing.
+
+### SPI audit, acq1001_694 (S1–S8)
+
+Measured over SPI on the carrier. **Within this box the configuration is
+uniform** — the chips are not set up differently from each other:
+
+```
+amplifier gain     1500  on all 8   -> +/-40 mT range, 34.65 V/T
+PWM_CTRL              0  on all 8   -> LPF 100 kHz, same on every chip
+CHANNEL_CTRL        127  on all 8   -> X, Z, Y and temperature all enabled
+EEPROM key         0xa5  on all 8   -> factory calibration IS loaded
+STATUS             0x1c  on all 8   -> no checksum error, no invalid key
+chip temperature   21.4 .. 32.5 C   -> plausible, unlike the SPAD TCH values
+```
+
+The per-chip trims *do* differ, and that is correct — they are the factory
+calibration compensating each Hall element:
+
+```
+DAC_X (Bx bias)  13..16  =  2.02-2.38 mA   18% spread
+DAC_Z (Bz bias)  18..21  =  2.61-2.96 mA   13% spread
+DAC_Y (By bias)  13..16  =  2.02-2.38 mA   18% spread
+```
+
+Those match the datasheet's nominal 2.2 mA (vertical) / 2.6 mA (horizontal)
+bias. Differing values here are what make the chips *agree*, not what makes them
+disagree — an earlier version of the audit flagged them as faults, which was
+wrong, and the script now separates "configuration that must match" from
+"calibration trim that is expected to differ".
+
+Three real anomalies did show up, where a trim has dropped to zero while every
+sibling is ~130–205:
+
+```
+SENS_Y = 0 on S4      SENS_Z = 0 on S8      SENS_Y = 0 on S8
+```
+
+`SENS` bit 7 clear means *auto linearity control* instead of *manual fine gain*,
+so those three axes are in a different sensitivity-correction mode from the other
+21. The fine-gain trim is only 0.05 %/LSB (a few percent overall), so this is a
+small effect — but it is a genuine per-axis calibration difference.
+
+### SPI audit, acq1001_695 (S9–S16) — and the root cause
+
+```
+S9 : gain=3000  G_CTRL_X=0  EEkey=0xa5  DAC=[11,16,12]  T=34.5 C
+S10: gain=3000  G_CTRL_X=0  EEkey=0xa5  DAC=[12,16,12]  T=31.3 C
+S11: gain=3000  G_CTRL_X=0  EEkey=0xa5  DAC=[12,15,12]  T=31.4 C
+S12: gain=3000  G_CTRL_X=0  EEkey=0xa5  DAC=[12,16,13]  T=28.8 C
+S13: gain=3000  G_CTRL_X=0  EEkey=0xa5  DAC=[12,16,13]  T=31.4 C
+S14: gain=3000  G_CTRL_X=0  EEkey=0xa5  DAC=[13,17,13]  T=30.0 C
+S15: gain=3000  G_CTRL_X=0  EEkey=0xa5  DAC=[13,16,13]  T=24.5 C
+S16: gain=3000  G_CTRL_X=0  EEkey=0xa5  DAC=[12,17,12]  T=29.2 C
+```
+
+**The two halves of the probe are running at different gains.**
+
+| carrier | sensors | `G_CTRL` | gain | range | sensitivity |
+|---|---|---|---|---|---|
+| `acq1001_694` | S1–S8 | 1 | 1500 | ±40 mT | **34.65 V/T** |
+| `acq1001_695` | S9–S16 | 0 | 3000 | ±20 mT | **63 V/T** |
+
+63 / 34.65 = **1.82×**. The same magnet at the same distance produces a spike
+1.82× taller on S9–S16 than on S1–S8, purely from the gain setting. That matches
+the 1.9× the noise-ratio check predicted from the data alone, before any SPI
+access — two independent routes to the same number.
+
+This is the main instrument-side answer to "why are the spikes different
+heights". It is not a broken calibration: every chip has a valid EEPROM key
+(`0xa5`) and sensible per-chip trims. The two boxes were simply configured on
+different ranges.
+
+**Also: S16's chip is alive.** It answers on SPI, reports gain 3000, a valid
+EEPROM key and 29.2 °C. So the fault behind the railed ch29/30/32 is purely in
+the **analog** path — the eval-kit-to-concentrator ribbon for port 8 — since SPI
+and analog take different routes. The chip and its power are fine.
+
+#### Fixing it
+
+Pick one range for all 16 and apply it everywhere. The choice depends on the
+largest field any sensor will see:
+
+- **±20 mT (gain 3000)** — best resolution, but clips above 20 mT.
+- **±40 mT (gain 1500)** — half the sensitivity, twice the headroom.
+
+```bash
+# make everything ±40 mT (matches the current 694 setting)
+"$PUTTY/plink.exe" -ssh -batch -pw "$PW" -hostkey "$HK" root@acq1001_695 \
+    'python3 /tmp/onbox_sensor_audit.py --set-gain 1500'
+```
+
+This writes registers only, so it is **lost at power cycle**. Make it permanent
+by writing the same values to EEPROM and calling `activate_EEPROM_config()`, or
+by applying it from `rc.user` at boot (OCTO-BEE guide Appendix B.4.2).
+
+Until they are harmonised, tell the analysis the truth per box:
+
+```bash
+python octobee_cal.py --range 40 --range 20      # 694 then 695, in --uut order
+```
+
+### A library bug to know about
+
+`get_meas_range()` returns `'400 mT'` while `get_gain()` returns `1500`, and the
+library's own `GainMeasRangeDict` maps `1500 -> '40 mT'`. The datasheet is
+unambiguous (Table 22: `G_CTRL` bits 1:0 = 01 → gain 1500; Table 21: gain 1500 →
+±40 mT), and the register reads `G_CTRL_* = 1`. **Trust `get_gain()`, not
+`get_meas_range()`** — at ±40 mT the sensitivity is 34.65 V/T, a factor of ten
+away from what the range string implies. Getting this wrong scales every field
+number by 10.
+
 ---
 
 ## 4. Calibration procedure
@@ -162,6 +298,35 @@ scp onbox_sensor_audit.py root@acq1001_694:/tmp/
 ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py'
 ssh root@acq1001_695 'python3 /tmp/onbox_sensor_audit.py'
 ```
+
+The root password is the one on the printed sheet that shipped with the units
+(D-TACQ manual §"The root password is provided on a printed sheet with your
+shipment"); both carriers use the same one. OpenSSH on this PC prompts
+interactively, which does not work from a script — PuTTY is installed and takes
+the password on the command line:
+
+```bash
+PUTTY="/c/Program Files/PuTTY"
+HK=SHA256:51adMhUSu461QXQICNZfCpfA81hV1nomlMNQPhKaq3M    # acq1001_694 host key
+"$PUTTY/pscp.exe"  -batch -pw "$PW" -hostkey "$HK" onbox_sensor_audit.py root@acq1001_694:/tmp/
+"$PUTTY/plink.exe" -ssh -batch -pw "$PW" -hostkey "$HK" root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py'
+```
+
+Better still, install a key once and drop the password entirely
+(D-TACQ manual, "Now ssh logins are automatic, no password required"):
+
+```bash
+ssh-keygen -t ed25519            # if you have no key yet
+ssh-copy-id root@acq1001_694
+ssh-copy-id root@acq1001_695
+```
+
+The SPI library lives at `/usr/local/senm3dx/ThreeDHALLInterface.py` on the
+carrier, not `/usr/local/CARE` as the OCTO-BEE guide implies; the audit script
+puts both on `sys.path`.
+
+The audit takes a couple of minutes per box — `verify_spi_interface(100)` does
+100 SPI round trips per chip before anything is read.
 
 Read the `!!` lines. They flag any register that differs between chips:
 `gain`, `DAC_X/Z/Y` (bias current = sensitivity), `SENS_*` (fine gain), and
@@ -264,7 +429,7 @@ Verify VCM still reads ~2.2 V afterwards.
 
 | file | runs on | purpose |
 |---|---|---|
-| `octobee.py` | PC | core library: UUT knobs, frame decode, capture. `info` / `capture` CLI |
+| `octobee.py` | PC | core library: UUT knobs, frame decode, capture. `info` / `capture` / `restore` CLI |
 | `octobee_live.py` | PC | live plot of all 16 sensors, both boxes, one window |
 | `octobee_cal.py` | PC | health + calibration report, optional PNG |
 | `octobee_idmap.py` | PC | proves the channel↔sensor map (SPI sweep or magnet pass) |
