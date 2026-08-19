@@ -24,6 +24,7 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PyQt6 import QtGui
 
+import octobee_profile as oprof
 import probe_geometry as pg_geom
 
 # Turbo runs blue -> green -> red with even perceptual steps, so a small change
@@ -64,8 +65,13 @@ ARM_COLOR = (0.55, 0.36, 0.20, 1.0)      # the eval-kit PCBs, bare board colour
 class ProbeView3D(gl.GLViewWidget):
     """Interactive 3D view of the probe head. Drag to orbit, wheel to zoom."""
 
-    def __init__(self, geom=None, parent=None):
+    def __init__(self, geom=None, parent=None, profiler=None):
         super().__init__(parent)
+        # Timing the paint separately from the code that requests it is the
+        # whole point: asking for a redraw is microseconds, doing it can be
+        # seconds without a GPU, and only one of those is our fault.
+        self.profiler = profiler or oprof.Profiler(enabled=False)
+        self._gl_info = None
         self.geom = geom or pg_geom.Geometry()
         self.arrow_scale_mm = None        # full-scale arrow length; None = auto
         self.full_scale_mt = 1.0          # |B| that maps to full scale
@@ -84,6 +90,16 @@ class ProbeView3D(gl.GLViewWidget):
         self._items = []
         self.setBackgroundColor(pg.mkColor(18, 20, 26))
         self.rebuild()
+
+    def paintGL(self, *args, **kwargs):
+        with self.profiler.time("GL paint (probe head)"):
+            super().paintGL(*args, **kwargs)
+
+    def gl_info(self):
+        """Cached vendor/renderer strings for the live context."""
+        if self._gl_info is None:
+            self._gl_info = oprof.gl_info(self)
+        return self._gl_info
 
     # ---- construction ----------------------------------------------------
     def rebuild(self, geom=None):

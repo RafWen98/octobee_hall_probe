@@ -260,9 +260,36 @@ class PoseSolution:
         self.notes = notes
 
     # ---- the physically meaningful split --------------------------------
+    # A sensor that saw nothing -- S16's analogue ribbon is the live example --
+    # fits an M with no rank, and inverting the whole (16,3,3) stack at once
+    # would then raise and take the other fifteen sensors down with it. Invert
+    # per sensor, fall back to a pseudo-inverse, and record who failed so the
+    # report can say so instead of quietly returning nonsense.
+    SINGULAR_COND = 1e6
+
     def chip_to_tube(self):
         """(16,3,3) C_i = M_i^-1, mapping a chip reading into the tube frame."""
-        return np.linalg.inv(self.M)
+        C = np.empty_like(self.M)
+        bad = []
+        for i in range(N_SENSORS):
+            if np.linalg.cond(self.M[i]) > self.SINGULAR_COND:
+                bad.append(f"S{i + 1}")
+                C[i] = np.linalg.pinv(self.M[i])
+                continue
+            try:
+                C[i] = np.linalg.inv(self.M[i])
+            except np.linalg.LinAlgError:
+                bad.append(f"S{i + 1}")
+                C[i] = np.linalg.pinv(self.M[i])
+        self._singular = bad
+        return C
+
+    @property
+    def singular(self):
+        """Sensors whose response could not be inverted -- treat as unusable."""
+        if not hasattr(self, "_singular"):
+            self.chip_to_tube()
+        return list(self._singular)
 
     def decompose(self):
         """
@@ -389,10 +416,16 @@ class PoseSolution:
                  f"gain spread: {(np.nanmax(g) - np.nanmin(g)) * 100:.2f} % "
                  f"peak-to-peak about the median",
                  ""]
+        bad = set(self.singular)
+        if bad:
+            lines.append(f"UNUSABLE (no invertible response): "
+                         f"{', '.join(sorted(bad))}")
+            lines.append("")
         lines.append("  sensor   gain    resid_uT   max non-ortho")
         for i in range(N_SENSORS):
             sid = f"S{i + 1}"
-            flag = "  (excluded)" if sid in dead else ""
+            flag = ("  (NO RESPONSE)" if sid in bad else
+                    "  (excluded)" if sid in dead else "")
             lines.append(f"  {sid:<6}  {g[i]:6.4f}  {self.residual_mt[i] * 1e3:8.3f}"
                          f"   {np.nanmax(np.abs(ortho[i])):6.2f} deg{flag}")
         if not self.identified[:, 2].all():
@@ -730,7 +763,10 @@ def _anchor_gauge(sol, geometry):
     # Best single rotation about z aligning solved to nominal: maximise
     # sum_i trace(Rz(g)^T R_nom_i R_i^T) -> closed form in atan2.
     s = c = 0.0
+    bad = set(sol.singular)
     for i in range(N_SENSORS):
+        if f"S{i + 1}" in bad:
+            continue        # a sensor that saw nothing gets no say in the frame
         Q = R_nom[i] @ R[i].T
         c += Q[0, 0] + Q[1, 1]
         s += Q[1, 0] - Q[0, 1]
@@ -857,12 +893,22 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sweeps", nargs="+",
-                    help="RollSweep .npz files (one per sweep; give both the "
-                         "A and the B sweep to identify the axial column)")
+                    help="RollSweep .npz files. Three sweeps for a complete "
+                         "solve: A as mounted, B with the tube end-for-end "
+                         "(separates offset from axial response), C with the "
+                         "cradle at another azimuth (pins transverse-vs-axial; "
+                         "the flip alone cannot)")
     ap.add_argument("--b-earth-ut", type=float, default=DEFAULT_B_EARTH_UT,
                     help=f"total field magnitude in uT (default {DEFAULT_B_EARTH_UT}); "
                          "look yours up at ngdc.noaa.gov/geomag")
     ap.add_argument("--dead", default="", help="comma-separated ids to ignore, e.g. S16")
+    ap.add_argument("--anisotropy", choices=("solve", "assume_isotropic"),
+                    default="solve",
+                    help="what to do when no second azimuth was recorded: "
+                         "'solve' leaves the transverse-vs-axial gauge "
+                         "unresolved and says so (default); 'assume_isotropic' "
+                         "fixes it by assuming the median chip has equal "
+                         "sensitivity on all three axes")
     ap.add_argument("--geometry", default=pg.CONFIG_NAME)
     ap.add_argument("--save", help="write the PoseSolution here as JSON")
     ap.add_argument("--apply", metavar="CALFILE",
@@ -872,7 +918,8 @@ def main(argv=None):
     geom = pg.Geometry.load_or_default(a.geometry)
     dead = [d.strip() for d in a.dead.split(",") if d.strip()]
     sweeps = [RollSweep.load(p) for p in a.sweeps]
-    sol = solve_roll(sweeps, geom, a.b_earth_ut, dead=dead)
+    sol = solve_roll(sweeps, geom, a.b_earth_ut, dead=dead,
+                     anisotropy=a.anisotropy)
 
     print(sol.report(dead=dead))
     print()

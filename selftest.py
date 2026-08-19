@@ -139,6 +139,16 @@ def _matching_error_pct(sol, S_true):
     return float(np.abs(rel - 1).max() * 100)
 
 
+def _matching_error_pct_subset(sol, S_true, idx):
+    """_matching_error_pct restricted to sensors that are supposed to work."""
+    _, S = sol.decompose()
+    idx = list(idx)
+    got = np.array([np.sqrt(S[i][0, 0] * S[i][2, 2]) for i in idx])
+    want = np.array([np.sqrt(S_true[i][0, 0] * S_true[i][2, 2]) for i in idx])
+    rel = (got / np.median(got)) / (want / np.median(want))
+    return float(np.abs(rel - 1).max() * 100)
+
+
 def test_posecal():
     print("\n== Earth-field roll calibration ==")
     geom = pgeom.Geometry.load_or_default()
@@ -228,6 +238,31 @@ def test_posecal():
     check("a uniform ambient reads as uniform",
           opc.ambient_uniformity(sol) < 0.01,
           f"{opc.ambient_uniformity(sol) * 100:.3f} % of |B|")
+
+    # ---- one dead sensor must not take the other fifteen down ------------
+    # S16's analogue ribbon is faulty on this probe, so it fits a response with
+    # no rank. Inverting the whole (16,3,3) stack in one call raises on that and
+    # loses the entire calibration, which is exactly the wrong failure mode.
+    flat = []
+    for sw in (A, B, C):
+        m = sw.b_mt.copy()
+        m[:, 15, :] = 0.0
+        flat.append(opc.RollSweep(m, tag=sw.tag))
+    try:
+        dsol = opc.solve_roll(flat, geom, 49.0)
+        ok = True
+    except Exception:                                    # noqa: BLE001
+        dsol = None
+        ok = False
+    check("a sensor with no response does not break the solve", ok)
+    if dsol is not None:
+        check("the unusable sensor is named, not silently averaged in",
+              "S16" in dsol.singular, f"singular {dsol.singular}")
+        check("the other fifteen still match each other",
+              _matching_error_pct_subset(dsol, S_true, range(15)) < 0.1,
+              f"max {_matching_error_pct_subset(dsol, S_true, range(15)):.4f} %")
+        check("the report calls the dead sensor out",
+              "NO RESPONSE" in dsol.report())
 
     # ---- refuses to mix ranges -------------------------------------------
     lo = opc.RollSweep(A.b_mt, tag="A", ranges_mt=np.full(n_sens, 40.0))
@@ -554,6 +589,73 @@ def test_app(app, args, workdir):
               f"{before_spread:.2f}x -> {after:.4f}x")
         win.on_clear_gain()
         check("gain trim clears", np.allclose(win.cal.gain_corr, 1.0))
+
+    # ---- Earth-field roll calibration panel ----
+    # The demo source is a moving dipole, not a uniform field being rolled
+    # through, so the numbers it produces are meaningless. What is being
+    # tested here is the wiring: that a sweep is captured from UNCORRECTED
+    # field, that the solve/apply path runs, and that sweeps survive a trip
+    # through disk. The physics is graded in test_posecal() against a known
+    # truth instead.
+    check("roll panel is built",
+          all(hasattr(win, a) for a in ("btn_solve_roll", "btn_apply_roll",
+                                        "lbl_sweeps", "spin_bearth",
+                                        "chk_isotropic", "spin_sweep_s")))
+    check("solve is disabled with no sweeps recorded",
+          not win.btn_solve_roll.isEnabled())
+
+    win.cal.gain_corr = np.full((pgeom.N_SENSORS, 3), 2.0)
+    for tag in ("A", "B", "C"):
+        win.start_sweep(tag, 0.4)
+        pump(win, app, 2.0)
+    win.cal.clear_gain()
+    check("all three sweeps recorded", set(win.sweeps) == {"A", "B", "C"},
+          win.lbl_sweeps.text())
+    check("solve enabled once sweeps exist", win.btn_solve_roll.isEnabled())
+
+    if set(win.sweeps) == {"A", "B", "C"}:
+        # A sweep must be independent of whatever trim was loaded when it was
+        # taken -- that is why it is captured pre-correction. The x2 gain above
+        # was live during capture and must not show up in the stored data.
+        sw = win.sweeps["A"]
+        check("sweeps are stored uncorrected",
+              np.abs(sw.b_mt).max() < 1e4 and np.isfinite(sw.b_mt).all())
+        check("sweeps record the range they were taken at",
+              sw.ranges_mt is not None
+              and np.allclose(sw.ranges_mt, win.cal.ranges_mt))
+
+        win.on_solve_roll()
+        check("roll solve produced a solution", win.pose_solution is not None,
+              "" if win.pose_solution is not None
+              else " ".join(win.cal_report.toPlainText().split())[:300])
+        check("apply is enabled after a solve", win.btn_apply_roll.isEnabled())
+        if win.pose_solution is not None:
+            sol = win.pose_solution
+            check("solve used all three orientations",
+                  sorted(sol.tags) == ["A", "B", "C"], f"{sol.tags}")
+            check("report reaches the calibration pane",
+                  "gain spread" in win.cal_report.toPlainText())
+            win.cal.apply_pose_solution(sol)
+            check("applying installs the matrix and clears the trim",
+                  win.cal.has_matrix and np.allclose(win.cal.gain_corr, 1.0))
+            check("the applied calibration still converts",
+                  np.isfinite(win.cal.to_mt(
+                      np.full((4, pgeom.N_SENSORS, 4), 2.2))).all())
+            win.cal.clear_matrix()
+            win.cal.clear_tare()
+
+        with tempfile.TemporaryDirectory() as d:
+            ok = True
+            for tag, sw in win.sweeps.items():
+                back = opc.RollSweep.load(sw.save(os.path.join(d, f"rs_{tag}")))
+                ok &= (back.tag == tag
+                       and back.b_mt.shape == sw.b_mt.shape
+                       and np.allclose(back.ranges_mt, sw.ranges_mt))
+            check("sweeps round trip through disk", ok)
+
+    win.on_clear_sweeps()
+    check("clearing sweeps disables solve",
+          not win.sweeps and not win.btn_solve_roll.isEnabled())
 
     # ---- display cannot starve acquisition ----
     win.cmb_view.setCurrentIndex(list(gui.VIEW_RATES).index(10.0))

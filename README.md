@@ -474,10 +474,151 @@ ratios are your per-sensor scale factors `k_i = B_ref / |B|_i`. After Step 1 the
 should land inside a few percent; anything still outside ±10 % means that chip's
 EEPROM calibration is suspect or its mounting differs.
 
-### Step 6 — absolute scale and orientation (when you need lab-frame vectors)
+### Step 6 — Earth-field roll calibration (the accurate way to match sensors)
 
-Relative cross-calibration is all you can get from a hand-held magnet. For
-absolute field and a common coordinate frame you need a known uniform field —
+Step 5 matches sensors with a magnet, and its accuracy is capped by *geometry*,
+not by noise. `cross_calibrate()` has to divide out the 1/r³ weight from
+`Geometry.expected_response()`, so a 2 mm error in where you think the magnet
+was, at r ≈ 78 mm, becomes 3 × (2/78) ≈ **7.7 % of gain error**. No amount of
+averaging helps: you are limited by how well you know the jig.
+
+The Earth's field has no 1/r³ term to divide out. Over a head this size (the FSV
+shell is 155 mm across) it is uniform to within nanotesla — its gradient is
+nT/m — so **every sensor is guaranteed to be sitting in the same field vector**,
+and the only thing that can make two of them disagree is the sensors. That turns
+matching from a geometry problem into a noise problem, worth about an order of
+magnitude. Against synthetic truth the solver matches sensors to **0.01 %**.
+
+It is also the only field source that covers the whole head at once. A Helmholtz
+pair is ~1 % uniform only inside ~0.3 R, so spanning a 77.7 mm FSV radius needs
+R ≈ 260 mm coils at ~290 A-turns per mT. A coil is the right tool for absolute
+scale on *one* arm tip (Step 7); it is the wrong tool for all sixteen.
+
+#### What rolling can and cannot see
+
+Rolling about the tube axis leaves the axial field component constant, so in
+`m_i = M_i·B_tube + b_i` the third column of `M` and the offset `b` are exactly
+degenerate. On this probe that is not abstract: with `mount_style: "tangential"`,
+`arm_dir` is circumferential and `board_normal` is radial, so `e2 = cross(e3,e1)`
+lands on the tube axis and **chip +Y is axial on all 16 sensors**. Roll alone
+calibrates chip X and Z and leaves chip Y untouched — a third of the channels.
+
+There is a second, sneakier degeneracy. Scaling the tube frame by
+`T = diag(a,a,c)` maps the swept circles onto circles of the same family, so the
+solver can trade transverse scale against axial scale for free; fixing |B| leaves
+`a²Bt² + c²Bz² = |B|²`, one equation in two unknowns. **An end-for-end flip does
+not fix this** — it sends `Bz → −Bz` and leaves `Bz²` alone. Only two genuinely
+different *inclinations* do.
+
+Both of these sit at the noise floor in the fit residual while being completely
+wrong, which is why the solver reports identifiability separately from residual.
+
+#### The procedure: three sweeps
+
+Cradle the tube (grip the *tube*, not the arms) in something non-magnetic. A
+square tube indexes in 90° jumps in a V-block; print two round end-collars so it
+rolls **continuously** instead — a 60 s hand roll then gives ~10⁷ samples rather
+than four poses, and the fit goes from exactly-determined to hugely
+over-determined. Keep the cables strain-relieved so they rotate rigidly with the
+head: a flexing cable moves ferrous connector shells relative to the sensors and
+turns a constant hard-iron term into a varying one.
+
+| sweep | what you do | what it buys |
+|---|---|---|
+| **A** | as mounted, roll ≥2 turns | transverse response |
+| **B** | lift the tube out, turn it **end-for-end**, roll again | separates offset from axial response |
+| **C** | turn the **cradle to another azimuth**, roll again | pins transverse-vs-axial scale |
+
+You do not need to know the roll angle, or roll evenly. All 16 sensors see the
+same field at every instant, so φ(t) is solved from the data alongside
+everything else.
+
+In the GUI: *Calibration → 3. Earth-field roll calibration → Record sweep A / B /
+C → Solve → Apply*. Or offline:
+
+```bash
+python octobee_posecal.py captures/rollsweep_A.npz \
+                          captures/rollsweep_B.npz \
+                          captures/rollsweep_C.npz \
+    --b-earth-ut 48.7 --dead S16 --apply calibration.json
+```
+
+`--b-earth-ut` is your local total field from
+[NOAA](https://ngdc.noaa.gov/geomag/calculators/magcalc.shtml) or BGS. It sets
+**absolute scale only** — matching, offsets and orientation are all solved
+without reference to it.
+
+#### Read the identifiability lines, not just the residual
+
+```
+axial column identified:     True
+transverse/axial gauge:      measured
+offset leverage:             1.24 (good; an end-for-end flip gives the most)
+gain spread: 2.31 % peak-to-peak about the median
+```
+
+If sweep C is missing you get `NOT MEASURED`, and you can either record it or
+pass `--anisotropy assume_isotropic` / tick the box in the GUI, which fixes the
+gauge by assuming the median chip has equal sensitivity on all three axes. That
+is fair for a monolithic factory-trimmed part, but it is an assumption and is
+recorded as one in the calibration notes. **Inter-sensor matching is valid either
+way** — that gauge is common mode, because `diag(a,a,c)` commutes with the
+rotations about the tube axis that distinguish one face from another.
+
+Two same-side azimuths (A+C without B) are *not* a shortcut: both have `Bz > 0`,
+so the offset is poorly pinned and that error leaks into the axial column. The
+solver flags this as weak offset leverage.
+
+#### What else falls out for free
+
+- **The sensor→face mapping.** In any pose all 16 chips see the same `B_tube`, so
+  chips on different faces report vectors differing by 90° about the tube axis.
+  `identify_faces()` clusters them and checks the result against
+  `probe_geometry.json`, which currently records that mapping as an assumption.
+  It cannot recover *slot* (position along the tube) — every slot on a face
+  shares the same rotation — so keep using `octobee_idmap.py --magnet` for that.
+  The mapping is also only recovered up to a global rotation of all four faces at
+  once, which no amount of Earth's field can pin down.
+- **A site survey.** Once the sensors are calibrated, the residual of "all 16 must
+  read the same vector" *is* a 16-point map of the ambient gradient across the
+  head. `ambient_uniformity()` reports it; much above ~0.5 % of |B| means there is
+  ferrous structure close enough to matter and the calibration taken there is not
+  trustworthy.
+
+#### Resolution: switch the ADC to 0–5 V first
+
+Earth's field is small compared to the range, so this matters more here than
+anywhere else:
+
+| ADC range | µT/count at ±20 mT | Earth (49 µT) |
+|---|---|---|
+| ±10 V (default) | 4.84 | 10 counts |
+| **0–5 V** | **1.21** | **40 counts** |
+
+See *Worth doing anyway: use the ADC range* below — it is free, and it is a 4×
+improvement in exactly the regime this step works in. At the ±400 mT range Earth
+is 0.6 counts and this whole method is unusable; carry the calibration up with
+`range_transfer()` instead (park a magnet to make 15–30 mT, capture at both
+gains without moving anything, take the ratio — the magnet's absolute value never
+enters, only that it held still).
+
+#### Honest limits
+
+| quantity | how it is fixed | expected |
+|---|---|---|
+| inter-sensor matching | roll invariance, no 1/r³ term | **~0.01–0.2 %** |
+| sensor offset `b` | flip pair, model-free | sub-µT |
+| orientation `R_i` | pose solve | ~0.01–0.5° |
+| absolute scale | your IGRF/WMM number | 0.2–0.3 % |
+
+Offsets, matching and orientation are all **model-free** — they need no knowledge
+of the Earth's field magnitude. Only absolute scale depends on it.
+
+### Step 7 — absolute scale and orientation (when you need lab-frame vectors)
+
+Step 6 gives you sensors matched to each other and a common frame, but its
+absolute scale is only as good as the IGRF number you fed it. For traceable
+absolute field you need a known applied field —
 a Helmholtz coil large enough to swallow the tube, or a calibrated reference
 magnetometer:
 
@@ -516,7 +657,8 @@ Verify VCM still reads ~2.2 V afterwards.
 | `octobee_gui.py` | PC | the application: live view, 3D probe head, calibration, exports |
 | `probe_geometry.py` | PC | chip positions and per-chip rotation matrices on the tube |
 | `probe_view3d.py` | PC | the 3D probe-head widget |
-| `octobee_calibration.py` | PC | counts → tesla, tare, gain trim, channel health |
+| `octobee_calibration.py` | PC | counts → tesla, zero, gain trim, pose matrix, channel health |
+| `octobee_posecal.py` | PC | Earth-field roll calibration: solves per-sensor response, offsets and orientation from hand-rolled sweeps |
 | `octobee_record.py` | PC | CSV / raw / report writers |
 | `selftest.py` | PC | end-to-end verification, offline or against the hardware |
 
@@ -655,6 +797,54 @@ mapping are not yet confirmed. **The face assignment has not been verified on th
 3D view's arrangement and the tube-frame rotation depend on it — |B|, the health
 diagnostics and the raw exports do not. Fix it with `octobee_idmap.py` and a
 slow magnet pass along one face, then press *Reload geometry*.
+
+### When it feels slow: `--profile`
+
+```bash
+python octobee_gui.py --profile
+```
+
+Adds a **Profile** tab that times every stage separately and keeps a rolling
+5 second window. It exists because "the app goes sluggish once data arrives"
+has several quite different causes and they need different fixes, and because a
+normal Python profiler sees only half of them -- the expensive half often
+happens inside Qt's paint, after our code has returned.
+
+It reports:
+
+- each acquisition stage (socket read, counts to tesla, decimate, file writes)
+- each drawing stage, *and* the repaints themselves: `GL paint (probe head)`
+  and `Qt paint (live plot)` are hooked directly
+- **event loop lag** -- how late a timer that asked for 100 ms actually fired.
+  This is the honest measure of "is it frozen" as opposed to merely busy
+- the OpenGL vendor/renderer strings. A renderer of `GDI Generic`,
+  `Microsoft Basic Render Driver` or `llvmpipe` means there is no GPU
+  acceleration and every repaint of the probe head is being done on the CPU;
+  the app says so in the Log if it sees one
+
+How to read it:
+
+| what is at the top | what to do |
+|---|---|
+| `GL paint (probe head)` | untick **3D**, or lower **refresh** |
+| `Qt paint (live plot)` | shorten **window**, or lower **output rate** |
+| `counts -> tesla` | lower the **stream rate** |
+| reader queue growing | acquisition is falling behind; recordings will have holes |
+| lag large, every row small | something outside this list is blocking |
+
+Two findings from building it, both now fixed, both worth knowing about:
+
+- pyqtgraph's downsampling has to be set **on the curves**, not just on the
+  plot. Without it Qt was rasterising 16 traces x 10 000 points on every
+  repaint -- 54 ms on average and 236 ms at worst, the single most expensive
+  thing in the application, and invisible to any timing of our own code.
+- the synthetic `--demo` source was rebuilding the sensor positions and all 16
+  rotation matrices per sample, so profiling `--demo` mostly measured the demo.
+  `Geometry.rotations()` is now cached and the demo is vectorised.
+
+For reference, a healthy run on the bench machine (Intel integrated graphics,
+both carriers live at 20 kSPS): event loop lag mean 10 ms / worst 28 ms, no
+single stage above 6%.
 
 ### Verifying it still works
 

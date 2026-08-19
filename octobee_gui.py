@@ -38,6 +38,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import octobee as ob
 import octobee_calibration as ocal
+import octobee_profile as oprof
 import octobee_posecal as opc
 import octobee_record as orec
 import probe_geometry as pgeom
@@ -67,6 +68,28 @@ HEALTH_WINDOW_S = 1.0
 RAW_HISTORY_S = 5.0
 
 pg.setConfigOptions(antialias=True, background=(18, 20, 26), foreground=(210, 214, 222))
+
+
+class ProfiledPlot(pg.PlotWidget):
+    """
+    A PlotWidget that times its own repaint.
+
+    Without this the table has a hole in it: asking a curve to setData is
+    cheap, and the expensive part -- Qt actually rasterising 16 or 48
+    polylines -- happens later in the event loop, where it would show up only
+    as unexplained lag. Timing it here means every row of the profile adds up
+    to something, and "none of these is big but the loop still stalls" becomes
+    a real conclusion rather than a gap in the measurement.
+    """
+
+    def __init__(self, label, profiler=None, **kw):
+        super().__init__(**kw)
+        self._label = label
+        self.profiler = profiler or oprof.Profiler(enabled=False)
+
+    def paintEvent(self, ev):
+        with self.profiler.time(self._label):
+            super().paintEvent(ev)
 
 
 def sensor_colors():
@@ -226,23 +249,31 @@ class DemoSource(SourceBase):
         self.noise_counts = np.concatenate([np.linspace(0.6, 13, 8),
                                             np.linspace(0.8, 16, 8)])
         self.rng = np.random.default_rng(7)
+        self._pos = geom.positions()
+        self._rot = geom.rotations()
 
     def _field_mt(self, t):
-        """Dipole moving along +Z, orbiting the tube, seen in each chip's axes."""
+        """
+        Dipole flying past the probe, seen in each chip's own axes.
+
+        Vectorised over time: `t` may be an array, and the whole (k, 16, 3)
+        block comes back in one go. Doing this one instant at a time rebuilt
+        the sensor positions and rotation matrices on every sample, which made
+        the synthetic source cost far more than the real one and turned the
+        profile of --demo into a measurement of itself.
+        """
+        t = np.atleast_1d(np.asarray(t, float))
         z = (t * 60.0) % (self.geom.tube_length_mm + 120.0) - 60.0
         ang = 2 * np.pi * t / 11.0
         # Fly past the chips, which sit at the arm tips -- not past the tube.
         r = self.geom.fsv_radius_mm + 25.0
-        src = np.array([r * np.cos(ang), r * np.sin(ang), z])
-        m = np.array([0.0, 0.0, 1.0]) * 6.0e4          # arbitrary strength, mT*mm^3
-        pos = self.geom.positions()
-        d = pos - src
-        rr = np.linalg.norm(d, axis=1, keepdims=True)
-        rr = np.maximum(rr, 8.0)
+        src = np.stack([r * np.cos(ang), r * np.sin(ang), z], axis=1)  # (k,3)
+        m = np.array([0.0, 0.0, 6.0e4])                # arbitrary, mT*mm^3
+        d = self._pos[None, :, :] - src[:, None, :]    # (k,16,3)
+        rr = np.maximum(np.linalg.norm(d, axis=2, keepdims=True), 8.0)
         rhat = d / rr
-        b_tube = (3.0 * rhat * (rhat @ m)[:, None] - m[None, :]) / rr ** 3
-        R = self.geom.rotations()
-        return np.einsum("sji,sj->si", R, b_tube)      # tube -> chip frame
+        b_tube = (3.0 * rhat * (rhat @ m)[:, :, None] - m) / rr ** 3
+        return np.einsum("sji,ksj->ksi", self._rot, b_tube)   # tube -> chip
 
     def read(self):
         now = time.time()
@@ -253,10 +284,10 @@ class DemoSource(SourceBase):
         t = self.t + np.arange(n) / self.fs_hz
         self.t_last, self.t = now, t[-1]
 
-        # field at ~20 points, interpolated up -- the magnet is slow
+        # The magnet is slow, so evaluate on a coarse grid and interpolate up.
         k = max(2, n // 256)
         tk = t[::k]
-        bk = np.array([self._field_mt(tt) for tt in tk])          # (k,16,3)
+        bk = self._field_mt(tk)                                   # (k,16,3)
         b = np.empty((n, N_SENSORS, 3))
         for s in range(N_SENSORS):
             for a in range(3):
@@ -470,7 +501,7 @@ class LivePlot(QtWidgets.QWidget):
 
     MODES = ("|B| per sensor", "all axes (chip frame)", "all axes (tube frame)")
 
-    def __init__(self, geom):
+    def __init__(self, geom, profiler=None):
         super().__init__()
         self.geom = geom
         self.mode = self.MODES[0]
@@ -478,7 +509,7 @@ class LivePlot(QtWidgets.QWidget):
         self.dead = set()
         self.colors = sensor_colors()
 
-        self.plot = pg.PlotWidget()
+        self.plot = ProfiledPlot("Qt paint (live plot)", profiler)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("bottom", "time", units="s")
         self.plot.setLabel("left", "B", units="mT")
@@ -490,19 +521,39 @@ class LivePlot(QtWidgets.QWidget):
         for s in range(N_SENSORS):
             c = self.plot.plot(pen=pg.mkPen(self.colors[s], width=1.6),
                                name=f"S{s+1}")
+            self._thin(c)
             self.mag_curves.append(c)
             row = []
             for a, style in enumerate((QtCore.Qt.PenStyle.SolidLine,
                                        QtCore.Qt.PenStyle.DashLine,
                                        QtCore.Qt.PenStyle.DotLine)):
-                row.append(self.plot.plot(
-                    pen=pg.mkPen(self.colors[s], width=1.1, style=style)))
+                cc = self.plot.plot(
+                    pen=pg.mkPen(self.colors[s], width=1.1, style=style))
+                self._thin(cc)
+                row.append(cc)
             self.axis_curves.append(row)
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.plot)
         self.set_mode(self.mode)
+
+    @staticmethod
+    def _thin(curve):
+        """
+        Make each curve downsample itself to the screen.
+
+        A 20 s window at 500 Hz is 10 000 points per trace, and there are up to
+        48 traces. Setting this on the PlotItem is not enough -- it has to be on
+        the curves -- and without it Qt rasterises every one of those points
+        into a plot around a thousand pixels wide. Measured, that was the single
+        most expensive thing in the whole application, tens of milliseconds per
+        repaint, and invisible to any timing of our own code because it happens
+        inside Qt's paint. 'peak' keeps the extremes of each bin, so a magnet
+        spike still shows at full height.
+        """
+        curve.setDownsampling(auto=True, method="peak")
+        curve.setClipToView(True)
 
     def set_mode(self, mode):
         self.mode = mode
@@ -567,9 +618,9 @@ class SensorBars(QtWidgets.QWidget):
     bar against the axis.
     """
 
-    def __init__(self):
+    def __init__(self, profiler=None):
         super().__init__()
-        self.plot = pg.PlotWidget()
+        self.plot = ProfiledPlot("Qt paint (peak bars)", profiler)
         self.plot.showGrid(y=True, alpha=0.25)
         self.plot.setLabel("left", "peak |B|", units="mT")
         self.window_s = 0.5
@@ -728,6 +779,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_dropped = 0
         self.paused = False
         self._draw_ms = 0.0
+        self.prof = oprof.Profiler(enabled=bool(getattr(args, "profile", False)))
+        self.lag = oprof.LagMonitor(interval_ms=100)
         self._connect_worker = None
         self._snap_worker = None
 
@@ -748,6 +801,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slow = QtCore.QTimer(self)
         self.slow.timeout.connect(self.on_slow_tick)
         self.slow.start(1000)
+        # Asks for exactly 100 ms and records how late it actually gets it.
+        # That difference is the honest measure of "is the app blocked".
+        self.lag_timer = QtCore.QTimer(self)
+        self.lag_timer.timeout.connect(self.lag.tick)
+        self.lag_timer.start(100)
+        self.prof_timer = QtCore.QTimer(self)
+        self.prof_timer.timeout.connect(self.refresh_profile)
+        self.prof_timer.start(1000)
 
         if args.demo:
             self._set_source(DemoSource(self.geom), "demo")
@@ -779,9 +840,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_toolbar()
         self.log = LogPane()
 
-        self.view3d = ProbeView3D(self.geom)
-        self.bars = SensorBars()
-        self.plot = LivePlot(self.geom)
+        self.view3d = ProbeView3D(self.geom, profiler=self.prof)
+        self.bars = SensorBars(profiler=self.prof)
+        self.plot = LivePlot(self.geom, profiler=self.prof)
         self.table = SensorTable(self.geom)
         self.table.range_changed.connect(self.on_range_changed)
         self.table.set_ranges(self.cal.ranges_mt)
@@ -792,6 +853,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addTab(self._calib_tab(), "Calibration")
         left.addTab(self._health_tab(), "Diagnostics")
         left.addTab(self._export_tab(), "Data output")
+        left.addTab(self._profile_tab(), "Profile")
         left.addTab(self.log, "Log")
         left.setCurrentIndex(0)
         self.tabs = left
@@ -1298,6 +1360,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_source(self, source, kind):
         self.source = source
+        # Measure the running state, not the startup: building the window and
+        # bringing up the GL context stalls the loop once, and leaving that in
+        # the numbers makes a healthy session look blocked.
+        self.prof.reset()
+        self.lag.reset()
         self.act_disconnect.setEnabled(True)
         self.act_connect.setEnabled(kind != "live")
         self.lbl_state.setText(f"{kind}: {', '.join(source.hosts)} "
@@ -1358,29 +1425,38 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_tick(self):
         if self.source is None:
             return
-        blocks = self.source.read()
-        if not blocks or blocks[0].shape[0] == 0:
-            if getattr(self.source, "error", None):
-                self.log.log(f"stream error: {self.source.error}")
-                self.source.error = None
-            return
+        with self.prof.time("acquisition tick (total)"):
+            with self.prof.time("  socket read + decode"):
+                blocks = self.source.read()
+            if not blocks or blocks[0].shape[0] == 0:
+                if getattr(self.source, "error", None):
+                    self.log.log(f"stream error: {self.source.error}")
+                    self.source.error = None
+                return
+            self.prof.note("samples per acquisition tick", blocks[0].shape[0])
 
-        self._keep_raw(blocks)
-        if self.raw_rec is not None:
-            self.raw_rec.write(blocks)
+            with self.prof.time("  keep raw history"):
+                self._keep_raw(blocks)
+            if self.raw_rec is not None:
+                with self.prof.time("  write raw file"):
+                    self.raw_rec.write(blocks)
 
-        grouped = ocal.assemble(blocks, self.source.vpc)          # (n,16,4) volts
-        b = self.cal.to_mt(grouped)                                # (n,16,3) mT
-        bd = ocal.decimate(b, self.decim)
-        if bd.shape[0] == 0:
-            return
-        self.roll.push(bd.astype(np.float32))
+            with self.prof.time("  counts -> tesla"):
+                grouped = ocal.assemble(blocks, self.source.vpc)   # (n,16,4) V
+                b = self.cal.to_mt(grouped)                        # (n,16,3) mT
+            with self.prof.time("  decimate + buffer"):
+                bd = ocal.decimate(b, self.decim)
+                if bd.shape[0] == 0:
+                    return
+                self.roll.push(bd.astype(np.float32))
 
-        if self.csv_rec is not None:
-            self.csv_rec.write(bd)
+            if self.csv_rec is not None:
+                with self.prof.time("  write CSV"):
+                    self.csv_rec.write(bd)
 
-        if self.collecting is not None:
-            self._collect_block(b, grouped)
+            if self.collecting is not None:
+                with self.prof.time("  magnet/tare collect"):
+                    self._collect_block(b, grouped)
 
     # Drawing is deliberately NOT done here. This tick has to keep draining the
     # reader queues or the carriers overrun and the recording gets holes in it,
@@ -1395,20 +1471,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if recent.shape[0] < 2:
             return
         t0 = time.perf_counter()
-        if self.chk_3d.isChecked():
-            k = min(8, recent.shape[0])
-            fs = self.view3d.update_fields(recent[-k:].mean(axis=0))
-            if self.chk_auto.isChecked() and abs(fs - self.spin_fs.value()) > 1e-4:
-                self.spin_fs.blockSignals(True)
-                self.spin_fs.setValue(max(fs, 0.001))
-                self.spin_fs.blockSignals(False)
-        self.plot.update_data(recent, self.out_rate)
-        # Peak over a trailing half second, not the instantaneous value: a magnet
-        # passed by hand is over well inside one refresh, so sampling one point
-        # would miss most passes.
-        n = max(2, min(recent.shape[0], int(self.out_rate * self.bars.window_s)))
-        self.bars.update_values(
-            np.linalg.norm(recent[-n:], axis=-1).max(axis=0), self.cal.dead)
+        with self.prof.time("view tick (total)"):
+            if self.chk_3d.isChecked():
+                with self.prof.time("  3D head: build vectors"):
+                    k = min(8, recent.shape[0])
+                    fs = self.view3d.update_fields(recent[-k:].mean(axis=0))
+                if (self.chk_auto.isChecked()
+                        and abs(fs - self.spin_fs.value()) > 1e-4):
+                    self.spin_fs.blockSignals(True)
+                    self.spin_fs.setValue(max(fs, 0.001))
+                    self.spin_fs.blockSignals(False)
+            with self.prof.time("  live plot setData"):
+                self.plot.update_data(recent, self.out_rate)
+            with self.prof.time("  peak bars"):
+                # Peak over a trailing half second, not the instantaneous
+                # value: a magnet passed by hand is over well inside one
+                # refresh, so sampling one point would miss most passes.
+                n = max(2, min(recent.shape[0],
+                               int(self.out_rate * self.bars.window_s)))
+                self.bars.update_values(
+                    np.linalg.norm(recent[-n:], axis=-1).max(axis=0),
+                    self.cal.dead)
         self._note_draw_time((time.perf_counter() - t0) * 1000.0)
 
     def _note_draw_time(self, ms):
@@ -1494,8 +1577,9 @@ class MainWindow(QtWidgets.QMainWindow):
             raw = self._raw_arrays(HEALTH_WINDOW_S)
             if raw is not None:
                 self._last_health_t = now
-                rows = ocal.channel_health(raw, self.source.vpc,
-                                           self.source.hosts)
+                with self.prof.time("  channel health scan"):
+                    rows = ocal.channel_health(raw, self.source.vpc,
+                                               self.source.hosts)
                 self.last_health = rows
                 if self.chk_autodead.isChecked():
                     dead = ocal.suggest_dead(rows)
@@ -1660,8 +1744,13 @@ class MainWindow(QtWidgets.QMainWindow):
                                              if self.chk_isotropic.isChecked()
                                              else "solve"))
         except (ValueError, np.linalg.LinAlgError) as e:
+            # Deliberately not a modal. Solving is a diagnostic step you may run
+            # repeatedly while getting a sweep right, and a dialog you have to
+            # dismiss in the middle of a live acquisition is worse than useless.
             self.log.log(f"roll solve failed: {e}")
-            QtWidgets.QMessageBox.warning(self, "Roll solve", str(e))
+            self.cal_report.setPlainText(f"Roll solve failed:\n\n{e}")
+            self.pose_solution = None
+            self.btn_apply_roll.setEnabled(False)
             return
         self.pose_solution = sol
         ids = opc.identify_faces(sol, self.geom)
@@ -2094,6 +2183,93 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.blockSignals(False)
         self.on_sensor_toggle()
 
+    def _profile_tab(self):
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QHBoxLayout()
+        self.chk_prof = QtWidgets.QCheckBox("measure where the time goes")
+        self.chk_prof.setChecked(self.prof.enabled)
+        self.chk_prof.setToolTip(
+            "Times every stage separately, including the OpenGL paint, and "
+            "watches the Qt event loop for stalls. Costs almost nothing, so it "
+            "is fine to leave on.")
+        self.chk_prof.toggled.connect(self.on_profile_toggle)
+        top.addWidget(self.chk_prof)
+        b_reset = QtWidgets.QPushButton("Reset")
+        b_reset.clicked.connect(self.on_profile_reset)
+        top.addWidget(b_reset)
+        b_copy = QtWidgets.QPushButton("Copy to clipboard")
+        b_copy.clicked.connect(
+            lambda: QtWidgets.QApplication.clipboard().setText(
+                self.profile_text.toPlainText()))
+        top.addWidget(b_copy)
+        top.addStretch(1)
+        lay.addLayout(top)
+        self.profile_text = QtWidgets.QPlainTextEdit()
+        self.profile_text.setReadOnly(True)
+        self.profile_text.setFont(QtGui.QFont("Consolas", 9))
+        lay.addWidget(self.profile_text)
+        return w
+
+    def on_profile_toggle(self, on):
+        self.prof.enabled = bool(on)
+        self.prof.reset()
+        self.lag.reset()
+        self.log.log("profiling on" if on else "profiling off")
+        self.refresh_profile()
+
+    def on_profile_reset(self):
+        self.prof.reset()
+        self.lag.reset()
+        self.refresh_profile()
+
+    def refresh_profile(self):
+        if not hasattr(self, "profile_text"):
+            return
+        if not self.prof.enabled:
+            self.profile_text.setPlainText(self.prof.text())
+            return
+        # Ask the live context what it is, once we have one. A software
+        # renderer here is the single most likely explanation for a window
+        # that seizes up the moment data starts arriving.
+        if "GL renderer" not in self.prof.notes and self.view3d.isVisible():
+            info = self.view3d.gl_info()
+            for k, v in info.items():
+                self.prof.note(k, v)
+            if oprof.is_software_renderer(info):
+                self.prof.note("VERDICT", "no GPU acceleration -- the 3D head "
+                                          "is being drawn on the CPU")
+                self.log.log(
+                    f"OpenGL is running on a software renderer "
+                    f"({info.get('GL renderer')}). Every repaint of the probe "
+                    f"head is done on the CPU, which is almost certainly why "
+                    f"the window struggles. Untick '3D' to confirm.")
+        parts = [self.prof.text(), "",
+                 f"event loop lag: mean {self.lag.mean_ms:.1f} ms, "
+                 f"worst {self.lag.max_ms:.0f} ms",
+                 f"  -> {self.lag.verdict()}"]
+        if self.source is not None:
+            st = self.source.stats()
+            parts += ["", "stream:"]
+            for k, v in st.items():
+                parts.append(f"  {k:<26} {v}")
+            qs = [getattr(x, "q", None) for x in
+                  getattr(self.source, "streamers", [])]
+            for h, q in zip(getattr(self.source, "hosts", []), qs):
+                if q is not None:
+                    parts.append(f"  {h + ' reader queue':<26} {q.qsize()} blocks "
+                                 f"waiting")
+        parts += ["", "how to read this:",
+                  "  'GL paint (probe head)' large  -> the 3D view is the cost;"
+                  " untick 3D or lower the refresh rate",
+                  "  'counts -> tesla' large        -> the data processing is"
+                  " the cost; lower the stream rate",
+                  "  reader queue growing           -> acquisition is falling"
+                  " behind and recordings will have holes",
+                  "  event loop lag large but every row small -> something"
+                  " outside this list is blocking"]
+        self.profile_text.setPlainText("\n".join(parts))
+
     def on_3d_toggle(self, on):
         self.view3d.setVisible(bool(on))
         self._draw_ms = 0.0
@@ -2123,6 +2299,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.roll.resize(max(4, int(self.out_rate * self.window_s)))
 
     def closeEvent(self, ev):
+        if self.prof.enabled:
+            print(self.prof.text())
+            print(f"\nevent loop lag: mean {self.lag.mean_ms:.1f} ms, "
+                  f"worst {self.lag.max_ms:.0f} ms -- {self.lag.verdict()}")
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
         self.on_disconnect()
@@ -2141,6 +2321,9 @@ def main():
     p.add_argument("--replay", help="play back a saved .npz capture")
     p.add_argument("--geometry", default=pgeom.CONFIG_NAME)
     p.add_argument("--calibration", default=ocal.CONFIG_NAME)
+    p.add_argument("--profile", action="store_true",
+                   help="start with the Profile tab measuring where the time "
+                        "goes, and print a summary on exit")
     p.add_argument("--screenshot", help="render one frame to this PNG and exit "
                                         "(for headless checks)")
     p.add_argument("--screenshot-tab", type=int, default=0,

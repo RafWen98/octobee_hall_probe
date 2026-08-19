@@ -126,6 +126,8 @@ class Geometry:
                  mapping="face-major", sensors=None, notes="",
                  board_plane=None):
         self.notes = notes
+        self._rot_sig = None
+        self._rot_cache = None
         self.tube_width_mm = float(tube_width_mm)
         self.arm_length_mm = float(arm_length_mm)
         self.fsv_from_tip_mm = float(fsv_from_tip_mm)
@@ -302,10 +304,30 @@ class Geometry:
         return np.array(self.sensors[sensor_id - 1].get("axis_signs", [1, 1, 1]),
                         dtype=float)
 
+    def _rot_signature(self):
+        """Cheap fingerprint of everything rotations() depends on."""
+        return (self.mount_style, self.arm_sense,
+                tuple((s["face"], s.get("chip_rot_deg", 0.0),
+                       tuple(s.get("axis_signs", (1, 1, 1))))
+                      for s in self.sensors))
+
     def rotations(self):
-        """(16, 3, 3) stack of R_i with the per-axis sign flips folded in."""
-        return np.array([self.rotation(i) * self.axis_signs(i)[None, :]
-                         for i in range(1, N_SENSORS + 1)])
+        """
+        (16, 3, 3) stack of R_i with the per-axis sign flips folded in.
+
+        Cached. This is called on every 3D frame and on every tube-frame
+        conversion, and rebuilding 16 matrices from trig and cross products
+        each time was costing more than the field maths it serves. The cache
+        keys on a fingerprint rather than a dirty flag because Geometry is
+        edited by plain attribute assignment.
+        """
+        sig = self._rot_signature()
+        if sig != self._rot_sig:
+            self._rot_cache = np.array(
+                [self.rotation(i) * self.axis_signs(i)[None, :]
+                 for i in range(1, N_SENSORS + 1)])
+            self._rot_sig = sig
+        return self._rot_cache
 
     def to_tube_frame(self, b_chip):
         """
