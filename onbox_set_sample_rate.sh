@@ -19,8 +19,12 @@
 #    20 kSPS -> 3.2x   (measured 3.1x on this hardware)
 #
 #   Averaging on the host AFTER sampling at 200 kSPS is strictly better than
-#   sampling slower, because the ADC does the anti-aliasing for you. Only lower
-#   the clock when the stream bandwidth is the binding constraint.
+#   sampling slower, because the ADC does the anti-aliasing for you.
+#
+#   You almost certainly do NOT need to lower the clock: both carriers were
+#   measured streaming full 200 kSPS simultaneously and indefinitely with zero
+#   lost samples (39.1 MB/s combined, lag flat over 150 s). Lower it only if the
+#   HOST cannot keep up.
 #
 # NOTE: the FPGA oversampling filter (nacc) would do this properly -- decimate
 # in the FPGA with no aliasing and sqrt(N) less noise -- but it is inert in this

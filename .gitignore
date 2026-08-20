@@ -15,3 +15,7 @@ smoketest*.png
 # local overrides
 probe_geometry_local.json
 calibration_local.json
+octobee_launch_error.log
+
+# on-box firmware/config snapshots (contain private keys and password hashes)
+fw_backup_*/

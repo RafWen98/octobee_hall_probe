@@ -29,6 +29,8 @@ import octobee_calibration as ocal
 import octobee_gui as gui
 import octobee_posecal as opc
 import octobee_record as orec
+import octobee_scan as oscan
+import octobee_stage as ostage
 import probe_geometry as pgeom
 
 FAILS = []
@@ -264,6 +266,43 @@ def test_posecal():
         check("the report calls the dead sensor out",
               "NO RESPONSE" in dsol.report())
 
+    # ---- large sensor offsets must not mirror the solution ---------------
+    # Measured on the real probe 2026-08-19: ambient readings run 0.10-0.57 mT
+    # while the Earth's field is 0.049 mT, so the offsets are 2-12x the signal.
+    # Seeding the field inclination from the raw mean then estimates the OFFSET
+    # rather than the field, and the iteration settles into a mirrored frame --
+    # matching still looks fine and the residual sits at the noise floor, but
+    # det(S) goes negative and the offsets come back wrong by more than their
+    # own size. The seed now uses the transverse VARIANCE (which a constant
+    # cannot affect) plus differences between orientation means (which cancel
+    # the offset exactly), so it has to hold well past anything real.
+    for off_mt in (0.02, 0.3, 0.6, 2.0):
+        rngo = np.random.default_rng(23)
+        go = 1.0 + rngo.normal(0, 0.03, n_sens)
+        So = np.array([np.eye(3) / go[i] for i in range(n_sens)])
+        Mo = np.array([np.linalg.inv(geom.rotations()[i] @ So[i])
+                       for i in range(n_sens)])
+        bo = rngo.normal(0, off_mt, (n_sens, 3))
+
+        def osweep(tag, incl, n=2500):
+            a = np.deg2rad(incl)
+            bt, bz = 49.0e-3 * np.cos(a), 49.0e-3 * np.sin(a)
+            phi = np.sort(rngo.uniform(0, 4 * np.pi, n))
+            B = np.column_stack([bt * np.cos(phi), bt * np.sin(phi),
+                                 np.full(n, bz)])
+            m = np.einsum("sij,tj->tsi", Mo, B) + bo[None]
+            return opc.RollSweep(m + rngo.normal(0, 3e-3, m.shape), tag=tag)
+
+        osol = opc.solve_roll([osweep("A", 25.), osweep("B", -25.),
+                               osweep("C", 60.)], geom, 49.0)
+        _, Sg = osol.decompose()
+        dets = np.array([np.linalg.det(Sg[i]) for i in range(n_sens)])
+        check(f"offsets of {off_mt * 1e3:.0f} uT still give a proper frame",
+              (dets > 0).all(), f"min det {dets.min():.3f}")
+        check(f"offsets of {off_mt * 1e3:.0f} uT are recovered",
+              np.abs(osol.b - bo).max() * 1e3 < 1.0,
+              f"max {np.abs(osol.b - bo).max() * 1e3:.3f} uT")
+
     # ---- S16's ACTUAL fault, not a convenient version of it --------------
     # ch29/30/32 (Bz, By, VCM) pinned at negative full scale while ch31 (Bx)
     # reads normally. This is nastier than a sensor that saw nothing: the railed
@@ -411,6 +450,483 @@ def test_posecal_persistence():
     spread = np.std(np.linalg.norm(tube, axis=2), axis=1).mean()
     check("corrected sensors agree on |B| in the tube frame",
           spread / 49.0e-3 < 0.01, f"spread {spread / 49.0e-3 * 100:.3f} % of |B|")
+
+
+# --------------------------------------------------------------------------
+# Indexed 90-degree poses (octobee_posecap)
+# --------------------------------------------------------------------------
+
+def _synth_pose_sweeps(geom, gains, n_poses=4, seconds=20.0, seed=7):
+    """The same truth as _synth_sweeps, sampled at n_poses discrete angles.
+
+    Noise is what a stationary pose actually averages down to: 81.5 uT rms per
+    sample (README section 7) over seconds * 200 kSPS.
+    """
+    rng = np.random.default_rng(seed)
+    n_sens = pgeom.N_SENSORS
+    b_mt = 49.0e-3
+    noise_mt = 81.5e-3 / np.sqrt(200000.0 * seconds)
+    R_nom = geom.rotations()
+    S_true = np.array([np.eye(3) / gains[i] for i in range(n_sens)])
+    M_true = np.array([np.linalg.inv(R_nom[i] @ S_true[i]) for i in range(n_sens)])
+    b_true = rng.normal(0, 20e-3, (n_sens, 3))
+
+    def sweep(tag, incl_deg, jitter_deg=0.0):
+        a = np.deg2rad(incl_deg)
+        bt, bz = b_mt * np.cos(a), b_mt * np.sin(a)
+        # An unknown start angle and an imperfectly square V-block: neither is
+        # supposed to matter, because solve_roll fits every pose's angle.
+        phi = (np.arange(n_poses) * (2 * np.pi / n_poses)
+               + np.deg2rad(rng.normal(0, jitter_deg, n_poses))
+               + rng.uniform(0, 2 * np.pi))
+        B = np.column_stack([bt * np.cos(phi), bt * np.sin(phi),
+                             np.full(n_poses, bz)])
+        m = np.einsum("sij,tj->tsi", M_true, B) + b_true[None]
+        return opc.RollSweep(m + rng.normal(0, noise_mt, m.shape), tag=tag)
+
+    return sweep, S_true, b_true
+
+
+def test_posecap():
+    print("\n== indexed 90-degree poses ==")
+    geom = pgeom.Geometry.load_or_default()
+    n_sens = pgeom.N_SENSORS
+    gains = 1.0 + np.random.default_rng(1).normal(0, 0.03, n_sens)
+
+    # ---- the claim the README makes: four poses is enough -----------------
+    sweep, S_true, b_true = _synth_pose_sweeps(geom, gains)
+    sol = opc.solve_roll([sweep("A", 25.0), sweep("B", -25.0),
+                          sweep("C", 60.0)], geom, 49.0)
+    err = _matching_error_pct(sol, S_true)
+    check("four 90-degree poses match sensors as well as a hand roll",
+          err < 0.1, f"max inter-sensor error {err:.4f} %")
+    check("four poses still identify the axial column and the gauge",
+          sol.identified[:, 2].all() and sol.anisotropy_identified)
+    check("four poses recover the offsets",
+          np.abs(sol.b - b_true).max() * 1e3 < 0.3,
+          f"max {np.abs(sol.b - b_true).max() * 1e3:.3f} uT")
+
+    # A V-block that indexes to 88 degrees must be as good as one that indexes
+    # to 90 -- otherwise the whole procedure needs a rotary stage.
+    sweep_j, S_j, _ = _synth_pose_sweeps(geom, gains, seed=7)
+    solj = opc.solve_roll([sweep_j("A", 25.0, 2.0), sweep_j("B", -25.0, 2.0),
+                           sweep_j("C", 60.0, 2.0)], geom, 49.0)
+    errj = _matching_error_pct(solj, S_j)
+    check("+/-2 degrees of indexing error does not matter",
+          abs(errj - err) < 0.02, f"{err:.4f} % -> {errj:.4f} %")
+
+    # The arrangement the bench can actually offer: tube axis never leaves the
+    # horizontal, and the only moves are the 90 deg roll and carrying the
+    # cradle round to another compass bearing. At the local ~68 deg dip a
+    # horizontal axis gets its inclination purely from its bearing.
+    dip = np.deg2rad(68.0)
+    bearing_alpha = lambda d: np.degrees(np.arcsin(np.cos(dip)
+                                                   * np.cos(np.deg2rad(d))))
+    sweep_h, S_h, b_h = _synth_pose_sweeps(geom, gains, seed=13)
+    horiz = opc.solve_roll([sweep_h("A", bearing_alpha(0)),      # north
+                            sweep_h("B", bearing_alpha(180)),    # south
+                            sweep_h("C", bearing_alpha(90))],    # east
+                           geom, 51.0)
+    check("three horizontal bearings alone calibrate the probe",
+          _matching_error_pct(horiz, S_h) < 0.1
+          and horiz.identified[:, 2].all() and horiz.anisotropy_identified,
+          f"matching {_matching_error_pct(horiz, S_h):.4f} %, "
+          f"offsets {np.abs(horiz.b - b_h).max() * 1e3:.3f} uT")
+
+    # Rolling at ONE bearing and nothing else leaves the axial column and the
+    # offset perfectly degenerate -- on this probe that is chip +Y on all 16
+    # sensors, a third of the channels. Matching still works, which is the
+    # trap: the number you were mostly after looks fine.
+    one = opc.solve_roll([sweep_h("A", bearing_alpha(0))], geom, 51.0)
+    check("rolling at a single bearing still matches sensors",
+          _matching_error_pct(one, S_h) < 0.15,
+          f"matching {_matching_error_pct(one, S_h):.4f} %")
+    check("...but says the axial column and the gauge are unidentified",
+          not one.identified[:, 2].all() and not one.anisotropy_identified)
+    check("...and its offsets are worthless, as advertised",
+          np.abs(one.b - b_h).max() * 1e3 > 1.0,
+          f"max offset error {np.abs(one.b - b_h).max() * 1e3:.1f} uT")
+
+    # An arrangement that LOOKS fine and is not: tube axis east-west, so the
+    # end-for-end flip leaves the axial field at zero both times and buys
+    # nothing. A third steeply-tilted sweep still spreads bz enough to clear
+    # the leverage test, the residual sits on the noise floor, and the matching
+    # figure comes out the best of the lot -- while the offsets are 350x wrong.
+    # Only the geometry gives it away: every orientation on the same side of
+    # level.
+    sweep_t, S_t, b_t = _synth_pose_sweeps(geom, gains, seed=11)
+    trap = opc.solve_roll([sweep_t("A", 0.0), sweep_t("B", 0.0),
+                           sweep_t("C", 68.0)], geom, 51.0)
+    off_err = np.abs(trap.b - b_t).max() * 1e3
+    check("the east-west arrangement really does wreck the offsets",
+          off_err > 5.0, f"max offset error {off_err:.1f} uT")
+    check("...with a residual that gives no hint of it",
+          np.median(trap.residual_mt) * 1e3 < 0.1,
+          f"{np.median(trap.residual_mt) * 1e3:.4f} uT")
+    check("...and is caught anyway, by every orientation sharing a sign",
+          "every orientation has the axial field" in trap.report())
+    good = opc.solve_roll([sweep_t("A", 22.0), sweep_t("B", -22.0),
+                           sweep_t("C", 68.0)], geom, 51.0)
+    check("a real end-for-end flip does not trip that warning",
+          "every orientation has the axial field" not in good.report()
+          and np.abs(good.b - b_t).max() * 1e3 < 0.3,
+          f"max offset error {np.abs(good.b - b_t).max() * 1e3:.3f} uT")
+
+    # ---- the recorder ------------------------------------------------------
+    import octobee_posecap as pcap
+
+    # Block means must be the real means: this is the path that keeps a 20 s
+    # dwell from being carried to float64 all at once.
+    rng = np.random.default_rng(4)
+    ai = rng.normal(0, 500, (6400, 32)).astype(np.int16)
+    blocks = pcap._block_means(ai, 64)
+    check("block means reduce without changing the mean",
+          blocks.shape == (64, 32)
+          and np.allclose(blocks.mean(axis=0), ai.mean(axis=0, dtype=np.float64)),
+          f"{blocks.shape}")
+    check("block means survive fewer samples than blocks",
+          pcap._block_means(ai[:10], 64).shape[0] == 10)
+
+    # capture_pose against a stubbed carrier: the pose row must be the field
+    # that was there, and the drain capture must be thrown away rather than
+    # averaged in -- it is the one that can hold the rotation itself.
+    R_nom = geom.rotations()
+    truth = np.array([49.0e-3 * v for v in (0.3, -0.5, 0.81)])
+    state = {"n": 0}
+
+    class _Lay:
+        fs_hz, adc_range = 200000.0, "PM10V"
+        volts_per_count = 20.0 / 65536
+
+    def fake_capture_all(hosts, seconds, take_over=True, verbose=True):
+        state["n"] += 1
+        rubbish = state["n"] == 1          # the drain must discard this one
+        out = {}
+        for bi, h in enumerate(hosts):
+            a = np.zeros((max(64, int(2000 * seconds)), 32))
+            for s in range(8):
+                gi = bi * 8 + s
+                m = (R_nom[gi].T @ (truth * (50.0 if rubbish else 1.0)))
+                volts = m * 1e-3 * ocal.ob.RANGE_TO_VPT[20.0] + 2.2
+                counts = volts / _Lay.volts_per_count
+                a[:, s * 4 + 0] = counts[2]      # ch 4k+1 = Bz
+                a[:, s * 4 + 1] = counts[1]      # ch 4k+2 = By
+                a[:, s * 4 + 2] = counts[0]      # ch 4k+3 = Bx
+                a[:, s * 4 + 3] = 2.2 / _Lay.volts_per_count
+            out[h] = ({"ai": a, "sam_cnt": np.arange(a.shape[0]),
+                       "temp_raw": np.zeros(8, dtype=np.int64)}, _Lay())
+        return out
+
+    real = ob.capture_all
+    try:
+        ob.capture_all = fake_capture_all
+        cal = ocal.Calibration(ranges_mt=np.full(n_sens, 20.0))
+        row, st = pcap.capture_pose(["a", "b"], 2.0, cal, chunk_s=1.0,
+                                    drain_s=1.0)
+    finally:
+        ob.capture_all = real
+
+    want = np.array([R_nom[i].T @ truth for i in range(n_sens)])
+    check("a pose reads back the field that was there",
+          np.abs(row - want).max() * 1e3 < 0.5,
+          f"max {np.abs(row - want).max() * 1e3:.3f} uT")
+    check("the drain capture is discarded, not averaged in",
+          np.abs(row).max() < 2 * np.abs(want).max(),
+          f"|row| max {np.abs(row).max() * 1e3:.1f} uT vs "
+          f"{np.abs(want).max() * 1e3:.1f} uT expected")
+    check("a pose reports how many chunks and blocks it averaged",
+          st["n_chunks"] == 2 and st["n_blocks"] == 2 * pcap.BLOCKS_PER_CHUNK,
+          f"{st['n_chunks']} chunks, {st['n_blocks']} blocks")
+
+    # ---- the location survey ----------------------------------------------
+    # Two poses 180 deg apart. Offsets cancel in the difference, so what is
+    # left is the field each sensor actually sat in -- and under a uniform
+    # field that is one number, whatever each chip's orientation, because a
+    # magnitude is rotation-invariant.
+    live_all = np.ones(n_sens, bool)
+    B_t = np.array([47.3e-3, 0.0, 19.0e-3])
+    offs = np.random.default_rng(6).normal(0, 0.3, (n_sens, 3))   # 300 uT
+    # pert is peak-to-peak across the 16 sensors, so the survey's
+    # (max - min) / median has something exact to be compared against.
+    pose = lambda sign, pert=0.0: np.array(
+        [R_nom[i].T @ (sign * B_t * (1.0 + pert * (i - 7.5) / 15.0)) + offs[i]
+         for i in range(n_sens)])
+
+    _, med, spread = pcap.survey_uniformity(pose(+1), pose(-1), live_all)
+    check("a uniform field surveys flat, whatever the offsets",
+          spread < 0.01 and abs(med - 51.0) < 0.5,
+          f"median {med:.2f} uT, spread {spread:.4f} %")
+
+    # A 10 % gradient across the head must read back as ~10 %, not be hidden
+    # by the offsets it sits on top of.
+    _, med_g, spread_g = pcap.survey_uniformity(pose(+1, 0.10), pose(-1, 0.10),
+                                                live_all)
+    check("a gradient across the head shows up at its true size",
+          9.0 < spread_g < 11.0, f"spread {spread_g:.2f} %")
+
+    # An index short of 180 deg scales every sensor the same way, so it moves
+    # the median but must NOT invent or hide non-uniformity.
+    c, s = np.cos(np.deg2rad(170.0)), np.sin(np.deg2rad(170.0))
+    rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    sloppy = np.array([R_nom[i].T @ (rot @ B_t) + offs[i] for i in range(n_sens)])
+    _, med_s, spread_s = pcap.survey_uniformity(pose(+1), sloppy, live_all)
+    check("a sloppy index changes the median, not the spread",
+          spread_s < 0.01 and med_s < med,
+          f"median {med_s:.2f} uT (vs {med:.2f}), spread {spread_s:.4f} %")
+
+
+# --------------------------------------------------------------------------
+# stages and motorised field maps -- no hardware required
+# --------------------------------------------------------------------------
+
+def test_scan_grid():
+    """The grid is the part that silently ruins a map if it is wrong."""
+    pts = oscan.parse_axis_spec("0:100:10")
+    check("an axis spec includes its stop point",
+          len(pts) == 11 and pts[-1] == 100.0,
+          f"{len(pts)} points, last {pts[-1]}")
+    pts = oscan.parse_axis_spec("0:10:3")
+    check("a step that does not divide the span stops short rather than over",
+          pts[-1] <= 10.0 + 1e-9, f"last {pts[-1]}")
+
+    for bad, why in (("0:100", "too few fields"),
+                     ("0:100:0", "zero step"),
+                     ("100:0:10", "stop before start")):
+        try:
+            oscan.parse_axis_spec(bad)
+            ok = False
+        except ValueError:
+            ok = True
+        check(f"axis spec rejects {why}", ok, bad)
+
+    grid = oscan.ScanGrid({"x": oscan.parse_axis_spec("0:20:10"),
+                           "y": oscan.parse_axis_spec("0:10:5")})
+    pts = list(grid.points())
+    check("the grid visits every combination", len(pts) == len(grid) == 9,
+          f"{len(pts)} points")
+
+    # The whole reason the scan is not a serpentine: if any axis ever ran
+    # backwards, leadscrew backlash would stamp an offset into alternate rows
+    # that looks exactly like real field structure.
+    xs = [p["x"] for p in pts]
+    ys = [p["y"] for p in pts]
+    check("the slow axis never reverses",
+          all(b >= a for a, b in zip(xs, xs[1:])), f"{xs}")
+    rows = [ys[i:i + 3] for i in range(0, 9, 3)]
+    check("every row of the fast axis runs the same way",
+          all(r == sorted(r) for r in rows), f"{rows}")
+
+
+def test_fieldmap_roundtrip(workdir):
+    rng = np.random.default_rng(11)
+    n = 12
+    pos = np.stack([np.arange(n, dtype=float), np.zeros(n)], axis=1)
+    fm = oscan.FieldMap(pos, pos + 1e-4, rng.normal(size=(n, 16, 3)),
+                        ["x", "y"], meta={"seconds_per_point": 5.0},
+                        stats=[{"sem_ut": 0.03, "lost": 0}] * n)
+    path = fm.save(os.path.join(workdir, "map_test"))
+    back = oscan.FieldMap.load(path)
+    check("a field map survives a save/load round trip",
+          len(back) == n and np.allclose(back.b_mt, fm.b_mt, atol=1e-6),
+          f"{len(back)} points")
+    check("the round trip keeps commanded and reached positions apart",
+          not np.allclose(back.pos_mm, back.pos_cmd),
+          "that difference is the only way a stalled point is visible later")
+    check("the field map writes a provenance sidecar",
+          os.path.exists(os.path.splitext(path)[0] + ".json"))
+
+
+def test_stage_binding():
+    """The ctypes binding, as far as it goes with no stage attached."""
+    try:
+        d = ostage.dll()
+    except ostage.StageError as exc:
+        check("the Kinesis C API loads", False, str(exc))
+        return
+    check("the Kinesis C API loads", d is not None)
+    check("the binding declares argtypes for every call it makes",
+          all(getattr(d, n).argtypes is not None
+              for n in ("ISC_Open", "ISC_MoveToPosition", "ISC_GetStatusBits",
+                        "ISC_MoveRelative", "TLI_GetDeviceListExt")),
+          "an unbound DWORD return truncates the status word silently")
+    check("the status word decodes the homed bit",
+          "homed" in ostage.Stage("45000000").status_flags(
+              ostage.HOMED_BIT | ostage.ENABLED_BIT))
+    check("the status word decodes motion errors",
+          "motion_error" in ostage.Stage("45000000").status_flags(
+              ostage.MOTION_ERROR_BIT))
+
+    st = ostage.Stage("45000000")
+    check("device units round trip through millimetres",
+          abs(st._to_mm(st._to_du(137.25)) - 137.25) < 1e-6)
+    check("the LTS300C default scaling matches the measured 409600 du/mm",
+          st._to_du(300.0) == 122880000, f"{st._to_du(300.0)}")
+
+    for name, fn in (("position", lambda: st.position_mm),
+                     ("status", lambda: st.status),
+                     ("a move", lambda: st.move_to(10.0))):
+        try:
+            fn()
+            ok = False
+        except ostage.StageError:
+            ok = True
+        check(f"{name} on an unopened stage raises rather than lying", ok)
+
+
+def _framed(name, invert, origin=None, lo=0.0, hi=300.0):
+    """A Stage with its travel filled in as if it had been opened."""
+    st = ostage.Stage("45000000", name=name, invert=invert, origin_mm=origin)
+    st.travel_dev_mm = (lo, hi)
+    st._resolve_frame()
+    return st
+
+
+def test_stage_frame():
+    """A reverse-mounted axis must be handled in exactly one place.
+
+    The failure this guards against is not a crash. It is a field map that
+    comes out mirrored along one axis and looks entirely plausible.
+    """
+    fwd = _framed("x", False)
+    check("an as-mounted axis is the identity",
+          fwd.travel_mm == (0.0, 300.0) and fwd._rig_to_dev(75.0) == 75.0,
+          f"travel {fwd.travel_mm}")
+    check("an as-mounted axis says so",
+          fwd.frame_note() == "as mounted", fwd.frame_note())
+
+    rev = _framed("z", True)
+    check("a reversed axis puts rig zero at the far end of travel",
+          rev.origin_mm == 300.0, f"origin {rev.origin_mm}")
+    check("a reversed axis still spans the same rig travel",
+          rev.travel_mm == (0.0, 300.0), f"travel {rev.travel_mm}")
+    check("a reversed axis has no negative zero in its travel",
+          not any(str(v).startswith("-0") for v in rev.travel_mm),
+          f"travel {rev.travel_mm}")
+
+    # The cube the user actually cares about: rig zero is the BOTTOM, and the
+    # limit switch the stage homes to is the top.
+    check("rig zero maps to the stage's far end",
+          rev._rig_to_dev(0.0) == 300.0)
+    check("rig maximum maps to the stage's home",
+          rev._rig_to_dev(300.0) == 0.0)
+    check("the midpoint is its own mirror image",
+          rev._rig_to_dev(150.0) == 150.0)
+    for rig in (0.0, 12.5, 150.0, 299.0):
+        check(f"rig {rig:g} mm round trips through the device frame",
+              abs(rev._dev_to_rig(rev._rig_to_dev(rig)) - rig) < 1e-9)
+
+    check("a reversed axis reverses relative moves too",
+          rev._sign == -1.0 and fwd._sign == 1.0,
+          "a rig +5 mm must drive the device -5 mm, or jogging goes backwards")
+
+    # An explicit origin is how you put rig zero on a fixture datum rather
+    # than on a hard limit.
+    off = _framed("z", True, origin=250.0)
+    check("an explicit origin overrides the automatic one",
+          off.origin_mm == 250.0 and off._rig_to_dev(0.0) == 250.0)
+    check("an explicit origin shifts the rig travel with it",
+          off.travel_mm == (-50.0, 250.0), f"travel {off.travel_mm}")
+
+
+def test_stage_frame_persistence(workdir):
+    path = os.path.join(workdir, "stages_frame.json")
+    ostage.save_axis_map(
+        {"x": "45502844", "z": "45502854", "y": "45538374"}, path,
+        frames={"x": {"invert": False},
+                "z": {"invert": True},
+                "y": {"invert": False, "origin_mm": 12.0}})
+    frames = ostage.load_axis_frames(path)
+    check("the axis frame round trips", frames["z"]["invert"] is True,
+          str(frames))
+    check("an explicit origin round trips", frames["y"]["origin_mm"] == 12.0,
+          str(frames))
+    check("an unset origin round trips as None",
+          frames["z"]["origin_mm"] is None, str(frames))
+    check("the axis map survives alongside the frame",
+          ostage.load_axis_map(path)["z"] == "45502854")
+
+    # Writing the map without frames must not wipe the mounting -- the GUI's
+    # "Save axis map" button does exactly that.
+    ostage.save_axis_map({"x": "45502844", "z": "45502854"}, path)
+    check("saving the map alone preserves the mounting",
+          ostage.load_axis_frames(path)["z"]["invert"] is True)
+
+    # A bare boolean is the shorthand a human is most likely to hand-edit in.
+    with open(path) as fh:
+        doc = json.load(fh)
+    doc["frame"] = {"z": True}
+    with open(path, "w") as fh:
+        json.dump(doc, fh)
+    check("a bare true is accepted as shorthand for invert",
+          ostage.load_axis_frames(path)["z"]["invert"] is True)
+
+    check("a missing frame block is empty, not an error",
+          ostage.load_axis_frames(os.path.join(workdir, "nope.json")) == {})
+
+
+def test_stage_axis_map(workdir):
+    path = os.path.join(workdir, "stages.json")
+    ostage.save_axis_map({"x": "45502844", "z": "45538374"}, path)
+    back = ostage.load_axis_map(path)
+    check("the axis map round trips",
+          back == {"x": "45502844", "z": "45538374"}, str(back))
+    check("a missing axis map is empty, not an error",
+          ostage.load_axis_map(os.path.join(workdir, "nope.json")) == {})
+
+    # A map naming a stage that is not present must fail loudly: the axis
+    # names ARE the coordinate frame, and quietly dropping one produces a map
+    # whose axes mean something other than what the file says.
+    try:
+        ostage.StageSet.from_config(path, serials=["45502844"])
+        ok = False
+    except ostage.StageError:
+        ok = True
+    check("an axis map naming an absent stage is refused", ok)
+
+    ss = ostage.StageSet.from_config(path, serials=["45502844", "45538374"])
+    check("a valid axis map builds the named axes",
+          sorted(ss.names) == ["x", "z"], str(ss.names))
+    try:
+        ss.move_to(y=1.0)
+        ok = False
+    except ostage.StageError:
+        ok = True
+    check("moving an axis the set does not have is refused", ok)
+
+
+def test_scan_guards():
+    """run_scan must refuse the two setups that yield a plausible bad map."""
+    class FakeStage:
+        def __init__(self, name, homed):
+            self.name, self.serial, self.homed = name, "45000000", homed
+
+    class FakeSet:
+        def __init__(self, axes):
+            self.axes = axes
+            self.names = list(axes)
+
+        def __getitem__(self, k):
+            return self.axes[k]
+
+    grid = oscan.ScanGrid({"x": oscan.parse_axis_spec("0:10:5")})
+    cal = ocal.Calibration()
+
+    try:
+        oscan.run_scan(("h",), FakeSet({"y": FakeStage("y", True)}), grid,
+                       1.0, cal)
+        ok = False
+    except ostage.StageError:
+        ok = True
+    check("a scan naming an axis the stages lack is refused", ok)
+
+    try:
+        oscan.run_scan(("h",), FakeSet({"x": FakeStage("x", False)}), grid,
+                       1.0, cal)
+        ok = False
+    except ostage.StageError:
+        ok = True
+    check("a scan over an unhomed axis is refused",
+          ok, "an unhomed counter gives the map no origin")
 
 
 # --------------------------------------------------------------------------
@@ -938,8 +1454,16 @@ def main():
     test_shipped_calibration()
     test_health()
     test_posecal()
+    test_posecap()
     test_posecal_persistence()
+    test_scan_grid()
+    test_scan_guards()
+    test_stage_binding()
+    test_stage_frame()
     with tempfile.TemporaryDirectory() as workdir:
+        test_fieldmap_roundtrip(workdir)
+        test_stage_axis_map(workdir)
+        test_stage_frame_persistence(workdir)
         test_app(app, args, workdir)
 
     print(f"\n{CHECKS - len(FAILS)}/{CHECKS} checks passed")

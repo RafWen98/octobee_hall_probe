@@ -37,8 +37,13 @@ is radial, so `e2 = cross(e3, e1)` lands exactly on the tube axis and **chip +Y
 is axial on all 16 sensors**. Roll alone therefore calibrates chip X and Z and
 leaves chip Y untouched -- a third of the channels.
 
-The fix needs no fixture: record a second sweep with the tube lifted out of the
-cradle and put back end-for-end. Bz flips sign, so
+The fix needs no fixture: record a second sweep with the tube axis REVERSED
+relative to the field. Lifting the tube out and putting it back end-for-end
+does that, but so does carrying the whole cradle round 180 deg on the bench --
+the solve only ever sees Bz = B . (tube axis) and Bt = |B - Bz*axis|, and both
+moves send Bz -> -Bz with Bt unchanged. Where the transverse axes land differs,
+and does not matter, because the roll angle is a free parameter. So the tube
+never has to leave the horizontal. Bz flips sign, so
 
     b_i        = (sweep_A + sweep_B) / 2
     M[:,2]*Bz  = (sweep_A - sweep_B) / 2
@@ -373,14 +378,21 @@ class PoseSolution:
     def orthogonality_deg(self):
         """(16,3) departure from 90 deg between each pair of chip axes."""
         _, S = self.decompose()
-        out = np.empty((N_SENSORS, 3))
+        out = np.full((N_SENSORS, 3), np.nan)
         for i in range(N_SENSORS):
             e = S[i]
             for k, (p, q) in enumerate(((0, 1), (1, 2), (2, 0))):
-                cp = e[:, p] / np.linalg.norm(e[:, p])
-                cq = e[:, q] / np.linalg.norm(e[:, q])
+                # A sensor that saw nothing -- S16's ribbon is the live
+                # example -- has a zero-length column here, and normalising it
+                # used to spray "invalid value encountered in divide" over
+                # every report. The angle between an axis and nothing is not a
+                # number; say so once, in the table, rather than in a warning.
+                np_, nq = np.linalg.norm(e[:, p]), np.linalg.norm(e[:, q])
+                if not (np_ > 0 and nq > 0):
+                    continue
                 out[i, k] = 90.0 - np.degrees(
-                    np.arccos(np.clip(abs(cp @ cq), -1.0, 1.0)))
+                    np.arccos(np.clip(abs((e[:, p] / np_) @ (e[:, q] / nq)),
+                                      -1.0, 1.0)))
         return out
 
     @property
@@ -460,8 +472,12 @@ class PoseSolution:
             sid = f"S{i + 1}"
             flag = ("  (NO RESPONSE)" if sid in bad else
                     "  (excluded)" if sid in dead else "")
+            # All three angles are NaN when the sensor saw nothing at all, and
+            # nanmax of an all-NaN row warns rather than returning NaN quietly.
+            row = np.abs(ortho[i])
+            ang = f"{np.nanmax(row):6.2f} deg" if np.isfinite(row).any() else "     -- "
             lines.append(f"  {sid:<6}  {g[i]:6.4f}  {self.residual_mt[i] * 1e3:8.3f}"
-                         f"   {np.nanmax(np.abs(ortho[i])):6.2f} deg{flag}")
+                         f"   {ang}{flag}")
         if not self.identified[:, 2].all():
             lines += ["",
                       "WARNING: the axial column of M was not identified by the",
@@ -476,6 +492,25 @@ class PoseSolution:
                       "biased. Add a sweep with the tube reversed end-for-end;",
                       "two cradle azimuths on the same side of level are not a",
                       "substitute."]
+        # Leverage alone lets a bad arrangement through. Point the tube axis
+        # east-west and flip it end-for-end and you get alpha = 0 both times:
+        # the flip bought nothing, but a third steeply-tilted sweep still
+        # spreads bz enough to score leverage 0.67 and clear the test above.
+        # Graded on synthetic truth that arrangement returned offsets 17 uT
+        # wrong -- 350x -- with the residual sitting on the noise floor and
+        # the matching figure looking like the best of the lot. What actually
+        # distinguishes it is that every orientation ended up on the SAME side
+        # of level, which is a property of the geometry, not of the fit.
+        if len(self.bz) > 1 and np.all(np.sign(self.bz) == np.sign(self.bz[0])):
+            lines += ["",
+                      "WARNING: every orientation has the axial field on the same",
+                      "side of level, so no end-for-end flip is present in this",
+                      "data even if you recorded one -- point the tube axis",
+                      "east-west and reversing it changes nothing. The offsets",
+                      "and the axial column are then traded against each other",
+                      "with the residual still at the noise floor, so do NOT read",
+                      "the residual as evidence. Re-record with the tube axis",
+                      "roughly along magnetic north, then flipped end-for-end."]
         if not self.anisotropy_identified:
             lines += ["",
                       "WARNING: transverse-vs-axial sensitivity was not pinned by",
@@ -609,13 +644,62 @@ def solve_roll(sweeps, geometry=None, b_earth_ut=DEFAULT_B_EARTH_UT,
 
     # Seed each orientation's field split from the nominal geometry: project
     # onto the tube frame and see how much of it never moved during the roll.
+    # Seeding the inclination is the one place a large sensor offset can wreck
+    # the whole solve. The obvious estimate -- project the mean reading onto the
+    # tube axis -- is the mean of (axial field + offset), and on this probe the
+    # offsets run 0.1-0.6 mT against an axial field of ~0.02 mT. The seed then
+    # comes out of the offsets, the first fit is nonsense, and the iteration
+    # settles into a MIRRORED frame: matching still looks fine, det(S) goes
+    # negative, and the offsets come back wrong by more than they are.
+    #
+    # So seed from quantities offsets cannot touch:
+    #   * the transverse amplitude comes from the VARIANCE, and a constant has
+    #     no variance -- so |bt| is clean, and |bz| follows from |B|.
+    #   * the SIGN of bz comes from how the group means DIFFER. The offset is
+    #     identical in every orientation, so differencing the group means
+    #     cancels it exactly and leaves only the axial field.
     alpha = np.zeros(len(groups))
+    mus, amps = [], []
     for g in range(len(groups)):
         sel = [m for m, gg in zip(data, gidx) if gg == g]
         seed = np.concatenate(
             [np.einsum("sji,tsj->tsi", M_nom[live], m[:, live, :]) for m in sel])
-        amp = np.sqrt(np.mean(seed[..., 0].var(axis=0) + seed[..., 1].var(axis=0)))
-        alpha[g] = np.arctan2(np.mean(seed[..., 2]), max(amp, 1e-12))
+        amps.append(np.sqrt(np.mean(seed[..., 0].var(axis=0)
+                                    + seed[..., 1].var(axis=0))))
+        mus.append(seed.mean(axis=0))                    # (live,3)
+    mu_bar = np.mean(mus, axis=0)
+    bt_seed = np.array([min(a, b_total_mt) for a in amps])
+    bz_mag = np.sqrt(np.maximum(b_total_mt ** 2 - bt_seed ** 2, 0.0))
+    # The group means give bz only up to a common unknown constant, because the
+    # offset they also contain is the same in every orientation:
+    #     mean_g  =  bz_g + (offset term)      ->   delta_g = bz_g - c
+    # So differencing fixes the ORDERING of the orientations but not their
+    # signs. Taking sign(delta_g) directly is wrong the moment two orientations
+    # share a sign -- it would hand +60 deg and +25 deg opposite signs purely
+    # because one sits either side of their mean, and the solve then converges
+    # on a genuinely wrong answer whose residual is indistinguishable from the
+    # right one.
+    #
+    # |bz_g| is already known from |B| and the offset-immune amplitude, so the
+    # only unknowns are the signs. Try them: the true pattern is the one that
+    # makes (s_g * |bz_g| - delta_g) actually constant. The overall sign is
+    # unobservable -- flipping every bz and the axial column of M together
+    # reproduces the same data -- so anchor the first orientation at +.
+    deltas = np.array([float(np.mean((mus[g] - mu_bar)[..., 2]))
+                       for g in range(len(groups))])
+    signs = np.ones(len(groups))
+    if 1 < len(groups) <= 10:
+        best = None
+        for bits in range(1 << (len(groups) - 1)):
+            cand = np.ones(len(groups))
+            for k in range(len(groups) - 1):
+                cand[k + 1] = 1.0 if (bits >> k) & 1 else -1.0
+            v = cand * bz_mag
+            r = float(np.sum((v - deltas - np.mean(v - deltas)) ** 2))
+            if best is None or r < best[0]:
+                best = (r, cand)
+        signs = best[1]
+    alpha = np.arctan2(signs * bz_mag, np.maximum(bt_seed, 1e-12))
 
     M = M_nom.copy()
     b = np.zeros((N_SENSORS, 3))

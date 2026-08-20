@@ -41,6 +41,8 @@ import octobee_calibration as ocal
 import octobee_profile as oprof
 import octobee_posecal as opc
 import octobee_record as orec
+import octobee_scan as oscan
+import octobee_stage as ostage
 import probe_geometry as pgeom
 from probe_view3d import ProbeView3D, color_for
 
@@ -52,10 +54,10 @@ OUT_RATES = (100.0, 200.0, 500.0, 1000.0, 2000.0)
 # below 200 kSPS folds noise from 0-100 kHz into 0-fs/2. The density penalty is
 # sqrt(100kHz / (fs/2)) -- measured 3.1x at 20 kSPS, matching the predicted 3.16x.
 # You trade noise for stream bandwidth; the label states the cost.
-STREAM_RATES = {"200 kSPS (no aliasing, best noise)": 200000.0,
+STREAM_RATES = {"leave the box alone (recommended)": 0.0,
+                "200 kSPS (no aliasing, best noise)": 200000.0,
                 "50 kSPS (2.0x noise, aliased)": 50000.0,
-                "20 kSPS (3.2x noise, aliased)": 20000.0,
-                "leave the box alone": 0.0}
+                "20 kSPS (3.2x noise, aliased)": 20000.0}
 
 # The per-channel health scan is the most expensive thing in the refresh loop
 # and its answer changes only when a connector does, so it runs on its own
@@ -510,6 +512,98 @@ class SnapshotWorker(QtCore.QThread):
             self.done.emit("", f"{type(e).__name__}: {e}", fs)
 
 
+class StageWorker(QtCore.QThread):
+    """
+    Run one blocking stage operation off the GUI thread.
+
+    Connecting, homing and moving all block for seconds to minutes. Reading
+    position and status does not -- those come out of the DLL's own polling
+    cache, so the GUI reads them directly on its own timer and only the
+    commands come through here.
+    """
+
+    done = QtCore.pyqtSignal(str, str)                 # what, error
+    progress = QtCore.pyqtSignal(str)
+
+    def __init__(self, what, fn):
+        super().__init__()
+        self.what = what
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.fn(self.progress.emit)
+            self.done.emit(self.what, "")
+        except Exception as e:                        # noqa: BLE001
+            self.done.emit(self.what, f"{type(e).__name__}: {e}")
+
+
+class ScanWorker(QtCore.QThread):
+    """
+    Drive a field map: move, settle, average, repeat.
+
+    Owns the carriers for the duration. The live stream has to be released and
+    the boxes put back on their own clock before the first capture, exactly as
+    SnapshotWorker does -- octobee_scan explains why a scan that quietly ran at
+    the reduced live rate is worse than one that fails outright: it produces a
+    map that looks entirely plausible and is several times noisier than the
+    seconds-per-point setting implies.
+    """
+
+    done = QtCore.pyqtSignal(object, str)             # FieldMap, error
+    progress = QtCore.pyqtSignal(int, int, str, float)  # i, n, where, sem_ut
+    message = QtCore.pyqtSignal(str)
+
+    def __init__(self, hosts, stages, grid, seconds, cal, settle_s,
+                 restore_clkdiv=None):
+        super().__init__()
+        self.hosts = hosts
+        self.stages = stages
+        self.grid = grid
+        self.seconds = seconds
+        self.cal = cal
+        self.settle_s = settle_s
+        self.restore_clkdiv = dict(restore_clkdiv or {})
+        self._abort = False
+
+    def abort(self):
+        """Ask the scan to stop after the point in flight.
+
+        Deliberately not an immediate stop: the capture running right now is
+        already paid for, and finishing it costs seconds where discarding it
+        loses a point from the map.
+        """
+        self._abort = True
+
+    def run(self):
+        fm = None
+        try:
+            if self.restore_clkdiv:
+                import octobee_live as olive
+                self.message.emit("restoring the carriers' own clock")
+                for h, prev in self.restore_clkdiv.items():
+                    olive.restore_rate(h, prev)
+                time.sleep(3.0)
+            for h in self.hosts:
+                if ob.stop_live_stream(h):
+                    self.message.emit(f"{h}: released a running capture")
+
+            def on_point(i, n, point, row, stats):
+                where = " ".join(f"{k}={v:g}" for k, v in point.items())
+                self.progress.emit(i, n, where,
+                                   float(stats.get("sem_ut", float("nan"))))
+
+            fm = oscan.run_scan(
+                self.hosts, self.stages, self.grid, self.seconds, self.cal,
+                settle_s=self.settle_s,
+                progress=on_point,
+                should_abort=lambda: self._abort,
+                log=self.message.emit)
+            self.done.emit(fm, "")
+        except Exception as e:                        # noqa: BLE001
+            self.done.emit(fm, f"{type(e).__name__}: {e}")
+
+
 # ==========================================================================
 # small widgets
 # ==========================================================================
@@ -898,6 +992,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lag = oprof.LagMonitor(interval_ms=100)
         self._connect_worker = None
         self._snap_worker = None
+        self.stages = None
+        self.stage_combos = {}
+        self._stage_pending = None
+        self._stage_worker = None
+        self._scan_worker = None
+        self._scan_t0 = 0.0
 
         self.setWindowTitle("OCTO-BEE Hall probe")
         self.resize(1720, 980)
@@ -924,6 +1024,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.prof_timer = QtCore.QTimer(self)
         self.prof_timer.timeout.connect(self.refresh_profile)
         self.prof_timer.start(1000)
+        # The stage positions come out of the Kinesis DLL's own polling
+        # cache, so this reads memory rather than talking to USB -- it
+        # can run fast enough to make jogging feel direct without
+        # competing with acquisition.
+        self.stage_timer = QtCore.QTimer(self)
+        self.stage_timer.timeout.connect(self.refresh_stage_table)
+        self.stage_timer.start(200)
 
         if args.demo:
             self._set_source(DemoSource(self.geom), "demo")
@@ -970,6 +1077,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addTab(self.table, "Sensors")
         left.addTab(self._calib_tab(), "Calibration")
         left.addTab(self._health_tab(), "Diagnostics")
+        left.addTab(self._stage_tab(), "Stages")
         left.addTab(self._export_tab(), "Data output")
         left.addTab(self._profile_tab(), "Profile")
         left.addTab(self.log, "Log")
@@ -1384,6 +1492,592 @@ class MainWindow(QtWidgets.QMainWindow):
             "concentrator, which is a wiring fault, not a calibration one.")
         lay.addWidget(self.health_text)
         return w
+
+    # ---- stages ----------------------------------------------------------
+    def _stage_tab(self):
+        """Thorlabs LTS300C control and motorised field mapping.
+
+        Laid out in the order you have to do things: find the stages, tell the
+        software which one is which axis, reference them, then scan. Homing sits
+        behind a confirmation because it drives the carriage into a limit switch
+        at speed and the software has no idea what is bolted to it.
+        """
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+
+        g1 = QtWidgets.QGroupBox("1. Stages")
+        f1 = QtWidgets.QGridLayout(g1)
+        note = QtWidgets.QLabel(
+            "The stages are exclusive-open USB devices: if the Thorlabs "
+            "Kinesis application is running it owns all of them and none will "
+            "appear here. Close Kinesis first.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#9aa3b2; font-size:11px;")
+        f1.addWidget(note, 0, 0, 1, 4)
+
+        self.stage_table = QtWidgets.QTableWidget(0, 5)
+        self.stage_table.setHorizontalHeaderLabels(
+            ["serial", "model", "axis", "position", "state"])
+        self.stage_table.verticalHeader().setVisible(False)
+        self.stage_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.stage_table.horizontalHeader().setStretchLastSection(True)
+        self.stage_table.setMaximumHeight(140)
+        f1.addWidget(self.stage_table, 1, 0, 1, 4)
+
+        self.btn_stage_scan = QtWidgets.QPushButton("Find stages")
+        self.btn_stage_scan.clicked.connect(self.on_stage_find)
+        self.btn_stage_connect = QtWidgets.QPushButton("Connect")
+        self.btn_stage_connect.clicked.connect(self.on_stage_connect)
+        self.btn_stage_disconnect = QtWidgets.QPushButton("Disconnect")
+        self.btn_stage_disconnect.clicked.connect(self.on_stage_disconnect)
+        self.btn_stage_disconnect.setEnabled(False)
+        self.btn_stage_savemap = QtWidgets.QPushButton("Save axis map")
+        self.btn_stage_savemap.setToolTip(
+            "Records which serial number is which axis in stages.json, so the "
+            "next session does not have to be told again.")
+        self.btn_stage_savemap.clicked.connect(self.on_stage_save_map)
+        f1.addWidget(self.btn_stage_scan, 2, 0)
+        f1.addWidget(self.btn_stage_connect, 2, 1)
+        f1.addWidget(self.btn_stage_disconnect, 2, 2)
+        f1.addWidget(self.btn_stage_savemap, 2, 3)
+        lay.addWidget(g1)
+
+        g2 = QtWidgets.QGroupBox("2. Manual control")
+        f2 = QtWidgets.QGridLayout(g2)
+        f2.addWidget(QtWidgets.QLabel("jog step"), 0, 1)
+        f2.addWidget(QtWidgets.QLabel("move to"), 0, 4)
+        self.stage_rows = {}
+        for r, ax in enumerate(("x", "y", "z"), start=1):
+            lbl = QtWidgets.QLabel(ax)
+            step = QtWidgets.QDoubleSpinBox()
+            step.setRange(0.001, 100.0)
+            step.setDecimals(3)
+            step.setValue(1.0)
+            step.setSuffix(" mm")
+            minus = QtWidgets.QPushButton("−")
+            plus = QtWidgets.QPushButton("+")
+            minus.setMaximumWidth(36)
+            plus.setMaximumWidth(36)
+            target = QtWidgets.QDoubleSpinBox()
+            target.setRange(0.0, 300.0)
+            target.setDecimals(3)
+            target.setSuffix(" mm")
+            go = QtWidgets.QPushButton("Go")
+            home = QtWidgets.QPushButton("Home")
+            home.setToolTip("Drives this axis into its limit switch. Make sure "
+                            "the probe and its cabling are clear first.")
+            minus.clicked.connect(
+                lambda _, a=ax, s=step: self.on_stage_jog(a, -s.value()))
+            plus.clicked.connect(
+                lambda _, a=ax, s=step: self.on_stage_jog(a, +s.value()))
+            go.clicked.connect(
+                lambda _, a=ax, t=target: self.on_stage_goto(a, t.value()))
+            home.clicked.connect(lambda _, a=ax: self.on_stage_home([a]))
+            for c, wdg in enumerate((lbl, step, minus, plus, target, go, home)):
+                f2.addWidget(wdg, r, c)
+            self.stage_rows[ax] = {"step": step, "target": target,
+                                   "widgets": (lbl, step, minus, plus, target,
+                                               go, home)}
+
+        self.btn_stage_homeall = QtWidgets.QPushButton("Home all axes")
+        self.btn_stage_homeall.clicked.connect(lambda: self.on_stage_home(None))
+        self.btn_stage_stop = QtWidgets.QPushButton("STOP")
+        self.btn_stage_stop.setStyleSheet(
+            "background:#7a1f1f; color:#fff; font-weight:bold;")
+        self.btn_stage_stop.clicked.connect(self.on_stage_stop)
+        f2.addWidget(self.btn_stage_homeall, 4, 0, 1, 3)
+        f2.addWidget(self.btn_stage_stop, 4, 5, 1, 2)
+        lay.addWidget(g2)
+
+        g3 = QtWidgets.QGroupBox("3. Field map")
+        f3 = QtWidgets.QGridLayout(g3)
+        blurb = QtWidgets.QLabel(
+            "Move, stop, average, repeat. Each point is averaged at the "
+            "carriers' own 200 kSPS with the stream released, so a 5 s point "
+            "reaches roughly 0.04 µT — the same argument as the pose capture, "
+            "applied to position instead of roll.\n"
+            "Every row is traversed in the same direction so leadscrew "
+            "backlash cannot stamp a comb into the map.")
+        blurb.setWordWrap(True)
+        f3.addWidget(blurb, 0, 0, 1, 6)
+        for c, head in enumerate(("", "start", "stop", "step"), start=0):
+            f3.addWidget(QtWidgets.QLabel(head), 1, c)
+        self.scan_rows = {}
+        for r, ax in enumerate(("x", "y", "z"), start=2):
+            chk = QtWidgets.QCheckBox(ax)
+            spins = []
+            for val, lo, hi in ((0.0, 0.0, 300.0), (10.0, 0.0, 300.0),
+                                (1.0, 0.001, 300.0)):
+                sp = QtWidgets.QDoubleSpinBox()
+                sp.setRange(lo, hi)
+                sp.setDecimals(3)
+                sp.setValue(val)
+                sp.setSuffix(" mm")
+                spins.append(sp)
+            f3.addWidget(chk, r, 0)
+            for c, sp in enumerate(spins, start=1):
+                f3.addWidget(sp, r, c)
+            chk.toggled.connect(self._update_scan_estimate)
+            for sp in spins:
+                sp.valueChanged.connect(self._update_scan_estimate)
+            self.scan_rows[ax] = {"chk": chk, "spins": spins}
+
+        self.spin_scan_s = QtWidgets.QDoubleSpinBox()
+        self.spin_scan_s.setRange(0.5, 120.0)
+        self.spin_scan_s.setValue(5.0)
+        self.spin_scan_s.setSuffix(" s")
+        self.spin_scan_s.valueChanged.connect(self._update_scan_estimate)
+        self.spin_scan_settle = QtWidgets.QDoubleSpinBox()
+        self.spin_scan_settle.setRange(0.0, 30.0)
+        self.spin_scan_settle.setValue(oscan.DEFAULT_SETTLE_S)
+        self.spin_scan_settle.setSuffix(" s")
+        self.spin_scan_settle.setToolTip(
+            "Wait after the stage stops before averaging. The controller says "
+            "'stopped' when its profile ends, which is not when a cantilevered "
+            "probe stops ringing. Too short does not look like an error — it "
+            "looks like a field gradient.")
+        self.spin_scan_settle.valueChanged.connect(self._update_scan_estimate)
+        f3.addWidget(QtWidgets.QLabel("average per point"), 5, 0, 1, 2)
+        f3.addWidget(self.spin_scan_s, 5, 2)
+        f3.addWidget(QtWidgets.QLabel("settle"), 5, 3)
+        f3.addWidget(self.spin_scan_settle, 5, 4)
+
+        self.lbl_scan_est = QtWidgets.QLabel("")
+        self.lbl_scan_est.setStyleSheet("color:#9aa3b2;")
+        f3.addWidget(self.lbl_scan_est, 6, 0, 1, 6)
+
+        self.btn_scan_start = QtWidgets.QPushButton("Start field map")
+        self.btn_scan_start.clicked.connect(self.on_scan_start)
+        self.btn_scan_abort = QtWidgets.QPushButton("Abort")
+        self.btn_scan_abort.setEnabled(False)
+        self.btn_scan_abort.clicked.connect(self.on_scan_abort)
+        self.bar_scan = QtWidgets.QProgressBar()
+        self.bar_scan.setTextVisible(True)
+        f3.addWidget(self.btn_scan_start, 7, 0, 1, 2)
+        f3.addWidget(self.btn_scan_abort, 7, 2)
+        f3.addWidget(self.bar_scan, 7, 3, 1, 3)
+        lay.addWidget(g3)
+
+        lay.addStretch(1)
+        self._update_scan_estimate()
+        self._set_stage_controls_enabled(False)
+        return w
+
+    def _set_stage_controls_enabled(self, on):
+        for row in self.stage_rows.values():
+            for wdg in row["widgets"]:
+                wdg.setEnabled(on)
+        self.btn_stage_homeall.setEnabled(on)
+        self.btn_stage_stop.setEnabled(on)
+        self.btn_scan_start.setEnabled(on)
+        self.btn_stage_disconnect.setEnabled(on)
+        self.btn_stage_connect.setEnabled(not on)
+
+    def on_stage_find(self):
+        try:
+            serials = ostage.list_devices()
+        except ostage.StageError as exc:
+            self.log.log(f"stages: {exc}")
+            QtWidgets.QMessageBox.warning(self, "Stages", str(exc))
+            return
+        if not serials:
+            msg = ("No stages on the bus. The Kinesis application is running "
+                   "and holds all of them — close it and try again."
+                   if ostage.kinesis_is_running() else
+                   "No stages on the bus. Check power and USB.")
+            self.log.log(f"stages: {msg}")
+            QtWidgets.QMessageBox.warning(self, "Stages", msg)
+            return
+
+        saved = {v: k for k, v in ostage.load_axis_map().items()}
+        self.stage_table.setRowCount(len(serials))
+        self.stage_combos = {}
+        for r, s in enumerate(serials):
+            info = ostage.device_info(s)
+            self.stage_table.setItem(r, 0, QtWidgets.QTableWidgetItem(s))
+            self.stage_table.setItem(
+                r, 1, QtWidgets.QTableWidgetItem(info["description"]))
+            combo = QtWidgets.QComboBox()
+            combo.addItems(["—", "x", "y", "z"])
+            if s in saved:
+                combo.setCurrentText(saved[s])
+            self.stage_table.setCellWidget(r, 2, combo)
+            self.stage_combos[s] = combo
+            self.stage_table.setItem(r, 3, QtWidgets.QTableWidgetItem("—"))
+            self.stage_table.setItem(r, 4, QtWidgets.QTableWidgetItem("closed"))
+        self.stage_table.resizeColumnsToContents()
+        # Sized for the widest thing each column will ever hold, not for what
+        # is in it right now: the position and state cells are rewritten five
+        # times a second, and re-fitting the columns on every poll makes the
+        # whole table twitch.
+        for col, width in ((0, 90), (1, 90), (2, 70), (3, 120)):
+            self.stage_table.setColumnWidth(col, width)
+        self.log.log(f"stages: found {len(serials)} controller(s): "
+                     f"{', '.join(serials)}")
+        if not saved:
+            self.log.log(
+                "stages: no axis map yet. Assign x/y/z in the table — the "
+                "software cannot work out which stage is which physical "
+                "direction, and guessing would silently transpose the "
+                "coordinate frame of every map you take. Use the CLI's "
+                "'octobee_stage.py identify' to wiggle each one if unsure.")
+
+    def _axis_map_from_table(self):
+        mapping = {}
+        for serial, combo in getattr(self, "stage_combos", {}).items():
+            name = combo.currentText()
+            if name != "—":
+                if name in mapping:
+                    raise ostage.StageError(
+                        f"axis '{name}' is assigned to two stages")
+                mapping[name] = serial
+        return mapping
+
+    def on_stage_save_map(self):
+        try:
+            mapping = self._axis_map_from_table()
+        except ostage.StageError as exc:
+            QtWidgets.QMessageBox.warning(self, "Axis map", str(exc))
+            return
+        if not mapping:
+            QtWidgets.QMessageBox.information(
+                self, "Axis map", "Assign at least one axis first.")
+            return
+        ostage.save_axis_map(mapping)
+        self.log.log(f"stages: wrote {ostage.AXIS_CONFIG} — "
+                     + ", ".join(f"{k}={v}" for k, v in mapping.items()))
+
+    def on_stage_connect(self):
+        if not getattr(self, "stage_combos", None):
+            self.on_stage_find()
+            if not getattr(self, "stage_combos", None):
+                return
+        try:
+            mapping = self._axis_map_from_table()
+        except ostage.StageError as exc:
+            QtWidgets.QMessageBox.warning(self, "Axis map", str(exc))
+            return
+        if not mapping:
+            QtWidgets.QMessageBox.information(
+                self, "Stages",
+                "Assign at least one stage to an axis before connecting.")
+            return
+        # The mounting comes from stages.json, not from the table: which way a
+        # bracket runs is not something the axis dropdown can express, and
+        # building the stages without it would silently ignore a reversed axis
+        # and mirror every map taken from this window.
+        frames = ostage.load_axis_frames()
+        stages = ostage.StageSet(
+            {name: ostage.Stage(serial, name=name,
+                                invert=frames.get(name, {}).get("invert", False),
+                                origin_mm=frames.get(name, {}).get("origin_mm"))
+             for name, serial in mapping.items()})
+        self.btn_stage_connect.setEnabled(False)
+        self.log.log("stages: opening " + ", ".join(
+            f"{k}={v}" for k, v in mapping.items()))
+
+        def work(emit):
+            stages.open()
+            for st in stages:
+                emit(f"{st.name}: {st.model}, travel "
+                     f"{st.travel_mm[0]:g}..{st.travel_mm[1]:g} mm"
+                     + ("" if st.homed else ", NOT HOMED"))
+                if st.invert:
+                    emit(f"{st.name}: mounted REVERSED — rig zero is at the "
+                         f"far end of its travel, so homing parks it at "
+                         f"{st.travel_mm[1]:g} mm, not 0")
+                if st.calibration_file() is None:
+                    emit(f"{st.name}: no Thorlabs calibration file loaded — "
+                         f"on-axis accuracy is ~47 um rather than <5 um")
+
+        self._stage_pending = stages
+        self._stage_action("connect", work)
+
+    def on_stage_disconnect(self):
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, "Stages", "A field map is running. Abort it first.")
+            return
+        if self.stages is not None:
+            self.stages.close()
+            self.stages = None
+        self._set_stage_controls_enabled(False)
+        for r in range(self.stage_table.rowCount()):
+            self.stage_table.setItem(r, 3, QtWidgets.QTableWidgetItem("—"))
+            self.stage_table.setItem(r, 4, QtWidgets.QTableWidgetItem("closed"))
+        self.log.log("stages: closed")
+
+    def _stage_action(self, what, fn):
+        """Run one blocking stage command in a worker, one at a time."""
+        if self._stage_worker is not None and self._stage_worker.isRunning():
+            self.log.log("stages: busy — wait for the current move to finish")
+            return
+        self._stage_worker = StageWorker(what, fn)
+        self._stage_worker.progress.connect(self.log.log)
+        self._stage_worker.done.connect(self.on_stage_action_done)
+        self._stage_worker.start()
+
+    def on_stage_action_done(self, what, error):
+        if error:
+            self.log.log(f"stages: {what} failed — {error}")
+            if what == "connect":
+                self._stage_pending = None
+                self.btn_stage_connect.setEnabled(True)
+            QtWidgets.QMessageBox.warning(self, "Stages", error)
+            return
+        if what == "connect":
+            self.stages = self._stage_pending
+            self._stage_pending = None
+            self._set_stage_controls_enabled(True)
+            for ax, row in self.stage_rows.items():
+                have = ax in self.stages.names
+                for wdg in row["widgets"]:
+                    wdg.setEnabled(have)
+                if have:
+                    lo, hi = self.stages[ax].travel_mm
+                    row["target"].setRange(lo, hi)
+            for ax, row in self.scan_rows.items():
+                have = ax in self.stages.names
+                row["chk"].setEnabled(have)
+                if not have:
+                    row["chk"].setChecked(False)
+                for sp in row["spins"]:
+                    sp.setEnabled(have)
+            self.log.log("stages: connected")
+        else:
+            self.log.log(f"stages: {what} done")
+
+    def on_stage_jog(self, axis, delta):
+        if self.stages is None or axis not in self.stages.names:
+            return
+        st = self.stages[axis]
+        self._stage_action(f"jog {axis} {delta:+g} mm",
+                           lambda emit: st.move_by(delta))
+
+    def on_stage_goto(self, axis, mm):
+        if self.stages is None or axis not in self.stages.names:
+            return
+        st = self.stages[axis]
+        if not st.homed:
+            QtWidgets.QMessageBox.warning(
+                self, "Not homed",
+                f"Axis {axis} has not been homed, so its position counter is "
+                f"unreferenced and an absolute move would go somewhere "
+                f"arbitrary. Home it first, or use the jog buttons, which are "
+                f"relative and do not need a reference.")
+            return
+        self._stage_action(f"move {axis} to {mm:g} mm",
+                           lambda emit: st.move_to(mm))
+
+    def on_stage_home(self, axes):
+        if self.stages is None:
+            return
+        names = axes or self.stages.names
+        names = [n for n in names if n in self.stages.names]
+        if not names:
+            return
+        reply = QtWidgets.QMessageBox.warning(
+            self, "Home",
+            f"Homing drives {', '.join(names)} into the limit switch at full "
+            f"homing speed, across the whole travel.\n\n"
+            f"Is the probe head — and its cabling — clear of the entire range "
+            f"of movement?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel)
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            self.log.log("stages: homing cancelled")
+            return
+        stages = [self.stages[n] for n in names]
+
+        def work(emit):
+            for st in stages:
+                st.home(wait=False)
+            for st in stages:
+                st.wait(timeout_s=300.0, what="homing")
+                emit(f"{st.name}: homed, at {st.position_mm:.4f} mm")
+
+        self._stage_action(f"home {', '.join(names)}", work)
+
+    def on_stage_stop(self):
+        """Stop everything now, including a running scan.
+
+        Not routed through the worker queue: a stop that has to wait behind the
+        move it is trying to interrupt is not a stop button.
+        """
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.abort()
+            self.log.log("stages: field map will stop after this point")
+        if self.stages is None:
+            return
+        try:
+            self.stages.stop_all()
+            self.log.log("stages: stopped")
+        except ostage.StageError as exc:
+            self.log.log(f"stages: stop failed — {exc}")
+
+    def refresh_stage_table(self):
+        """Position and state per stage, off the DLL's own polling cache."""
+        if self.stages is None or not self.stage_table.rowCount():
+            return
+        by_serial = {st.serial: st for st in self.stages}
+        for r in range(self.stage_table.rowCount()):
+            item = self.stage_table.item(r, 0)
+            st = by_serial.get(item.text() if item else None)
+            if st is None or not st.is_open:
+                continue
+            try:
+                snap = st.snapshot()
+            except ostage.StageError:
+                continue
+            # Before opening, all the bus can say is "APT Stepper Motor
+            # Controller"; the actual model only arrives with the settings.
+            if snap["model"] and self.stage_table.item(r, 1).text() != snap["model"]:
+                self.stage_table.setItem(
+                    r, 1, QtWidgets.QTableWidgetItem(snap["model"]))
+            self.stage_table.setItem(
+                r, 3, QtWidgets.QTableWidgetItem(f"{snap['position_mm']:.4f} mm"))
+            state = "moving" if snap["moving"] else "idle"
+            if not snap["homed"]:
+                state += ", NOT HOMED"
+            if snap["error"]:
+                state += ", MOTION ERROR"
+            if snap["invert"]:
+                # Worth carrying in the always-visible row: the rig number and
+                # the number on the controller's own display disagree on a
+                # reversed axis, and that is alarming until you know why.
+                state += f"  [reversed, device {snap['position_dev_mm']:.3f}]"
+            self.stage_table.setItem(r, 4, QtWidgets.QTableWidgetItem(state))
+
+    # ---- field map -------------------------------------------------------
+    def _scan_grid(self):
+        axes = {}
+        for ax, row in self.scan_rows.items():
+            if not row["chk"].isChecked():
+                continue
+            start, stop, step = (sp.value() for sp in row["spins"])
+            if stop < start:
+                raise ValueError(
+                    f"{ax}: stop ({stop:g}) is before start ({start:g}). The "
+                    f"scan always runs in the +ve direction so that every "
+                    f"point is approached from the same side and backlash "
+                    f"cannot bias alternate rows.")
+            axes[ax] = oscan.parse_axis_spec(f"{start}:{stop}:{step}")
+        if not axes:
+            raise ValueError("tick at least one axis to scan")
+        return oscan.ScanGrid(axes)
+
+    def _update_scan_estimate(self):
+        try:
+            grid = self._scan_grid()
+        except ValueError as exc:
+            self.lbl_scan_est.setText(str(exc))
+            return
+        n = len(grid)
+        # Per point: the average itself, the settle, and the move. The move is
+        # a guess -- it depends on step size and velocity -- so this is a floor
+        # to plan around, not a promise.
+        per = self.spin_scan_s.value() + self.spin_scan_settle.value() + 2.0
+        total = n * per
+        self.lbl_scan_est.setText(
+            f"{n} points — {grid.describe()} — roughly "
+            f"{total / 60:.0f} min ({total / 3600:.1f} h) at {per:.1f} s/point")
+
+    def on_scan_start(self):
+        if self.stages is None:
+            return
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            return
+        try:
+            grid = self._scan_grid()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Field map", str(exc))
+            return
+        unhomed = [n for n in grid.names if not self.stages[n].homed]
+        if unhomed:
+            QtWidgets.QMessageBox.warning(
+                self, "Field map",
+                f"Axes {', '.join(unhomed)} have not been homed, so their "
+                f"position counters are unreferenced and the map would have no "
+                f"origin. Home them first.")
+            return
+
+        n = len(grid)
+        per = self.spin_scan_s.value() + self.spin_scan_settle.value() + 2.0
+        reply = QtWidgets.QMessageBox.question(
+            self, "Field map",
+            f"{n} points over {grid.describe()}.\n"
+            f"Roughly {n * per / 60:.0f} minutes.\n\n"
+            f"This takes the carriers off the live stream and puts them back "
+            f"on their own 200 kSPS clock for the duration — the live plot "
+            f"will stop.\n\nStart?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel)
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        if self.act_record.isChecked():
+            self.act_record.setChecked(False)
+        if isinstance(self.source, LiveSource):
+            self.source.stop()
+        self.source = None
+        self.lbl_state.setText("field map in progress...")
+        self.bar_scan.setRange(0, n)
+        self.bar_scan.setValue(0)
+        self.btn_scan_start.setEnabled(False)
+        self.btn_scan_abort.setEnabled(True)
+        self.act_snapshot.setEnabled(False)
+
+        self._scan_worker = ScanWorker(
+            self.hosts, self.stages, grid, self.spin_scan_s.value(),
+            self.cal, self.spin_scan_settle.value(), self.prev_clkdiv)
+        # As with the snapshot: the worker restores the clock itself, so
+        # clearing this now means a failed scan cannot leave a stale value
+        # for disconnect to apply on top.
+        self.prev_clkdiv = {}
+        self._scan_worker.message.connect(self.log.log)
+        self._scan_worker.progress.connect(self.on_scan_progress)
+        self._scan_worker.done.connect(self.on_scan_done)
+        self._scan_t0 = time.time()
+        self._scan_worker.start()
+
+    def on_scan_progress(self, i, n, where, sem_ut):
+        self.bar_scan.setValue(i)
+        elapsed = time.time() - self._scan_t0
+        eta = elapsed / max(i, 1) * (n - i)
+        self.bar_scan.setFormat(f"%v / %m — {eta / 60:.0f} min left")
+        self.lbl_state.setText(f"field map {i}/{n}: {where}")
+        if i == 1 or i % 10 == 0 or i == n:
+            self.log.log(f"  point {i}/{n} at {where}: noise {sem_ut:.3f} uT")
+
+    def on_scan_abort(self):
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.abort()
+            self.btn_scan_abort.setEnabled(False)
+            self.log.log("field map: stopping after the point in flight")
+
+    def on_scan_done(self, fm, error):
+        self.btn_scan_start.setEnabled(self.stages is not None)
+        self.btn_scan_abort.setEnabled(False)
+        self.act_snapshot.setEnabled(True)
+        self.bar_scan.setFormat("%v / %m")
+        self.lbl_state.setText("disconnected")
+        if error:
+            self.log.log(f"field map failed: {error}")
+            QtWidgets.QMessageBox.warning(self, "Field map", error)
+        if fm is None or not len(fm):
+            return
+        path = fm.save(os.path.join(
+            "captures", time.strftime("fieldmap_%Y%m%d_%H%M%S")))
+        sem = np.array([s.get("sem_ut", np.nan) for s in fm.stats])
+        self.log.log(
+            f"field map: {len(fm)} of {fm.meta['n_requested']} points, "
+            f"noise median {np.nanmedian(sem):.3f} uT / worst "
+            f"{np.nanmax(sem):.3f} uT -> {path}")
+        self.log.log("field map: the carriers are still off the live stream — "
+                     "press Connect to go back to the live view.")
 
     def _export_tab(self):
         w = QtWidgets.QWidget()
@@ -2475,8 +3169,41 @@ class MainWindow(QtWidgets.QMainWindow):
                   f"worst {self.lag.max_ms:.0f} ms -- {self.lag.verdict()}")
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.abort()
+            self._scan_worker.wait(30000)
+        self.stage_timer.stop()
+        if self.stages is not None:
+            # These are exclusive-open USB devices: leaving them held means the
+            # Kinesis application will not start until this process dies.
+            self.stages.close()
+            self.stages = None
         self.on_disconnect()
         super().closeEvent(ev)
+
+
+ICON_NAME = "octobee.ico"
+
+
+def _apply_app_icon(app):
+    """Put the probe-head icon on the window and the taskbar button.
+
+    The AppUserModelID is the non-obvious half. Without it Windows attributes
+    the window to pythonw.exe, so the taskbar shows the generic Python icon and
+    groups this with every other Python process -- leaving the desktop shortcut
+    as the only place the application looks like itself.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ICON_NAME)
+    if not os.path.exists(path):
+        return
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "harrer.octobee.hallprobe.1")
+        except Exception:                             # noqa: BLE001
+            pass                                      # cosmetic only
+    app.setWindowIcon(QtGui.QIcon(path))
 
 
 def main():
@@ -2503,6 +3230,7 @@ def main():
     a = p.parse_args()
 
     app = QtWidgets.QApplication(sys.argv)
+    _apply_app_icon(app)
     app.setApplicationName("OCTO-BEE Hall probe")
     win = MainWindow(a)
     win.show()

@@ -316,7 +316,12 @@ def report(boxes, ranges, do_plot, plot_path):
         flag = "" if act else "   (no response above noise)"
         print(f"{'S'+str(p['sensor']):>7} {p['pk'][0]:10.3f} {p['pk'][1]:10.3f} "
               f"{p['pk'][2]:10.3f} {m:10.3f}   {rel:>15}{flag}")
-    print(f"\nall values in mT, assuming the +/-{b_range_mt:g} mT range.")
+    # Ranges are per box, not global -- the boxes ran at different gains until
+    # the 2026-08-19 harmonisation, and could again. Name the ones in force
+    # rather than a variable that never existed.
+    print("\nall values in mT, assuming "
+          + ", ".join(f"{b['host']} +/-{b['range_mt']:g} mT" for b in boxes)
+          + ".")
     if active.sum() >= 2:
         spread = mags[active].max() / mags[active].min()
         print(f"responding sensors: {int(active.sum())}/16; "
@@ -381,6 +386,31 @@ def _plot(boxes, peaks, mags, path):
     print(f"\nwrote {path}")
 
 
+def _ranges_from_calibration(n_boxes):
+    """
+    One range per box, taken from calibration.json.
+
+    That file is per SENSOR, this report is per BOX, so a box whose eight chips
+    disagree cannot be summarised by one number -- say so rather than pick one.
+    """
+    try:
+        import octobee_calibration as ocal
+        cal = ocal.Calibration.load(ocal.CONFIG_NAME)
+    except (OSError, ValueError, TypeError, ImportError):
+        print("no readable calibration.json -- assuming +/-20 mT (gain 3000); "
+              "override with --range")
+        return [20.0] * n_boxes
+    out = []
+    for bi in range(n_boxes):
+        part = cal.ranges_mt[bi * ob.SENSORS_PER_BOX:(bi + 1) * ob.SENSORS_PER_BOX]
+        vals = sorted(set(float(v) for v in part))
+        if len(vals) != 1:
+            print(f"WARNING: box {bi} has chips on {vals} mT in calibration.json; "
+                  f"this report assumes {vals[0]:g} mT for all of them")
+        out.append(vals[0])
+    return out
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -394,14 +424,19 @@ def main():
                         "Give it once to apply to both boxes, or once per box in "
                         "--uut order -- the two carriers can be set to different "
                         "gains. Read the true value with onbox_sensor_audit.py. "
-                        "Default 40 (gain 1500).")
+                        "Default: whatever calibration.json records.")
     p.add_argument("--plot", action="store_true", help="also write a PNG")
     p.add_argument("--plot-path", default="octobee_cal.png")
     a = p.parse_args()
 
     hosts = tuple(a.uut) if a.uut else ob.DEFAULT_UUTS
     boxes = load_npz(a.load) if a.load else live(hosts, a.seconds)
-    rng = a.b_range or [40.0]
+    # Hard-coding 40 mT here was a landmine: the chips were harmonised to gain
+    # 3000 (+/-20 mT, 63 V/T) on 2026-08-19, so the old default silently scaled
+    # every field number in this report by 1.82x -- and a uniformly wrong report
+    # looks exactly like a correct one. calibration.json is where the codebase
+    # already records what the chips are set to, so read it.
+    rng = a.b_range or _ranges_from_calibration(len(boxes))
     if len(rng) == 1:
         rng = rng * len(boxes)
     if len(rng) != len(boxes):

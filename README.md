@@ -65,11 +65,14 @@ python octobee_cal.py --seconds 5       # health + calibration report
 
 ### Sample rate while streaming live
 
-Each carrier produces 19.2 MB/s at 200 kSPS but its stream path delivers only
-about 10–15 MB/s, so a sustained full-rate live stream cannot keep up. **This is
-not the Ethernet** — both carriers and this PC negotiate 1 Gbps full duplex, and
-reading `localhost:4210` on the carrier itself tops out at 15 MB/s. The limit is
-the carrier's streaming daemon and its dual-core ARM.
+**Both carriers sustain full 200 kSPS indefinitely.** Measured 2026-08-19:
+39.1 MB/s combined, **zero lost samples** over a 150 s run, with the pipeline lag
+flat at 2.6 s / 3.1 s — constant latency, not a growing backlog. The 1 Gbps link
+runs at about 31 % utilisation.
+
+An earlier version of this file claimed a 9.8 MB/s ceiling. That came from a
+5-second throughput test and was wrong: the stream **ramps over the first ~30 s**
+(16.5 → 18.9 MB/s), so short measurements badly understate the steady rate.
 `octobee_live.py` drops the ADC clock to 20 kSPS while it runs (`--fs`) and puts
 the original clock back on exit; measured broadband noise is unchanged, and a
 hand-passed magnet is a sub-Hz signal anyway.
@@ -516,25 +519,166 @@ different *inclinations* do.
 Both of these sit at the noise floor in the fit residual while being completely
 wrong, which is why the solver reports identifiability separately from residual.
 
+#### Survey the location first — this is not optional
+
+The method rests on one assumption: **all 16 sensors sit in the same field
+vector.** Earth's field satisfies it to nanotesla over a head this size. A room
+containing steel, monitors, speakers or a stray magnet does not, and when the
+assumption fails the solve does not fail loudly — it returns a fitted answer.
+
+A single static capture cannot detect this, because each sensor's own offset
+(0.1–0.6 mT here) is indistinguishable from the field it is sitting in. Two
+poses 180° apart can: the offset cancels exactly in the difference and what is
+left is offset-free.
+
+```
+bt_i = |pose1_i − pose2_i| / 2
+```
+
+Under a uniform field **every sensor must return the same number**, whatever its
+orientation, because a magnitude is rotation-invariant. The spread between them
+is the non-uniformity, measured rather than assumed. Two minutes:
+
+```bash
+python octobee_posecap.py --survey --seconds 10 --dead S16
+```
+
+| spread | verdict |
+|---|---|
+| ≤ 2 % | good — at or below the chips' own gain spread, so what is left to measure *is* the chips |
+| 2–5 % | usable, but that number becomes the floor on inter-sensor matching |
+| > 5 % | the sensors are not in the same field; their disagreement is the room, not them |
+
+An index short of 180° scales every sensor's `bt` by the same `sin(Δ/2)`, so it
+moves the median and leaves the spread alone — a sloppy survey index costs
+nothing.
+
+Measured on the bench 2026-08-20, the first location tried came back at
+**83–113 %**, with a median transverse field of 56–65 µT against the ~47 µT
+Earth alone would give. The four fitted roll angles were 0° / 95° / 187° / 272°,
+so the V-block indexing was fine; per-sensor fit residuals were 3–20 µT against
+a 0.14 µT per-pose noise floor, and the fitted response matrices came out up to
+37° from orthogonal. That is what a failed uniformity assumption looks like from
+the inside — not an error, just wrong numbers.
+
 #### The procedure: three sweeps
 
 Cradle the tube (grip the *tube*, not the arms) in something non-magnetic. A
-square tube indexes in 90° jumps in a V-block; print two round end-collars so it
-rolls **continuously** instead — a 60 s hand roll then gives ~10⁷ samples rather
-than four poses, and the fit goes from exactly-determined to hugely
-over-determined. Keep the cables strain-relieved so they rotate rigidly with the
-head: a flexing cable moves ferrous connector shells relative to the sensors and
-turns a constant hard-iron term into a varying one.
+square tube indexes in 90° jumps in a V-block, and **that is enough** — see
+"four poses beat a hand roll" below; you do not need round end-collars. Keep the
+cables strain-relieved so they rotate rigidly with the head: a flexing cable
+moves ferrous connector shells relative to the sensors and turns a constant
+hard-iron term into a varying one.
 
 | sweep | what you do | what it buys |
 |---|---|---|
 | **A** | as mounted, roll ≥2 turns | transverse response |
-| **B** | lift the tube out, turn it **end-for-end**, roll again | separates offset from axial response |
-| **C** | turn the **cradle to another azimuth**, roll again | pins transverse-vs-axial scale |
+| **B** | **reverse the tube axis** relative to the field, roll again | separates offset from axial response |
+| **C** | point the tube axis a **third** way, roll again | pins transverse-vs-axial scale |
+
+"Reverse the tube axis" does not mean you have to lift anything. The solve only
+ever sees `bz = B · (tube axis)` and `bt = |B − bz·axis|`, so **carrying the
+whole cradle round 180° on the bench is identical to lifting the tube out and
+putting it back end-for-end** — both send the axis from north to south and both
+give `bz: +19.10 → −19.10 µT`, `bt: 47.29 µT` unchanged. The transverse axes
+land differently, but the roll angle is a free parameter, so nothing downstream
+can tell the two apart. Turn the cradle; it is less disturbance and there is
+nothing to re-clamp.
 
 You do not need to know the roll angle, or roll evenly. All 16 sensors see the
 same field at every instant, so φ(t) is solved from the data alongside
 everything else.
+
+#### Which way to point the tube
+
+What the solver cares about is `α`, the angle between the field and the roll
+plane — i.e. how much field lies along the tube axis. The three sweeps want
+three different `α`. Here the local dip is ~68°, so a **horizontal** tube axis
+gets its `α` purely from its compass bearing:
+
+| tube axis, horizontal, bearing | α | axial | transverse |
+|---|---|---|---|
+| magnetic north (0°) | +22.0° | +19.1 µT | 47.3 µT |
+| 30° off north | +18.9° | +16.6 µT | 48.2 µT |
+| 45° off north | +15.4° | +13.5 µT | 49.2 µT |
+| magnetic east (90°) | 0° | 0 µT | 51.0 µT |
+| magnetic south (180°) | −22.0° | −19.1 µT | 47.3 µT |
+| *(vertical, for comparison)* | +68.0° | +47.3 µT | 19.1 µT |
+
+So the whole calibration can be done **without the tube ever leaving the
+horizontal**, which is what a V-block on a bench actually offers. Graded on
+synthetic truth, 4 poses × 20 s, 16 sensors:
+
+| bearings used | matching | offsets | axial col. | aniso gauge |
+|---|---|---|---|---|
+| N only (roll and nothing else) | 0.088 % | **6.0 µT** | **no** | **no** |
+| N, E | 0.061 % | **25.7 µT** | yes | yes |
+| N, S | 0.063 % | 0.046 µT | yes | **no** |
+| **N, S, E** | **0.041 %** | **0.041 µT** | yes | yes |
+| N, S, E, NE | 0.033 % | 0.118 µT | yes | yes |
+
+**N, S, E is the one to use.** It costs 0.005 % of matching against standing
+sweep C vertically (0.036 %) and needs no lifting, no tilting and no fixture.
+
+Two failure modes are worth knowing:
+
+- **Never pair two bearings 90° apart and stop there.** N + E leaves both
+  orientations with `bz ≥ 0`; the "flip" separated nothing and the offsets came
+  back 25.7 µT wrong. `solve_roll()` now catches this specific case (every
+  orientation on the same side of level) and says so, because the leverage
+  figure alone did not — it scored 0.18 there but 0.67 in the closely related
+  east–west case, which used to sail past the 0.6 threshold.
+- **Don't rotate the whole N/S/E pattern by 45°.** That maps it onto bearings
+  45/225/135, whose `|α|` are 15.4° three times over, and the anisotropy gauge
+  dies. Any other rotation is fine.
+
+**How well must you know north?** Not very. Rotating the whole pattern degrades
+the offsets from 0.041 µT at 0° error to 0.068 / 0.162 / 0.315 µT at 10 / 20 /
+30°, and matching does not move at all. A phone compass held a couple of metres
+from the probe is ample; keep it away from the head while you record.
+
+#### If a single bearing is all you can offer
+
+Rolling at one bearing and never moving the cradle is a legitimate calibration —
+it just buys less, and it is worth being precise about which parts you get:
+
+| quantity | single bearing, axis ≈ north | why |
+|---|---|---|
+| inter-sensor matching | **0.057 %** (25 realisations, 4 poses × 60 s) | roll invariance needs nothing else |
+| orientation about the tube axis | **0.03°** | ditto |
+| sensor offsets `b` | **1.7 µT** median, 3.3 µT worst | back-derived, see below |
+| chip X and Z response | measured | these are the transverse axes |
+| **chip Y response** | **not measured** — nominal geometry | +Y is the tube axis on all 16 |
+| transverse-vs-axial gauge | not measured, and common mode | harmless for matching |
+
+The offsets deserve care because the honest description cuts both ways. Roll
+leaves `M[:,2]·Bz` and `b` *exactly* degenerate, so `solve_roll()` fills the
+axial column from `probe_geometry.json` and back-derives `b` from what is left.
+The error in `b` is therefore (error in the nominal axial column) × 19 µT of
+axial field — **a systematic floor that more averaging does not touch**:
+measured 5.16 → 5.19 µT across dwells from 20 s to 120 s in one realisation.
+
+But the alternative is not a better offset, it is *no* offset. This probe's real
+offsets run 0.1–0.6 mT, and `calibration.json` currently carries zeros, so the
+single-bearing solve still improves them by a **median factor of 426×** (732 µT
+→ 1.7 µT). Apply it.
+
+`--anisotropy assume_isotropic` does nothing here — it adjusts the axial gauge,
+and the axial column already came from geometry — so don't bother passing it.
+
+A V-block offers four positions and no more, so the way to buy accuracy is dwell
+and repeats, not angles. Same four positions, total data is what counts:
+
+| | matching | offsets |
+|---|---|---|
+| 1 turn × 20 s = 80 s | 0.113 % | 0.99 µT |
+| 1 turn × 60 s = 240 s | 0.066 % | 0.99 µT |
+| 2 turns × 30 s = 240 s | 0.050 % | 0.99 µT |
+| 2 turns × 60 s = 480 s | **0.036 %** | 0.99 µT |
+
+`octobee_posecap.py --turns 2` walks you round twice, prompting for the same
+90° index each time; a revisited pose also shows you drift directly, since two
+rows that should be identical are sitting in the same file.
 
 In the GUI: *Calibration → 3. Earth-field roll calibration → Record sweep A / B /
 C → Solve → Apply*. Or offline:
@@ -550,6 +694,52 @@ python octobee_posecal.py captures/rollsweep_A.npz \
 [NOAA](https://ngdc.noaa.gov/geomag/calculators/magcalc.shtml) or BGS. It sets
 **absolute scale only** — matching, offsets and orientation are all solved
 without reference to it.
+
+#### Four indexed poses beat a continuous hand roll
+
+An earlier version of this file said to print end-collars so the tube rolls
+continuously, on the grounds that ~10⁷ samples over many angles beats four
+poses. That reasoning counted samples and ignored where they were taken:
+
+| method | samples | alias penalty | **effective noise** |
+|---|---|---|---|
+| 60 s hand roll off the live stream, 20 kSPS | 1.2 M | ×3.16 | **0.235 µT** |
+| 4 poses × 20 s offline capture, 200 kSPS | 16 M | ×1.00 | **0.020 µT** |
+
+An indexed pose is *stationary*, so you can average it for as long as you like
+at the full 200 kSPS, where the ADC does its own anti-aliasing (§7). A hand roll
+cannot: the head is always moving, and the live stream it is recorded from runs
+the clock down to 20 kSPS so the display keeps up. **The V-block wins by 11.5×.**
+
+Four is also the right number, not merely the number a square tube gives you.
+Opposite poses subtract to isolate each transverse column and add to cancel the
+roll, so 90° steps are the ideal minimum set. Graded against synthetic truth at
+20 s per pose with all three orientations, 4 poses match sensors to **0.038 %**
+against 0.039 % for 8 and 0.041 % for 12 — the total averaging time is what
+limits you, not the number of angles. More poses do sharpen the offsets
+(0.048 → 0.022 µT from 4 to 8), so add them if offsets are what you are after.
+
+**The 90° does not have to be accurate.** `solve_roll()` fits every pose's roll
+angle from the data, so ±2° of indexing error moves the answer in the fourth
+decimal place. What must be true is that the head is *rigid* between poses.
+
+Record a sweep pose-by-pose with:
+
+```bash
+python octobee_posecap.py --tag A --seconds 20      # as mounted
+python octobee_posecap.py --tag B --seconds 20      # tube end-for-end
+python octobee_posecap.py --tag C --seconds 20      # cradle at a new azimuth
+```
+
+It prompts between poses, refuses to start if a killed live session left the ADC
+clock down, stores the median of 64 sub-blocks per pose (so one person walking
+past cannot poison a pose without being seen), and finishes each sweep with a
+**closure** capture back at pose 1. That closure is the honest error bar on the
+whole session: under 1 µT is clean, 1–5 µT is your real floor rather than the
+noise figure, above 5 µT means something moved and the sweep should be redone.
+
+What it writes is an ordinary `RollSweep`, so `octobee_posecal.py` and the GUI's
+*Load sweeps* read it with no special handling.
 
 #### Read the identifiability lines, not just the residual
 
@@ -688,12 +878,20 @@ but it is not a resolution win and it is not a priority.
 | `probe_view3d.py` | PC | the 3D probe-head widget |
 | `octobee_calibration.py` | PC | counts → tesla, zero, gain trim, pose matrix, channel health |
 | `octobee_posecal.py` | PC | Earth-field roll calibration: solves per-sensor response, offsets and orientation from hand-rolled sweeps |
+| `octobee_posecap.py` | PC | records a roll sweep as indexed 90° poses, one full-rate capture each — 11.5× quieter than a hand roll |
 | `octobee_record.py` | PC | CSV / raw / report writers |
+| `octobee_stage.py` | PC | Thorlabs LTS300C control over the Kinesis C API — no Kinesis app, no pythonnet |
+| `octobee_scan.py` | PC | motorised field map: move, settle, average at full rate, repeat |
+| `octobee_launch.pyw` | PC | what the desktop icon runs: no console, but startup failures still reported |
+| `octobee.ico` | PC | application icon |
 | `selftest.py` | PC | end-to-end verification, offline or against the hardware |
 
 The command-line tools need only `numpy` and `matplotlib`. The GUI additionally
 needs `PyQt6`, `pyqtgraph` and `PyOpenGL` — `pip install -r requirements.txt`.
 Nothing else in either case: no HAPI install, no Phoebus, no EPICS.
+
+The stage tools need no Python package at all beyond `numpy` — they call the
+Kinesis C API through `ctypes`. They do need Kinesis *installed*, for the DLLs.
 
 ---
 
@@ -705,6 +903,37 @@ pip install -r requirements.txt
 python octobee_gui.py                       # the two carriers
 python octobee_gui.py --demo                # synthetic probe, no hardware
 python octobee_gui.py --replay captures/ambient_test.npz
+```
+
+### The desktop icon
+
+There is a shortcut, **OCTO-BEE Hall Probe**, on the desktop. It runs
+`octobee_launch.pyw` under `pythonw.exe`, so there is no console window.
+
+That wrapper exists because a `.pyw` with no console fails *silently*: a missing
+package, a moved checkout or a half-finished `pip` upgrade all look identical
+from the desktop, which is to say they look like the icon not working. So it
+catches whatever went wrong, writes `octobee_launch_error.log` next to itself,
+and reports it in a native message box — native rather than Qt, because if the
+thing that failed *was* PyQt6 then a Qt dialog is not available to say so.
+
+It also pins the working directory to the checkout. Shortcuts do not reliably
+set one, and `calibration.json`, `probe_geometry.json`, `stages.json` and
+`captures/` are all resolved relative to it: launched from the wrong place the
+GUI would come up on built-in defaults with nothing on screen to say it had.
+
+To recreate the shortcut, or point it at a checkout somewhere else:
+
+```powershell
+$repo = 'C:\Users\3DHall\hall_claude'
+$pw   = 'C:\Users\3DHall\AppData\Local\Python\bin\pythonw.exe'
+$lnk  = Join-Path ([Environment]::GetFolderPath('Desktop')) 'OCTO-BEE Hall Probe.lnk'
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+$s.TargetPath       = $pw
+$s.Arguments        = '"' + (Join-Path $repo 'octobee_launch.pyw') + '"'
+$s.WorkingDirectory = $repo
+$s.IconLocation     = (Join-Path $repo 'octobee.ico') + ',0'
+$s.Save()
 ```
 
 One window, built on the same `octobee.py` decode path as the CLI tools. The
@@ -1048,83 +1277,261 @@ reject common drift.
 
 ---
 
-## 8. Reducing the data rate
+## 8. Long continuous logging, and the data rate
 
-Three places to do it, with very different consequences.
+**You do not need to reduce anything.** Both carriers stream full 200 kSPS
+continuously, indefinitely, with zero sample loss. Long continuous measurement at
+full bandwidth and full resolution is exactly what this system does.
 
-### The rule that governs all of them
+### Measured, both boxes together
 
-The SENM3Dx analog low-pass is **fixed at 100 kHz** (`PWM_CTRL` bits 5:4 select
-100/150/200/220 kHz; every chip is already on the narrowest, 0). Nothing between
-the sensor and the ADC filters further. So sampling below 200 kSPS folds all the
-noise in 0–100 kHz into 0–fs/2, and noise density rises by `sqrt(100kHz/(fs/2))`:
+| test | duration | combined rate | gaps | lost |
+|---|---|---|---|---|
+| 100 kSPS | 90 s | 19.3 MB/s | 0 | 0 |
+| 150 kSPS | 60 s | 28.8 MB/s | 0 | 0 |
+| 200 kSPS | 180 s | 39.3 MB/s | 0 | 0 |
+| 200 kSPS + host decimation to disk | 150 s | 39.1 MB/s | 0 | 0 |
 
-| rate | stream | aliasing penalty | measured |
+In the 180 s run the lag held flat at 2.78 s (694) and 3.06 s (695) from the
+20 s mark onward. Flat lag means keeping up; a growing lag would mean the box's
+512 MB buffer pool was filling.
+
+### The shape to use for long logs
+
+Receive at 200 kSPS (the ADC does your anti-aliasing), decimate on the host,
+write the decimated stream. Measured over 150 s with both boxes:
+
+```
+200 kSPS in  ->  host boxcar average  ->  1 kHz float32 out
+   0 gaps, 0 lost, lag flat at 2.6 s / 3.1 s
+   453 MB/hour per box  =  10.9 GB/day per box, 21.7 GB/day for both
+```
+
+Output size scales with the rate you choose, and the noise improves as √decim:
+
+| output rate | per box | both boxes | noise floor |
 |---|---|---|---|
-| 200 kSPS | 19.2 MB/s | 1.00× (critically sampled) | baseline |
+| 1 kHz | 10.9 GB/day | 21.7 GB/day | ~4.9 µT |
+| 100 Hz | 1.1 GB/day | 2.2 GB/day | ~1.5 µT |
+| 10 Hz | 0.11 GB/day | 0.22 GB/day | ~0.7 µT |
+| 1 Hz | 0.011 GB/day | 0.022 GB/day | ~1 µT (drift floor, §7) |
+
+So a month of continuous 10 Hz logging from all 16 sensors is about 6.6 GB. The
+binding constraint is host disk, not the instrument.
+
+### If you *do* lower the clock, it costs you
+
+The SENM3Dx analog low-pass is fixed at 100 kHz (`PWM_CTRL` bits 5:4, already at
+its narrowest), so sampling below 200 kSPS folds 0–100 kHz into 0–fs/2 and noise
+density rises by `sqrt(100kHz/(fs/2))`:
+
+| rate | stream/box | penalty | measured |
+|---|---|---|---|
+| 200 kSPS | 19.2 MB/s | 1.00× | baseline |
 | 50 kSPS | 4.8 MB/s | 2.00× | — |
 | 20 kSPS | 1.9 MB/s | 3.16× | **3.1×** |
 
-**Averaging on the host after sampling at 200 kSPS is strictly better than
-sampling slower**, because the ADC does the anti-aliasing for you. Only drop the
-clock when stream bandwidth is genuinely the binding constraint.
-
-### 1. Clock divider — works, costs noise
+Note the penalty largely **washes out below ~1 Hz**, where offset drift dominates
+instead of white noise: at 1 Hz, 20 kSPS measured 0.75 µT against ~0.7 µT at full
+rate. So for very slow logging the aliasing barely matters — but there is no
+reason to accept it, since full rate streams fine.
 
 ```bash
-python octobee.py rate                    # report rate, load and aliasing cost
-python octobee.py rate --fs 50000         # set 50 kSPS on both boxes
+python octobee.py rate                    # report rate, load, aliasing cost
+python octobee.py rate --fs 50000         # set (rarely needed)
 python octobee.py restore                 # back to 200 kSPS
 ```
 
-On the carrier itself:
+On the carrier: `/usr/local/CARE/set-sample-rate.sh [hz]`. In the GUI, the
+**stream rate** dropdown now defaults to "leave the box alone".
+
+### The FPGA oversampling filter is still missing
+
+D-TACQ's `nacc` accumulate/decimate (manual §13.1) would decimate in the FPGA
+with no aliasing and √N less noise. It is inert here: `NACC:DISA` was `TRUE`, and
+with it `FALSE` and `nacc=8`/`nacc=32` set, the knob echoes `8,3,0,1`/`32,5,0,1`
+while the output rate stays 200 kSPS and the noise stays 63 µT. The FPGA is a
+custom `ACQ1001_TOP_09_74_32B-OCTOBEE` bitstream, so the block is probably not in
+this build. Worth asking D-TACQ for — but it is now a nice-to-have, not a
+blocker, since full-rate streaming works.
+
+### Onboard capture as an alternative
+
+`nbuffers=512 × bufferlen=1 MB` = **512 MB** of dedicated capture RAM, i.e. ~26 s
+gapless at 200 kSPS (96 B/sample) with no network involved. Useful for
+triggered bursts. Not needed for continuous work. Not yet wired into these tools.
+
+---
+
+## 9. The Thorlabs stages, and motorised field maps
+
+Verified against the hardware on 2026-08-20.
+
+### What is on the bench
+
+Three **LTS300C** long-travel stages, on USB as APT devices:
+
+| serial | axis | mounting | travel | device units |
+|---|---|---|---|---|
+| 45502844 | **x** | forward | 0–300 mm | 409 600 du/mm |
+| 45502854 | **z** | **reversed** | 0–300 mm | 409 600 du/mm |
+| 45538374 | **y** | forward | 0–300 mm | 409 600 du/mm |
+
+This is the standard map, recorded in `stages.json`.
+
+The stages report `stepsPerRev=200`, `gearBoxRatio=1.0`, `pitch=1.0 mm`, so one
+leadscrew revolution is exactly 1 mm and the controller counts 2048 microsteps
+per full step. **There is no linear scale on the carriage** — the position you
+read is where the controller counted itself to, not where the platform is.
+
+### z is mounted backwards, and that is handled
+
+The z stage is bolted on in reverse, so **its limit switch is at the top of the
+working volume**. Homing parks it at rig z = 300 mm, not 0. In cube terms, the
+position it homes to is the top-left corner; rig zero is the bottom-left one.
+
+Left uncorrected this is the nastiest class of bug in the whole system, because
+it does not fail — it produces a field map mirrored along one axis that looks
+completely reasonable and is wrong by the height of the volume.
+
+So the mounting is declared once, in `stages.json`, and everything public speaks
+**rig** millimetres:
+
+```json
+{"axes":  {"x": "45502844", "z": "45502854", "y": "45538374"},
+ "frame": {"z": {"invert": true}}}
+```
+
+    device = origin + sign × rig        sign = −1 when inverted
+    origin = the far end of travel when inverted, 0 when not
+
+so rig z=0 drives the stage to device 300, rig z=300 drives it to device 0, and
+150 is its own mirror image. Relative moves flip too, so jogging +z always goes
+up. `position_dev_mm` keeps the raw device number for when you need to reconcile
+against the controller's own display — on a reversed axis the two disagree, and
+that is alarming until you know why. The Stages tab shows both, and any field
+map records the frame per axis in its `.json` sidecar, so a map stays readable
+years later without this README.
+
+To change it — if a bracket gets remounted, or if the reversed axis turns out to
+be a different one:
 
 ```bash
-/usr/local/CARE/set-sample-rate.sh          # report
-/usr/local/CARE/set-sample-rate.sh 50000    # set
+python octobee_stage.py map --assign x=45502844 --assign z=45502854 \
+                           --assign y=45538374 --invert z
+python octobee_stage.py map ... --forward z          # clear it again
+python octobee_stage.py map ... --origin z=250       # rig zero on a fixture datum
 ```
 
-Both print the aliasing penalty so the trade is never silent. The GUI's
-**stream rate** dropdown does the same thing and now states the cost in each
-option label.
+Verify it by eye rather than trusting the file: jog +z in the GUI and check the
+probe goes **up**. That is a two-second check against an error that averaging,
+calibration and every noise figure in this README cannot touch.
 
-### 2. FPGA oversampling filter (`nacc`) — the right answer, but inert here
+### Two things that will waste your afternoon
 
-D-TACQ's documented accumulate/decimate filter (manual §13.1) would do this
-properly: decimate in the FPGA, no aliasing, √N less noise, data rate ÷N, zero
-CPU. It does not work on these boxes:
+**Only one process may hold the stages.** They are exclusive-open FTDI/APT
+devices. If the Kinesis application is running it owns all three, and the device
+list here comes back *empty* — which looks exactly like a cabling fault. Close
+Kinesis first. `octobee_stage.py list` says so explicitly rather than letting you
+chase it.
 
+**Nothing is homed at power-on,** and an unhomed stage still reports a position.
+That number is whatever was left in the counter. Absolute moves and scans refuse
+to run until the axis is homed; jogging is relative and does not need it.
+
+### Accuracy: repeatability is not accuracy
+
+| | |
+|---|---|
+| repeatability (returning to a point) | micrometres — excellent |
+| absolute accuracy, no calibration file | **~47 µm** |
+| absolute accuracy, with Thorlabs' per-serial calibration file | **<±5 µm** |
+
+**None of the three stages has a calibration file loaded** (checked via
+`ISC_GetCalibrationFile`, 2026-08-20). Thorlabs supply them free per serial
+number; they map that individual leadscrew's error and the controller applies it
+internally from then on. Install with `Stage.set_calibration_file()`.
+
+Whether 47 µm matters is a gradient question, not a preference. A position error
+*d* appears in the data as a field error |∇B|·*d*. Against a 1 mT/mm gradient,
+47 µm is 47 µT — 2000× the 0.02 µT noise floor `octobee_posecap.py` works so hard
+to reach. In a near-uniform field it is irrelevant. Do the arithmetic for the
+magnet you are actually mapping before deciding.
+
+### Why the scan stops at every point
+
+Same argument as the pose capture, applied to position instead of roll: the noise
+is white and falls as 1/√N, so a point you can sit on averages down in a way a
+moving one cannot. Stopping also means the stage's USB position readout is good
+enough — a reading with tens of milliseconds of latency is *exact* when the thing
+it describes is not moving.
+
+**Every row is traversed in the same direction.** A serpentine raster would save
+travel and is the wrong choice: reversing direction costs leadscrew backlash, so
+alternate rows would carry a fixed offset that looks exactly like real field
+structure with the periodicity of the raster.
+
+Set `--settle` from measurement, not hope. The controller reports "stopped" when
+its motion profile ends, which is not when a cantilevered probe stops ringing.
+`octobee_scan.py --settle-scan z` moves the axis and watches the field stop
+changing, which is the number your rig actually needs. A settle time that is too
+short does not look like an error — it looks like a gradient.
+
+### Would the spare rotary encoders help?
+
+They measure the **leadscrew**, which is the same shaft the controller already
+counts to a part in 400 000. So they add nothing to absolute accuracy — the 47 µm
+is *downstream* of the screw, in the nut's travel, and a rotary encoder on the
+screw is blind to it by construction. They are also blind to backlash, since on a
+reversal the screw turns and the carriage does not.
+
+What they do buy is the one thing nothing else can: the ACQ400 samples encoder
+words **in the data frame at the ADC clock**, so position and field become
+synchronous. That is required for measuring *while moving*, and useless
+otherwise. Carrier 695 already carries 3 encoder words per frame; 694 carries 1.
+
+If you wire them up: they are incremental, so they need a datum — home the stage
+and zero the counter at that instant. The index pulse will not do it on its own,
+because with a 1 mm pitch it fires **once per millimetre**, giving 300 identical
+marks over the travel. Derive counts/mm from CPR × 4 ÷ pitch rather than dividing
+a 300 mm move, which would fold the leadscrew error into the scale factor. Do
+compare encoder counts against the controller's microstep count over a long move
+as a *check*: both watch the same shaft, so any divergence is a slipped coupling
+or lost steps.
+
+Before committing to continuous scanning, measure what the **motors** do to the
+probe. Three energised steppers commutating a few tens of mm from a sensor you
+are reading to 20 nT is a rotating magnetic dipole with switching drive current,
+and that contamination is coherent with position — it will look like real field
+structure and no averaging removes it. Park the probe, run an axis at scan speed,
+and see. This is a stronger argument for stop-and-capture than the noise
+statistics are.
+
+### Usage
+
+```bash
+python octobee_stage.py list                     # what is on the bus
+python octobee_stage.py identify                 # wiggle each one to see which axis it is
+python octobee_stage.py map --assign x=45502844 --assign z=45502854 \
+                           --assign y=45538374 --invert z
+python octobee_stage.py status
+python octobee_stage.py home --axis x            # explicit; asks before moving
+python octobee_stage.py moveby --x 5             # relative, works unhomed
+python octobee_stage.py moveto --x 100 --y 50    # absolute, needs homing
+
+python octobee_scan.py --settle-scan z           # measure the real settle time
+python octobee_scan.py --x 0:100:5 --y 0:100:5 --seconds 5
 ```
-NACC:DISA was TRUE at site 0; setting it FALSE and then nacc=8 / nacc=32
-reads back 8,3,0,1 / 32,5,0,1 -- but the output rate stays 200 kSPS
-(uSec counter still +5 per sample) and the noise stays at 63 uT rms.
-```
 
-The FPGA is a **custom OCTO-BEE bitstream**, `ACQ1001_TOP_09_74_32B-OCTOBEE`,
-so the oversampling block is most likely simply not in this build. **Worth asking
-D-TACQ to include it** — it is the clean fix and it is their own feature.
+The axis map and the mounting live in `stages.json`. Nothing guesses either: a
+wrong guess produces a silently transposed or mirrored coordinate frame, and
+such a field map looks entirely plausible.
 
-### 3. Decimate on the carrier before the network
-
-The carrier runs numpy 1.18.2 on a dual-core ARMv7. Benchmarked reading its own
-`localhost:4210` and boxcar-averaging by 32:
-
-```
-naive (float mean, bytearray del)   13.4 MB/s in,  39% CPU
-tuned (recv_into, int32 sum)        15.0 MB/s in,  25% CPU
-```
-
-15.0 of the 19.2 MB/s produced, so it still falls ~20 % short at full rate — the
-remaining bottleneck is the loopback socket, not numpy. Viable if paired with a
-small clock trim (150 kSPS costs only 1.15× in noise), or by reading D-TACQ's
-raw buffer devices instead of the TCP loopback. Not implemented here; noted
-because it is the best option that needs no firmware change.
-
-### What to actually do
-
-- **Short captures:** stay at 200 kSPS. The box buffers and delivers every
-  sample — a 3 s capture from both boxes came back with zero lost samples.
-- **Live viewing:** the GUI/`octobee_live.py` default of 20 kSPS is fine. You are
-  watching a hand-passed magnet; 3.2× on a noise floor of ~1 µT does not matter.
-- **Quantitative work:** 200 kSPS, then average to the bandwidth you need (§7).
-- **Long continuous logging:** ask D-TACQ about `nacc` in the OCTO-BEE build.
+In the GUI, all of this is the **Stages** tab — find, assign, home, jog, and run
+a field map with a progress bar and an abort. A scan takes the carriers off the
+live stream and puts them back on their own 200 kSPS clock for the duration, so
+the live plot stops; press Connect afterwards to get it back. Output is
+`captures/fieldmap_<time>.npz` plus a `.json` sidecar, holding both the commanded
+and the reached position for every point — when those disagree, something
+stalled, and having both is the difference between noticing and quietly folding a
+bad point into the map.

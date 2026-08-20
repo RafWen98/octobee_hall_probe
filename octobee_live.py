@@ -15,17 +15,20 @@ port 4210 on both boxes and draws all 16 sensors at once.
 
 Sample rate
 -----------
-The boxes free-run at 200 kSPS = 19.2 MB/s each, but the Ethernet link to this
-PC tops out near 9.8 MB/s (measured), so a *sustained* 200 kSPS live stream
-cannot keep up -- latency grows until the box's buffers overrun. A magnet passed
-by hand is a sub-Hz signal, so by default this tool drops the ACQ423 clock to
-20 kSPS (clkdiv 1000) while it runs, which streams at 1.9 MB/s per box with zero
-sample loss, and restores the original clock when you quit. Measured broadband
-noise is unchanged by the change.
+Leave it at 200 kSPS. Measured 2026-08-19: both carriers stream full rate
+simultaneously and indefinitely with ZERO lost samples -- 39.1 MB/s combined over
+the 1 Gbps link, pipeline lag flat at 2.6 s / 3.1 s over a 150 s run (constant
+latency, not a growing backlog).
 
-Short offline captures (octobee.py capture) are unaffected: the box buffers and
-delivers every sample, just slower than real time, so full-rate 200 kSPS
-captures of a few seconds come back complete.
+An earlier version of this tool dropped the clock to 20 kSPS by default, on the
+strength of a 5-second throughput test that read 9.8 MB/s. That test was simply
+too short: the stream ramps over the first ~30 s (16.5 -> 18.9 MB/s), so brief
+measurements badly understate the steady-state rate.
+
+Lowering the clock is now opt-in via --fs, and it is a real cost: the sensor's
+analog low-pass is fixed at 100 kHz, so any rate below 200 kSPS aliases and the
+noise density rises by sqrt(100kHz/(fs/2)) -- 2.0x at 50 kSPS, 3.2x at 20 kSPS.
+Only do it if your host cannot keep up with rendering.
 
 Geometry note
 -------------
@@ -183,9 +186,10 @@ def main():
     p.add_argument("--window", type=float, default=10.0, help="seconds shown")
     p.add_argument("--decim", type=int, default=0,
                    help="extra host-side block averaging (0 = auto for ~2 kHz)")
-    p.add_argument("--fs", type=float, default=20000.0,
-                   help="ADC sample rate to run at while plotting, Hz "
-                        "(default 20000; 0 = leave the box's clock alone). "
+    p.add_argument("--fs", type=float, default=0.0,
+                   help="ADC sample rate to run at while plotting, Hz. "
+                        "Default 0 = leave the box alone (200 kSPS streams fine). "
+                        "Lowering it aliases: 2.0x noise at 50k, 3.2x at 20k. "
                         "The original clock is restored on exit.")
     p.add_argument("--raw", action="store_true",
                    help="plot raw counts without subtracting each sensor's VCM")
