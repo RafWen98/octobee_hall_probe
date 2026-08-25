@@ -25,3 +25,9 @@ octobee_crash.log
 
 # pytest
 .pytest_cache/
+
+# PowerShell redirect accidents. "2>$null" is correct in PowerShell, but
+# escaped or quoted wrongly it creates a file with that literal name --
+# and NUL is the same trap. Neither is ever a file this project wants.
+$null
+NUL
