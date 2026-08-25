@@ -32,6 +32,7 @@ from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.gui import window as gui
+from octobee.gui.crash import CrashHandler
 from octobee.calib import roll as opc
 from octobee.calib import poses as opcap
 from octobee.calib import poses as pcap
@@ -2542,10 +2543,11 @@ _CRASH_PROBE = """
 import faulthandler, os, sys
 from PyQt6 import QtCore, QtWidgets
 from octobee.gui import window as gui
+from octobee.gui.crash import CrashHandler
 
 app = QtWidgets.QApplication([])
 if {install!r}:
-    handler = gui.CrashHandler(path={log!r}).install()
+    handler = CrashHandler(path={log!r}).install()
     faulthandler.enable(file=open({log!r}, "a", buffering=1, encoding="utf-8"))
 
 def boom():
@@ -2637,7 +2639,7 @@ def test_crash_handler(workdir):
     # program is ever in; with none, the handler logs and shows nothing rather
     # than parenting a box to nowhere.
     parent = QtWidgets.QMainWindow()
-    handler = gui.CrashHandler(path=os.path.join(workdir, "twice.log"),
+    handler = CrashHandler(path=os.path.join(workdir, "twice.log"),
                                window=parent)
     boxes = []
     t0 = time.time()

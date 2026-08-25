@@ -56,7 +56,7 @@ def report(title, body):
 
 def main():
     try:
-        from octobee.gui import window
+        from octobee.gui import app
     except Exception:
         tb = traceback.format_exc()
         try:
@@ -73,7 +73,7 @@ def main():
         return 1
 
     try:
-        window.main()
+        app.main()
     except SystemExit:
         raise
     except Exception:
