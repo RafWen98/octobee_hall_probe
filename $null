@@ -1,0 +1,52 @@
+﻿python : QFontDatabase: Cannot find font directory C:/Users/3DHall/AppData/Local/Python/pythoncore-3.14-64/Lib/site-packages/PyQt6/Qt6/lib/fonts.
+At line:3 char:1
++ python -c @"
++ ~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (QFontDatabase: .../Qt6/lib/fonts.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QOpenGLWidget is not supported on this platform.
+QOpenGLWidget is not supported on this platform.
+This plugin does not support propagateSizeHints()
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support propagateSizeHints()
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
+This plugin does not support createPlatformOpenGLContext!
+QOpenGLWidget: Failed to create context
