@@ -28,19 +28,19 @@ import time
 import numpy as np
 from PyQt6 import QtCore, QtWidgets
 
-import octobee as ob
-import octobee_calibration as ocal
-import octobee_gui as gui
-import octobee_posecal as opc
-import octobee_posecap as opcap
-import octobee_posecap as pcap
-import octobee_record as orec
-import octobee_scan as oscan
-import octobee_stage as ostage
-import octobee_help as ohelp
-import octobee_machine as omach
-import octobee_magcal as omag
-import probe_geometry as pgeom
+from octobee.acq import carrier as ob
+from octobee.calib import convert as ocal
+from octobee.gui import window as gui
+from octobee.calib import roll as opc
+from octobee.calib import poses as opcap
+from octobee.calib import poses as pcap
+from octobee import record as orec
+from octobee.motion import scan as oscan
+from octobee.motion import stage as ostage
+from octobee import help as ohelp
+from octobee import machine as omach
+from octobee.calib import magnet as omag
+from octobee.calib import geometry as pgeom
 import itertools
 
 FAILS = []
@@ -2538,9 +2538,8 @@ def test_health():
 # process dies, and proving that in-process would take the test runner with it.
 _CRASH_PROBE = """
 import faulthandler, os, sys
-sys.path.insert(0, {repo!r})
 from PyQt6 import QtCore, QtWidgets
-import octobee_gui as gui
+from octobee.gui import window as gui
 
 app = QtWidgets.QApplication([])
 if {install!r}:
@@ -2575,11 +2574,10 @@ def test_crash_handler(workdir):
     faulthandler is what turns that into a stack trace.
     """
     print("\ncrash handler")
-    repo = os.path.dirname(os.path.abspath(__file__))
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
 
     def run(install, log, native=False):
-        src = _CRASH_PROBE.format(repo=repo, install=install, log=log,
+        src = _CRASH_PROBE.format(install=install, log=log,
                                   native=native)
         # check=False on purpose: a non-zero exit IS one of the results.
         return subprocess.run([sys.executable, "-c", src], env=env, check=False,

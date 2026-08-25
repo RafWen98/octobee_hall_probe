@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-machine_view3d.py -- the probe drawn where it actually is, inside the coils.
+octobee/gui/widgets/machine3d.py -- the probe drawn where it actually is, inside the coils.
 
 The probe view next to the live plot answers "which chip is reading what". This
 one answers the other question, the one that decides whether a field map means
@@ -28,9 +28,9 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PyQt6 import QtGui
 
-import octobee_machine as omach
-import octobee_profile as oprof
-import probe_geometry as pgeom
+from octobee import machine as omach
+from octobee import profile as oprof
+from octobee.calib import geometry as pgeom
 
 COIL_ON_COLOR = (0.95, 0.62, 0.18, 1.0)
 COIL_OFF_COLOR = (0.58, 0.63, 0.72, 1.0)

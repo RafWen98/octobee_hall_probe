@@ -44,19 +44,19 @@ so kit 1 → ch 1–4, kit 2 → ch 5–8, … kit 8 → ch 29–32, on each box
 field number is quoted. The 16 chips' VCMs differ by up to ~90 mV.
 
 This map comes from the OCTO-BEE guide §3.7. It is documentation, not
-measurement — confirm it on your hardware with `octobee_idmap.py` (§4).
+measurement — confirm it on your hardware with `octobee/acq/idmap.py` (§4).
 
 ---
 
 ## 2. Quick start
 
 ```bash
-python octobee.py info                  # live config + channel map, both boxes
-python octobee_live.py                  # LIVE PLOT, all 16 sensors, one window
-python octobee_cal.py --seconds 5       # health + calibration report
+python octobee/acq/carrier.py info                  # live config + channel map, both boxes
+python octobee/live.py                  # LIVE PLOT, all 16 sensors, one window
+python octobee/report.py --seconds 5       # health + calibration report
 ```
 
-`octobee_live.py` modes:
+`octobee/live.py` modes:
 
 | flag | view |
 |---|---|
@@ -76,7 +76,7 @@ runs at about 31 % utilisation.
 An earlier version of this file claimed a 9.8 MB/s ceiling. That came from a
 5-second throughput test and was wrong: the stream **ramps over the first ~30 s**
 (16.5 → 18.9 MB/s), so short measurements badly understate the steady rate.
-`octobee_live.py` drops the ADC clock to 20 kSPS while it runs (`--fs`) and puts
+`octobee/live.py` drops the ADC clock to 20 kSPS while it runs (`--fs`) and puts
 the original clock back on exit; measured broadband noise is unchanged, and a
 hand-passed magnet is a sub-Hz signal anyway.
 
@@ -88,8 +88,8 @@ If a live session is killed rather than closed, the reduced clock is left in
 place. Undo it with:
 
 ```bash
-python octobee.py restore        # puts both boxes back to 200 kSPS
-python octobee.py info           # confirm
+python octobee/acq/carrier.py restore        # puts both boxes back to 200 kSPS
+python octobee/acq/carrier.py info           # confirm
 ```
 
 ### Phoebus interaction
@@ -160,7 +160,7 @@ case where it was decisive: with 695's sensor power disconnected it read
 **The 1.9× gain split between the boxes is history.** It was real, it was a
 register difference rather than cabling, and it is what motivated the
 harmonisation below -- all 16 chips have run gain 3000 since 2026-08-19. The
-`noise(field) / noise(VCM)` check in `octobee_cal.py` is still the right tool if
+`noise(field) / noise(VCM)` check in `octobee/report.py` is still the right tool if
 the two halves ever diverge again.
 
 ### Telling a bad chip from a bad cable, without unplugging anything
@@ -230,7 +230,7 @@ two back-to-back identical captures. Do not chase small changes.
 
 > **Probe state, 2026-08-21:** 695 ports 3 and 7 are still **swapped** from the
 > diagnostic above, so the software's sensor index does not match physical tube
-> position. Every `probe_geometry.py` rotation, zero and calibration keyed by
+> position. Every `octobee/calib/geometry.py` rotation, zero and calibration keyed by
 > index is wrong until they are exchanged back. Swap them back before taking any
 > calibration or field data.
 
@@ -331,7 +331,7 @@ by applying it from `rc.user` at boot (OCTO-BEE guide Appendix B.4.2).
 Until they are harmonised, tell the analysis the truth per box:
 
 ```bash
-python octobee_cal.py --range 40 --range 20      # 694 then 695, in --uut order
+python octobee/report.py --range 40 --range 20      # 694 then 695, in --uut order
 ```
 
 ### Gain: all 16 now at 3000 (±20 mT), permanently — 2026-08-19
@@ -454,7 +454,7 @@ The cabling work is **done**: S16 is repaired and every VCM now reads between
 0.5 and 2.2 counts (section 3). What remains is five chip-level faults that no
 amount of reseating will fix, so this step is now a check rather than a job.
 
-Re-run `python octobee_cal.py --seconds 5` and confirm every sensor still shows
+Re-run `python octobee/report.py --seconds 5` and confirm every sensor still shows
 VCM noise below ~2 counts. If one has crept up, that is a cabling fault and
 calibrating over it bakes it into your coefficients. If instead a *field*
 channel is noisy while its own VCM is clean, that is a chip fault -- see
@@ -527,7 +527,7 @@ writing the same values to EEPROM and calling `activate_EEPROM_config()`.
 # terminal 1
 ssh root@acq1001_694 'python3 /tmp/sensor_audit.py --id-sweep 4'
 # terminal 2, started right after
-python octobee_idmap.py --uut acq1001_694 --seconds 70
+python octobee/acq/idmap.py --uut acq1001_694 --seconds 70
 ```
 
 The sweep mutes each sensor's Bx/By/Bz in turn over SPI; the host tool reports
@@ -539,7 +539,7 @@ map. No clock sync needed — only the order matters. Repeat for `_695`.
 SPI position ≠ position on the tube. Pass a magnet slowly along one face:
 
 ```bash
-python octobee_idmap.py --uut acq1001_694 --seconds 60 --magnet
+python octobee/acq/idmap.py --uut acq1001_694 --seconds 60 --magnet
 ```
 
 It ranks the sensor groups by when they peaked, which is the physical order.
@@ -550,8 +550,8 @@ Record the result as a table: *tube face × position → sensor → channels*.
 Capture with no magnet nearby and the probe away from anything ferrous:
 
 ```bash
-python octobee.py capture --seconds 10 -o zero_field.npz
-python octobee_cal.py --load zero_field.npz
+python octobee/acq/carrier.py capture --seconds 10 -o zero_field.npz
+python octobee/report.py --load zero_field.npz
 ```
 
 The `off Bz/By/Bx` columns are each axis' residual offset after VCM subtraction.
@@ -572,7 +572,7 @@ sensor in turn, normal to that sensor's face, at a fixed distance — use a
 machined spacer or jig so the geometry repeats to well under a millimetre.
 
 ```bash
-python octobee_cal.py --seconds 20 --range 20 --plot
+python octobee/report.py --seconds 20 --range 20 --plot
 ```
 
 The report gives each sensor's peak `|B|` and its ratio to the median. Those
@@ -792,7 +792,7 @@ orientation, because a magnitude is rotation-invariant. The spread between them
 is the non-uniformity, measured rather than assumed. Two minutes:
 
 ```bash
-python octobee_posecap.py --survey --seconds 10 --dead S16
+python octobee/calib/poses.py --survey --seconds 10 --dead S16
 ```
 
 | spread | verdict |
@@ -928,7 +928,7 @@ and repeats, not angles. Same four positions, total data is what counts:
 | 2 turns × 30 s = 240 s | 0.050 % | 0.99 µT |
 | 2 turns × 60 s = 480 s | **0.036 %** | 0.99 µT |
 
-`octobee_posecap.py --turns 2` walks you round twice, prompting for the same
+`octobee/calib/poses.py --turns 2` walks you round twice, prompting for the same
 90° index each time; a revisited pose also shows you drift directly, since two
 rows that should be identical are sitting in the same file.
 
@@ -937,7 +937,7 @@ In the GUI: tick *Calibration → show the superseded manual routines*, then
 Apply*. Or offline:
 
 ```bash
-python octobee_posecal.py captures/rollsweep_A.npz \
+python octobee/calib/roll.py captures/rollsweep_A.npz \
                           captures/rollsweep_B.npz \
                           captures/rollsweep_C.npz \
     --b-earth-ut 48.7 --dead S16 --apply calibration.json
@@ -979,9 +979,9 @@ decimal place. What must be true is that the head is *rigid* between poses.
 Record a sweep pose-by-pose with:
 
 ```bash
-python octobee_posecap.py --tag A --seconds 20      # as mounted
-python octobee_posecap.py --tag B --seconds 20      # tube end-for-end
-python octobee_posecap.py --tag C --seconds 20      # cradle at a new azimuth
+python octobee/calib/poses.py --tag A --seconds 20      # as mounted
+python octobee/calib/poses.py --tag B --seconds 20      # tube end-for-end
+python octobee/calib/poses.py --tag C --seconds 20      # cradle at a new azimuth
 ```
 
 It prompts between poses, refuses to start if a killed live session left the ADC
@@ -991,7 +991,7 @@ past cannot poison a pose without being seen), and finishes each sweep with a
 whole session: under 1 µT is clean, 1–5 µT is your real floor rather than the
 noise figure, above 5 µT means something moved and the sweep should be redone.
 
-What it writes is an ordinary `RollSweep`, so `octobee_posecal.py` and the GUI's
+What it writes is an ordinary `RollSweep`, so `octobee/calib/roll.py` and the GUI's
 *Load sweeps* read it with no special handling.
 
 #### Read the identifiability lines, not just the residual
@@ -1022,7 +1022,7 @@ solver flags this as weak offset leverage.
   `identify_faces()` clusters them and checks the result against
   `probe_geometry.json`, which currently records that mapping as an assumption.
   It cannot recover *slot* (position along the tube) — every slot on a face
-  shares the same rotation — so keep using `octobee_idmap.py --magnet` for that.
+  shares the same rotation — so keep using `octobee/acq/idmap.py --magnet` for that.
   The mapping is also only recovered up to a global rotation of all four faces at
   once, which no amount of Earth's field can pin down.
 - **A site survey.** Once the sensors are calibrated, the residual of "all 16 must
@@ -1129,26 +1129,26 @@ but it is not a resolution win and it is not a priority.
 
 | file | runs on | purpose |
 |---|---|---|
-| `octobee.py` | PC | core library: UUT knobs, frame decode, capture. `info` / `capture` / `restore` CLI |
-| `octobee_live.py` | PC | live plot of all 16 sensors, both boxes, one window |
-| `octobee_cal.py` | PC | health + calibration report, optional PNG |
-| `octobee_idmap.py` | PC | proves the channel↔sensor map (SPI sweep or magnet pass) |
+| `octobee/acq/carrier.py` | PC | core library: UUT knobs, frame decode, capture. `info` / `capture` / `restore` CLI |
+| `octobee/live.py` | PC | live plot of all 16 sensors, both boxes, one window |
+| `octobee/report.py` | PC | health + calibration report, optional PNG |
+| `octobee/acq/idmap.py` | PC | proves the channel↔sensor map (SPI sweep or magnet pass) |
 | `onbox/sensor_audit.py` | **carrier** | SPI register audit of all 8 chips; `--id-sweep`, `--set-gain` |
 | `onbox/gain_config.py` | **carrier** | reads/sets the amplifier gain **permanently** in EEPROM, with a backup and a restore path — see §3 |
 | `onbox/set_sample_rate.sh` | **carrier** | report or set the ADC rate, with the aliasing cost stated |
 | `onbox/fix_carrier_keys.sh` | **carrier** | repair `authorized_keys` and install the workstation key |
-| `octobee_gui.py` | PC | the application: live view, 3D probe head, calibration, exports |
-| `probe_geometry.py` | PC | chip positions and per-chip rotation matrices on the tube |
-| `probe_view3d.py` | PC | the 3D probe-head widget |
-| `octobee_calibration.py` | PC | counts → tesla, zero, gain trim, pose matrix, channel health |
-| `octobee_posecal.py` | PC | Earth-field roll calibration: solves per-sensor response, offsets and orientation from hand-rolled sweeps |
-| `octobee_posecap.py` | PC | records a roll sweep as indexed 90° poses, one full-rate capture each — 11.5× quieter than a hand roll |
-| `octobee_record.py` | PC | CSV / raw / report writers |
-| `octobee_stage.py` | PC | Thorlabs LTS300C control over the Kinesis C API — no Kinesis app, no pythonnet |
-| `octobee_scan.py` | PC | motorised field map: move, settle, average at full rate, repeat |
-| `octobee_machine.py` | PC | reads a simsopt coil set, sweeps it into a keep-out volume, and places the probe in it |
-| `machine_view3d.py` | PC | the 3D machine widget: coils, stage envelope, and the probe among them |
-| `octobee_profile.py` | PC | span timing, event-loop lag and GL renderer detection behind `--profile` |
+| `octobee/gui/window.py` | PC | the application: live view, 3D probe head, calibration, exports |
+| `octobee/calib/geometry.py` | PC | chip positions and per-chip rotation matrices on the tube |
+| `octobee/gui/widgets/probe3d.py` | PC | the 3D probe-head widget |
+| `octobee/calib/convert.py` | PC | counts → tesla, zero, gain trim, pose matrix, channel health |
+| `octobee/calib/roll.py` | PC | Earth-field roll calibration: solves per-sensor response, offsets and orientation from hand-rolled sweeps |
+| `octobee/calib/poses.py` | PC | records a roll sweep as indexed 90° poses, one full-rate capture each — 11.5× quieter than a hand roll |
+| `octobee/record.py` | PC | CSV / raw / report writers |
+| `octobee/motion/stage.py` | PC | Thorlabs LTS300C control over the Kinesis C API — no Kinesis app, no pythonnet |
+| `octobee/motion/scan.py` | PC | motorised field map: move, settle, average at full rate, repeat |
+| `octobee/machine.py` | PC | reads a simsopt coil set, sweeps it into a keep-out volume, and places the probe in it |
+| `octobee/gui/widgets/machine3d.py` | PC | the 3D machine widget: coils, stage envelope, and the probe among them |
+| `octobee/profile.py` | PC | span timing, event-loop lag and GL renderer detection behind `--profile` |
 | `octobee_launch.pyw` | PC | what the desktop icon runs: no console, but startup failures still reported in a native dialog |
 | `octobee.ico` | PC | application icon |
 | `selftest.py` | PC | end-to-end verification, offline or against the hardware. 454 checks; the quality gate |
@@ -1169,9 +1169,9 @@ Kinesis C API through `ctypes`. They do need Kinesis *installed*, for the DLLs.
 ```bash
 pip install -r requirements.txt
 
-python octobee_gui.py                       # the two carriers
-python octobee_gui.py --demo                # synthetic probe, no hardware
-python octobee_gui.py --replay captures/ambient_test.npz
+python octobee/gui/window.py                       # the two carriers
+python octobee/gui/window.py --demo                # synthetic probe, no hardware
+python octobee/gui/window.py --replay captures/ambient_test.npz
 ```
 
 ### It connects itself when it opens
@@ -1257,7 +1257,7 @@ $s.IconLocation     = (Join-Path $repo 'octobee.ico') + ',0'
 $s.Save()
 ```
 
-One window, built on the same `octobee.py` decode path as the CLI tools. The
+One window, built on the same `octobee/acq/carrier.py` decode path as the CLI tools. The
 left half carries the work — live traces, the per-sensor table, calibration,
 diagnostics, exports — and the right half always shows the probe head in 3D
 with a peak-|B| bar chart underneath, so the state of all 16 sensors is visible
@@ -1275,7 +1275,7 @@ healthy.*
 
 The chips point in 16 different directions, so a stack of 48 traces cannot show
 you where a field actually is. The 3D view rotates each chip's vector into the
-common tube frame with the matrices from `probe_geometry.py` and draws it where
+common tube frame with the matrices from `octobee/calib/geometry.py` and draws it where
 that chip physically sits. A magnet passing the probe then reads directly: which
 face it went past, in which direction the field pointed, and — because every
 arrow shares one scale — which sensors answered more strongly than their
@@ -1289,7 +1289,7 @@ The model is drawn the way the probe is mounted rather than the way the maths
 writes it: the tube lies horizontally along the rig's **Y** with the tip end
 (S4, S8, S12, S16) pointing forward and **Z** up, so an arrow on screen points
 the way the field points on the bench. Only the drawing moves. `MOUNT_ROT` in
-`probe_geometry.py` is applied at the last moment before each mesh and arrow
+`octobee/calib/geometry.py` is applied at the last moment before each mesh and arrow
 goes to the GPU, so the tube frame that every calibration, pose solve and export
 is written in is untouched — remount the probe and it is one matrix to change,
 with nothing to recalibrate.
@@ -1488,7 +1488,7 @@ carries. Turning the tube in its cradle renames all four, so the run checks the
 ### When it feels slow: `--profile`
 
 ```bash
-python octobee_gui.py --profile
+python octobee/gui/window.py --profile
 ```
 
 Adds a **Profile** tab that times every stage separately and keeps a rolling
@@ -1722,9 +1722,9 @@ rate. So for very slow logging the aliasing barely matters — but there is no
 reason to accept it, since full rate streams fine.
 
 ```bash
-python octobee.py rate                    # report rate, load, aliasing cost
-python octobee.py rate --fs 50000         # set (rarely needed)
-python octobee.py restore                 # back to 200 kSPS
+python octobee/acq/carrier.py rate                    # report rate, load, aliasing cost
+python octobee/acq/carrier.py rate --fs 50000         # set (rarely needed)
+python octobee/acq/carrier.py restore                 # back to 200 kSPS
 ```
 
 On the carrier: `/usr/local/CARE/set-sample-rate.sh [hz]`. In the GUI, the
@@ -1802,10 +1802,10 @@ To change it — if a bracket gets remounted, or if the reversed axis turns out 
 be a different one:
 
 ```bash
-python octobee_stage.py map --assign x=45502844 --assign z=45502854 \
+python octobee/motion/stage.py map --assign x=45502844 --assign z=45502854 \
                            --assign y=45538374 --invert z
-python octobee_stage.py map ... --forward z          # clear it again
-python octobee_stage.py map ... --origin z=250       # rig zero on a fixture datum
+python octobee/motion/stage.py map ... --forward z          # clear it again
+python octobee/motion/stage.py map ... --origin z=250       # rig zero on a fixture datum
 ```
 
 Verify it by eye rather than trusting the file: jog +z in the GUI and check the
@@ -1817,7 +1817,7 @@ calibration and every noise figure in this README cannot touch.
 **Only one process may hold the stages.** They are exclusive-open FTDI/APT
 devices. If the Kinesis application is running it owns all three, and the device
 list here comes back *empty* — which looks exactly like a cabling fault. Close
-Kinesis first. `octobee_stage.py list` says so explicitly rather than letting you
+Kinesis first. `octobee/motion/stage.py list` says so explicitly rather than letting you
 chase it.
 
 **Nothing is homed at power-on,** and an unhomed stage still reports a position.
@@ -1843,9 +1843,9 @@ The profile is applied when a stage opens, so every mover — the GUI's jog
 buttons, `moveto`, a field map — gets the same one:
 
 ```bash
-python octobee_stage.py speed                        # what each axis is set to
-python octobee_stage.py speed --vel 8 --accel 10 --save
-python octobee_stage.py speed --axis z --vel 5 --save # just the vertical one
+python octobee/motion/stage.py speed                        # what each axis is set to
+python octobee/motion/stage.py speed --vel 8 --accel 10 --save
+python octobee/motion/stage.py speed --axis z --vel 5 --save # just the vertical one
 ```
 
 `speed` prints peak speed against step size, which is the number that matches
@@ -1868,7 +1868,7 @@ of this touches it.
 ### The speed ceiling, and why the profile is re-sent before every move
 
 Above that setting is a hard ceiling — `MAX_VEL_MM_S`, **10 mm/s** — that
-nothing in `octobee_stage.py` will exceed. It is enforced at every door into
+nothing in `octobee/motion/stage.py` will exceed. It is enforced at every door into
 the module: the GUI spin box will not go higher, `speed --vel 20` is clamped
 and says so, and a `stages.json` written by hand or by an older version is
 clamped as it is read *and* as it is written.
@@ -1916,7 +1916,7 @@ is not the limit switch, a driver fault. Every one of those leaves the bit set
 and the number wrong, and an absolute move then computes its distance from a
 position the stage believes and does not have.
 
-So `octobee_stage.py` tracks trust separately from the bit. `Stage.homed` is
+So `octobee/motion/stage.py` tracks trust separately from the bit. `Stage.homed` is
 the controller's claim; `Stage.position_trusted` is this module's, granted only
 by a homing cycle it watched complete and withdrawn by anything that could
 have cost steps. Absolute moves require both. The Stages tab shows the
@@ -1993,7 +1993,7 @@ From another terminal, when the window is not the thing running or is not
 answering:
 
 ```
-python octobee_stage.py estop
+python octobee/motion/stage.py estop
 ```
 
 That stops the axes but cannot latch: the interlock lives in a process and that
@@ -2022,7 +2022,7 @@ internally from then on. Install with `Stage.set_calibration_file()`.
 
 Whether 47 µm matters is a gradient question, not a preference. A position error
 *d* appears in the data as a field error |∇B|·*d*. Against a 1 mT/mm gradient,
-47 µm is 47 µT — 2000× the 0.02 µT noise floor `octobee_posecap.py` works so hard
+47 µm is 47 µT — 2000× the 0.02 µT noise floor `octobee/calib/poses.py` works so hard
 to reach. In a near-uniform field it is irrelevant. Do the arithmetic for the
 magnet you are actually mapping before deciding.
 
@@ -2083,7 +2083,7 @@ structure with the periodicity of the raster.
 
 Set `--settle` from measurement, not hope. The controller reports "stopped" when
 its motion profile ends, which is not when a cantilevered probe stops ringing.
-`octobee_scan.py --settle-scan z` moves the axis and watches the field stop
+`octobee/motion/scan.py --settle-scan z` moves the axis and watches the field stop
 changing, which is the number your rig actually needs. A settle time that is too
 short does not look like an error — it looks like a gradient. Read the result as
 an **upper bound**: each probe is a whole `capture_pose()`, so probes land
@@ -2230,19 +2230,19 @@ continuous scanning is worth revisiting on its merits.
 ### Usage
 
 ```bash
-python octobee_stage.py list                     # what is on the bus
-python octobee_stage.py identify                 # wiggle each one to see which axis it is
-python octobee_stage.py map --assign x=45502844 --assign z=45502854 \
+python octobee/motion/stage.py list                     # what is on the bus
+python octobee/motion/stage.py identify                 # wiggle each one to see which axis it is
+python octobee/motion/stage.py map --assign x=45502844 --assign z=45502854 \
                            --assign y=45538374 --invert z
-python octobee_stage.py status
-python octobee_stage.py home --axis x            # explicit; asks before moving
-python octobee_stage.py moveby --x 5             # relative, works unhomed
-python octobee_stage.py moveto --x 100 --y 50    # absolute, needs homing
-python octobee_stage.py stop                     # profiled; nothing is lost
-python octobee_stage.py estop                    # EMERGENCY: stop now
+python octobee/motion/stage.py status
+python octobee/motion/stage.py home --axis x            # explicit; asks before moving
+python octobee/motion/stage.py moveby --x 5             # relative, works unhomed
+python octobee/motion/stage.py moveto --x 100 --y 50    # absolute, needs homing
+python octobee/motion/stage.py stop                     # profiled; nothing is lost
+python octobee/motion/stage.py estop                    # EMERGENCY: stop now
 
-python octobee_scan.py --settle-scan z           # measure the real settle time
-python octobee_scan.py --x 0:100:5 --y 0:100:5 --seconds 5
+python octobee/motion/scan.py --settle-scan z           # measure the real settle time
+python octobee/motion/scan.py --x 0:100:5 --y 0:100:5 --seconds 5
 ```
 
 The axis map and the mounting live in `stages.json`. Nothing guesses either: a
@@ -2272,8 +2272,8 @@ current. The **Machine** tab is where both are declared, and it draws the
 consequence rather than asking anyone to picture it.
 
 ```bash
-python octobee_machine.py designA_after_scaled.json          # what is in the file
-python octobee_machine.py designA_after_scaled.json --at 40 0 12   # and where the probe is
+python octobee/machine.py designA_after_scaled.json          # what is in the file
+python octobee/machine.py designA_after_scaled.json --at 40 0 12   # and where the probe is
 ```
 
 In the GUI it is the tab between **Stages** and **Data output**: the coil set

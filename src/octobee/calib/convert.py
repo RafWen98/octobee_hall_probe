@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_calibration.py -- turn raw ACQ423 counts into calibrated field vectors,
+octobee/calib/convert.py -- turn raw ACQ423 counts into calibrated field vectors,
 and keep the calibration state that does it.
 
 The conversion chain, in order, is:
@@ -35,8 +35,8 @@ import os
 
 import numpy as np
 
-import octobee as ob
-import probe_geometry as pg
+from octobee.acq import carrier as ob
+from octobee.calib import geometry as pg
 
 N_SENSORS = pg.N_SENSORS
 AXES = ("Bx", "By", "Bz")
@@ -569,7 +569,7 @@ def spread_report(mag_pk, geom=None, magnet_point=None, exponent=3.0,
 # --------------------------------------------------------------------------
 
 def load_capture(path):
-    """Read an octobee.py capture .npz into the shape this module expects."""
+    """Read an octobee/acq/carrier.py capture .npz into the shape this module expects."""
     with np.load(path, allow_pickle=True) as z:
         hosts = [str(h) for h in z["hosts"]]
         ai = [z[f"ai_{i}"] for i in range(len(hosts))]
@@ -589,7 +589,7 @@ def load_capture(path):
 
 def main():
     p = argparse.ArgumentParser(description="calibration engine self-check")
-    p.add_argument("capture", help="an .npz written by octobee.py capture")
+    p.add_argument("capture", help="an .npz written by octobee/acq/carrier.py capture")
     p.add_argument("--range", type=float, default=20.0, choices=sorted(ob.RANGE_TO_VPT))
     p.add_argument("--tare", action="store_true", help="tare on this capture")
     p.add_argument("--save", nargs="?", const=CONFIG_NAME,

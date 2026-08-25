@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_help.py -- the searchable index behind the GUI's Help tab.
+octobee/help.py -- the searchable index behind the GUI's Help tab.
 
 Where the text comes from
 -------------------------
@@ -30,6 +30,8 @@ words outranks one that contains any.
 
 import os
 import re
+
+from octobee import paths
 
 README_NAME = "README.md"
 
@@ -262,7 +264,7 @@ controllers.
 
 ### From another terminal
 
-    python octobee_stage.py estop
+    python octobee/motion/stage.py estop
 
 for when the window is not the thing that is running, or is not answering.
 That stops the axes but cannot latch anything — the latch lives in a process,
@@ -301,8 +303,8 @@ def load_topics(readme_path=None):
     says where the rest went.
     """
     topics = gui_topics()
-    path = readme_path or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), README_NAME)
+    root = paths.repo_root()
+    path = readme_path or (os.path.join(root, README_NAME) if root else README_NAME)
     try:
         with open(path, encoding="utf-8") as fh:
             topics += split_markdown(fh.read(), source=os.path.basename(path))

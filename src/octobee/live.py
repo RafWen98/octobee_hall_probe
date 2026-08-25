@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-octobee_live.py -- live plot of every Hall probe channel, both carriers, one window.
+octobee/live.py -- live plot of every Hall probe channel, both carriers, one window.
 
 Replaces the Phoebus Data Browser workflow: no PV names to type, no manual
 start/end times, no CSV export round-trip. It reads the raw stream straight off
 port 4210 on both boxes and draws all 16 sensors at once.
 
-    python octobee_live.py                    # stacked, VCM-subtracted (default)
-    python octobee_live.py --mode overlay     # all traces on one pair of axes
-    python octobee_live.py --mode grid        # one subplot per sensor
-    python octobee_live.py --show-vcm         # include the 16 VCM references
-    python octobee_live.py --raw              # raw counts, no VCM subtraction
-    python octobee_live.py --fs 0             # do not touch the box's sample rate
+    python octobee/live.py                    # stacked, VCM-subtracted (default)
+    python octobee/live.py --mode overlay     # all traces on one pair of axes
+    python octobee/live.py --mode grid        # one subplot per sensor
+    python octobee/live.py --show-vcm         # include the 16 VCM references
+    python octobee/live.py --raw              # raw counts, no VCM subtraction
+    python octobee/live.py --fs 0             # do not touch the box's sample rate
 
 Sample rate
 -----------
@@ -45,7 +45,7 @@ import time
 
 import numpy as np
 
-import octobee as ob
+from octobee.acq import carrier as ob
 
 
 # --------------------------------------------------------------------------
@@ -77,7 +77,7 @@ def restore_rate(host, prev):
 
     `prev` is the raw string the box replied with, and a comms hiccup can make
     that empty. Returning quietly then leaves the carrier at the reduced rate
-    with nothing said -- the exact state `octobee.py restore` exists to undo --
+    with nothing said -- the exact state `octobee/acq/carrier.py restore` exists to undo --
     so the caller is told instead of guessing.
     """
     if not prev:
@@ -366,12 +366,12 @@ def main():
                     print(f"{h}: clkdiv restored to {prev}")
                 else:
                     print(f"{h}: NO clkdiv recorded, so the rate was NOT put "
-                          f"back -- run 'python octobee.py restore'",
+                          f"back -- run 'python octobee/acq/carrier.py restore'",
                           file=sys.stderr)
             except OSError as exc:
                 # One unreachable box must not stop the other being restored.
                 print(f"{h}: could not restore clkdiv ({exc}) -- run "
-                      f"'python octobee.py restore'", file=sys.stderr)
+                      f"'python octobee/acq/carrier.py restore'", file=sys.stderr)
 
 
 if __name__ == "__main__":

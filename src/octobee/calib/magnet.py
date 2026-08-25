@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_magcal.py -- the guided single-magnet calibration: one magnet, a
+octobee/calib/magnet.py -- the guided single-magnet calibration: one magnet, a
 motorised sweep of the plane the sensors lie in, repeated once per quarter turn
 of the head.
 
@@ -130,7 +130,7 @@ probe_geometry.json rather than silently rewriting it.
 A note on what this does NOT do
 -------------------------------
 It does not calibrate absolute scale, and it does not fix chip orientation.
-The Earth-field roll sweep (octobee_posecal.py) is still what matches the
+The Earth-field roll sweep (octobee/calib/roll.py) is still what matches the
 sensors to each other in three dimensions and pins the axes; this fixes the
 scalar per-sensor response and identifies which sensor is where. They are
 complementary: run this first, because knowing which sensor is on which face
@@ -142,7 +142,7 @@ import os
 
 import numpy as np
 
-import probe_geometry as pgeom
+from octobee.calib import geometry as pgeom
 
 N_SENSORS = pgeom.N_SENSORS
 N_POSES = pgeom.N_FACES          # a square tube indexes in quarter turns

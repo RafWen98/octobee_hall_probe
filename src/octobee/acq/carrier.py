@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee.py -- core library for the Hampton3D / OCTO-BEE Hall probe system.
+octobee/acq/carrier.py -- core library for the Hampton3D / OCTO-BEE Hall probe system.
 
 Hardware chain (as found on the bench, 2026-08-19)
 --------------------------------------------------
@@ -572,7 +572,7 @@ def _cmd_rate(hosts, fs_hz):
 
 def _cmd_restore(hosts, fs_hz):
     """
-    Put the site-1 ADC clock back. octobee_live.py restores it on a clean exit,
+    Put the site-1 ADC clock back. octobee/live.py restores it on a clean exit,
     but a killed process (or a lost connection) leaves the box at the reduced
     rate -- this is the undo.
     """

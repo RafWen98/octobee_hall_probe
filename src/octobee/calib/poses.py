@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-octobee_posecap.py -- record an Earth-field roll sweep as INDEXED POSES rather
+octobee/calib/poses.py -- record an Earth-field roll sweep as INDEXED POSES rather
 than a continuous hand roll.
 
 Why a separate recorder?
 ------------------------
 The GUI's "Record sweep A/B/C" takes one continuous recording off the live
-stream, which runs the ADC clock down to 20 kSPS (octobee_live.py --fs) so the
+stream, which runs the ADC clock down to 20 kSPS (octobee/live.py --fs) so the
 display can keep up. That is the right trade for a hand roll, where you are
 buying roll ANGLES and the head never stops moving.
 
@@ -40,9 +40,9 @@ Usage
 -----
 One run records one mounting orientation:
 
-    python octobee_posecap.py --tag A --seconds 20    # axis horizontal, north
-    python octobee_posecap.py --tag B --seconds 20    # cradle turned to south
-    python octobee_posecap.py --tag C --seconds 20    # cradle turned to east
+    python octobee/calib/poses.py --tag A --seconds 20    # axis horizontal, north
+    python octobee/calib/poses.py --tag B --seconds 20    # cradle turned to south
+    python octobee/calib/poses.py --tag C --seconds 20    # cradle turned to east
 
 The tube never has to leave the horizontal and never has to come out of the
 V-block: carrying the whole cradle round 180 deg is the same thing to the solve
@@ -54,13 +54,13 @@ bearing patterns that fail silently.
 
 then solve all three together:
 
-    python octobee_posecal.py captures/rollsweep_A.npz \
+    python octobee/calib/roll.py captures/rollsweep_A.npz \
                               captures/rollsweep_B.npz \
                               captures/rollsweep_C.npz \
         --b-earth-ut <yours> --apply calibration.json
 
 Each run writes captures/rollsweep_<TAG>.npz + .json, which is exactly the
-format octobee_posecal.py and the GUI's "Load sweeps" already read.
+format octobee/calib/roll.py and the GUI's "Load sweeps" already read.
 """
 
 import argparse
@@ -70,9 +70,9 @@ import time
 
 import numpy as np
 
-import octobee as ob
-import octobee_calibration as ocal
-import octobee_posecal as opc
+from octobee.acq import carrier as ob
+from octobee.calib import convert as ocal
+from octobee.calib import roll as opc
 
 # A pose is stored as the MEDIAN of its sub-block means, not as a plain mean.
 # That costs ~25 % in noise and buys immunity to someone walking past with a
@@ -127,7 +127,7 @@ def check_rate(hosts):
             ok = False
     if not ok:
         print("\nA killed live session leaves the ADC clock down. Fix it with:")
-        print("    python octobee.py restore")
+        print("    python octobee/acq/carrier.py restore")
     return ok, layouts
 
 
@@ -583,7 +583,7 @@ def main(argv=None):
                 print("        clean: the session held to under a microtesla.")
             print("        a single channel far above the 90th percentile is "
                   "that channel's problem, not the sweep's -- check it in "
-                  "octobee_cal.py")
+                  "octobee/report.py")
             break
 
         rows.append(row)

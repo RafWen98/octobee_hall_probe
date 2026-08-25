@@ -2,8 +2,8 @@
 """
 octobee_launch.pyw -- what the desktop icon runs.
 
-Why this exists rather than pointing the shortcut straight at octobee_gui.py
----------------------------------------------------------------------------
+Why this exists rather than pointing the shortcut straight at the GUI
+--------------------------------------------------------------------
 A .pyw runs under pythonw.exe, which has no console. That is what you want for
 a desktop application -- but it also means anything that fails before the
 window opens fails *silently*: no traceback, no window, nothing. Missing PyQt6,
@@ -56,7 +56,7 @@ def main():
     if HERE not in sys.path:
         sys.path.insert(0, HERE)
     try:
-        import octobee_gui
+        from octobee.gui import window
     except Exception:
         tb = traceback.format_exc()
         try:
@@ -73,7 +73,7 @@ def main():
         return 1
 
     try:
-        octobee_gui.main()
+        window.main()
     except SystemExit:
         raise
     except Exception:

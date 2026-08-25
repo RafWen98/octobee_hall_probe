@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-octobee_gui.py -- control, live view, calibration and data export for the
+octobee/gui/window.py -- control, live view, calibration and data export for the
 16-sensor OCTO-BEE Hall probe, in one window.
 
-    python octobee_gui.py                       # talk to the two carriers
-    python octobee_gui.py --demo                # synthetic probe, no hardware
-    python octobee_gui.py --replay capture.npz  # play back a saved capture
+    python octobee/gui/window.py                       # talk to the two carriers
+    python octobee/gui/window.py --demo                # synthetic probe, no hardware
+    python octobee/gui/window.py --replay capture.npz  # play back a saved capture
 
 What it is for
 --------------
@@ -42,20 +42,21 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-import octobee as ob
-import octobee_calibration as ocal
-import octobee_help as ohelp
-import octobee_magcal as omag
-import octobee_live as olive
-import octobee_machine as omach
-import octobee_profile as oprof
-import octobee_posecal as opc
-import octobee_record as orec
-import octobee_scan as oscan
-import octobee_stage as ostage
-import probe_geometry as pgeom
-from machine_view3d import MachineView3D
-from probe_view3d import ProbeView3D, color_for
+from octobee import paths
+from octobee.acq import carrier as ob
+from octobee.calib import convert as ocal
+from octobee import help as ohelp
+from octobee.calib import magnet as omag
+from octobee import live as olive
+from octobee import machine as omach
+from octobee import profile as oprof
+from octobee.calib import roll as opc
+from octobee import record as orec
+from octobee.motion import scan as oscan
+from octobee.motion import stage as ostage
+from octobee.calib import geometry as pgeom
+from octobee.gui.widgets.machine3d import MachineView3D
+from octobee.gui.widgets.probe3d import ProbeView3D, color_for
 
 N_SENSORS = pgeom.N_SENSORS
 AXES = ("Bx", "By", "Bz")
@@ -762,7 +763,7 @@ PASS_NAMES = {
 class MagnetWizard(QtWidgets.QDialog):
     """Guided single-magnet calibration: four sweeps, one per quarter turn.
 
-    The routine is in octobee_magcal.py; this is the part that has to be a
+    The routine is in octobee/calib/magnet.py; this is the part that has to be a
     dialog, because between poses the instrument cannot do anything until a
     person has turned the head and said so. That pause is the whole reason
     this is guided rather than a button: the run is only valid if the magnet
@@ -3229,7 +3230,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "software cannot work out which stage is which physical "
                 "direction, and guessing would silently transpose the "
                 "coordinate frame of every map you take. Use the CLI's "
-                "'octobee_stage.py identify' to wiggle each one if unsure.")
+                "'octobee/motion/stage.py identify' to wiggle each one if unsure.")
         return True
 
     def _axis_map_from_table(self):
@@ -5879,7 +5880,7 @@ class CrashHandler:
 
     def __init__(self, path=None, window=None):
         self.path = path or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), CRASH_LOG)
+            paths.repo_root() or os.getcwd(), CRASH_LOG)
         self.window = window
         self.count = 0
         self.previous = None
@@ -5957,7 +5958,8 @@ def _apply_app_icon(app):
     groups this with every other Python process -- leaving the desktop shortcut
     as the only place the application looks like itself.
     """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ICON_NAME)
+    root = paths.repo_root()
+    path = os.path.join(root, ICON_NAME) if root else ICON_NAME
     if not os.path.exists(path):
         return
     if sys.platform == "win32":

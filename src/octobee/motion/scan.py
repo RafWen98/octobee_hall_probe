@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-octobee_scan.py -- map a field over a volume: move the stages, stop, average,
+octobee/motion/scan.py -- map a field over a volume: move the stages, stop, average,
 repeat.
 
 The whole method in one paragraph
 ---------------------------------
-octobee_posecap.py already established that a STATIONARY average beats a
+octobee/calib/poses.py already established that a STATIONARY average beats a
 moving one by an order of magnitude: the sensor noise is white and falls as
 1/sqrt(N), so a pose you can sit on for 20 s at the carriers' own 200 kSPS
 reaches 0.020 uT where a continuous sweep off the reduced-rate live stream
@@ -43,13 +43,13 @@ Two arrays are stored, and they are not the same thing:
 They normally agree to well under a micrometre. When they do not, something
 stalled or hit a limit, and having both is the difference between noticing
 that and quietly folding a bad point into a field map. Neither is a *measured*
-carriage position -- see octobee_stage.py on why absolute accuracy is ~47 um
+carriage position -- see octobee/motion/stage.py on why absolute accuracy is ~47 um
 without Thorlabs' per-serial calibration files, and ~5 um with them.
 
 Usage
 -----
-    python octobee_scan.py --x 0:100:10 --y 0:100:10 --seconds 5
-    python octobee_scan.py --x 0:50:5 --z 10:60:5 --seconds 20 --out captures/map1
+    python octobee/motion/scan.py --x 0:100:10 --y 0:100:10 --seconds 5
+    python octobee/motion/scan.py --x 0:50:5 --z 10:60:5 --seconds 20 --out captures/map1
 
 Each axis is START:STOP:STEP in millimetres, stop inclusive. Axes you do not
 name are left where they are and recorded as constant.
@@ -64,10 +64,10 @@ import time
 
 import numpy as np
 
-import octobee as ob
-import octobee_calibration as ocal
-import octobee_posecap as opcap
-import octobee_stage as ostage
+from octobee.acq import carrier as ob
+from octobee.calib import convert as ocal
+from octobee.calib import poses as opcap
+from octobee.motion import stage as ostage
 
 N_SENSORS = ocal.N_SENSORS
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-probe_geometry.py -- where each sensor actually sits, and which way its chip faces.
+octobee/calib/geometry.py -- where each sensor actually sits, and which way its chip faces.
 
 The probe is a square tube carrying 16 SENM3Dx evaluation-kit PCBs, 4 per face.
 Each board lies FLAT ON its face -- coplanar with it, bolted down through the

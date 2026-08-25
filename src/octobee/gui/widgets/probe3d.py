@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-probe_view3d.py -- the little 3D model of the probe head.
+octobee/gui/widgets/probe3d.py -- the little 3D model of the probe head.
 
 Draws the square tube, the 16 eval-kit boards lying flat on its faces and
 reaching out tangentially, and on each chip the field vector it is currently
@@ -31,8 +31,8 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PyQt6 import QtGui
 
-import octobee_profile as oprof
-import probe_geometry as pg_geom
+from octobee import profile as oprof
+from octobee.calib import geometry as pg_geom
 import itertools
 
 # Turbo runs blue -> green -> red with even perceptual steps, so a small change

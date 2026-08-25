@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_profile.py -- find out what is actually slow, on the machine it is slow on.
+octobee/profile.py -- find out what is actually slow, on the machine it is slow on.
 
 "The app goes sluggish once data arrives" has several quite different causes,
 and they need different fixes:

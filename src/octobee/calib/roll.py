@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_posecal.py -- calibrate the probe against the Earth's magnetic field by
+octobee/calib/roll.py -- calibrate the probe against the Earth's magnetic field by
 rolling it about the tube axis.
 
 Why bother, when there is already a magnet pass?
@@ -113,8 +113,8 @@ import os
 
 import numpy as np
 
-import octobee_calibration as ocal
-import probe_geometry as pg
+from octobee.calib import convert as ocal
+from octobee.calib import geometry as pg
 
 N_SENSORS = pg.N_SENSORS
 AXES = ocal.AXES
@@ -942,7 +942,7 @@ def identify_faces(solution, geometry=None):
 
     Two honest limits:
       * Slot (position ALONG the tube) is invisible here -- every slot on a
-        face shares the same rotation. Use octobee_idmap.py --magnet for that.
+        face shares the same rotation. Use octobee/acq/idmap.py --magnet for that.
       * The mapping is recovered up to a global rotation of all four faces at
         once; see _anchor_gauge.
     """

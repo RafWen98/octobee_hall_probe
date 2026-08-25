@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_machine.py -- the coil set the probe is measuring inside.
+octobee/machine.py -- the coil set the probe is measuring inside.
 
 A field map is a table of vectors at rig millimetres. On its own it says
 nothing about the machine: 40 mT at (120, 45, 80) is only meaningful once you
@@ -69,7 +69,7 @@ import sys
 
 import numpy as np
 
-import probe_geometry as pgeom
+from octobee.calib import geometry as pgeom
 
 CONFIG_NAME = "machine.json"
 

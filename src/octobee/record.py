@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_record.py -- getting data out of the probe and onto disk.
+octobee/record.py -- getting data out of the probe and onto disk.
 
 Three routes, because they answer different questions:
 
@@ -33,9 +33,9 @@ import time
 
 import numpy as np
 
-import octobee as ob
-import octobee_calibration as ocal
-import probe_geometry as pg
+from octobee.acq import carrier as ob
+from octobee.calib import convert as ocal
+from octobee.calib import geometry as pg
 
 AXES = ocal.AXES
 N_SENSORS = ocal.N_SENSORS
@@ -393,7 +393,7 @@ def sensor_table(cal, b_mt, health_rows, temps=None, peaks=None, geom=None):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="export a saved capture")
-    p.add_argument("capture", help=".npz from octobee.py capture")
+    p.add_argument("capture", help=".npz from octobee/acq/carrier.py capture")
     p.add_argument("-o", "--out", default=None, help="output CSV")
     p.add_argument("--rate", type=float, default=1000.0, help="output rate Hz")
     p.add_argument("--tube-frame", action="store_true")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_idmap.py -- prove which ACQ423 channel belongs to which physical sensor.
+octobee/acq/idmap.py -- prove which ACQ423 channel belongs to which physical sensor.
 
 The channel map in the OCTO-BEE guide (ch 4k+1=Bz, 4k+2=By, 4k+3=Bx, 4k+4=VCM)
 is documentation, not measurement. Before you trust any calibration you should
@@ -21,7 +21,7 @@ How it works
 This needs no clock synchronisation between the PC and the carrier -- only the
 *order* of the events matters.
 
-    python octobee_idmap.py --uut acq1001_694 --seconds 70
+    python octobee/acq/idmap.py --uut acq1001_694 --seconds 70
 
 Alternative without SPI: --magnet mode. Pass a magnet slowly along the tube,
 sensor by sensor, and the same event detector reports the channel groups in the
@@ -33,8 +33,8 @@ import argparse
 
 import numpy as np
 
-import octobee as ob
-import octobee_live as ol
+from octobee.acq import carrier as ob
+from octobee import live as ol
 
 
 def bin_stats(ai, fs, bin_s):

@@ -2,22 +2,16 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-# No modules are installed, deliberately. This is not a library -- it is a set
-# of scripts that run from the checkout, importing each other as siblings, with
-# the desktop shortcut and every CLI pointing at that checkout. Installing
-# copies under site-packages would give a second set of files that shadow the
-# ones being edited, which is worse than useless on the bench.
+[tool.setuptools.packages.find]
+# src-layout: the package is the only thing under src/, so setuptools has
+# nothing to guess at and cannot pick up captures/ or the on-box backups.
 #
-# So `pip install -e ".[gui,dev]"` exists to bring in the DEPENDENCIES, and
-# that is all CI wants from it.
-#
-# The empty list is also what makes the install work at all. Without it,
-# setuptools tries to guess what to package, finds twenty top-level modules
-# sitting in the repository root next to captures/ and the on-box backups, and
-# refuses -- "Multiple top-level packages discovered in a flat-layout" -- which
-# is a build failure ten seconds into CI with nothing to do with the code.
-py-modules = []
+# Install it with `pip install -e ".[gui,dev]"`. An EDITABLE install does not
+# copy anything into site-packages -- it writes a path hook back to this
+# checkout, so the files being edited are the files being run, which is the
+# property the bench needs. A plain `pip install .` would make the second,
+# shadowing copy this project spent a while avoiding; keep the -e.
+where = ["src"]
 
 [project]
 name = "octobee"
@@ -91,6 +85,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # The Qt event-loop entry points genuinely need a few long argument lists.
-"octobee_gui.py" = ["PLR0913"]
+"src/octobee/gui/window.py" = ["PLR0913"]
 # Test names read as sentences and the file is one long script by design.
 "selftest.py" = ["PLR0915"]

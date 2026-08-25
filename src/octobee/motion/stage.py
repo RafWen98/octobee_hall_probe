@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_stage.py -- drive the Thorlabs LTS300C translation stages directly,
+octobee/motion/stage.py -- drive the Thorlabs LTS300C translation stages directly,
 without the Kinesis application.
 
 Why ctypes and not pythonnet
@@ -37,7 +37,7 @@ individual leadscrew's error and take that 47 um to <+/-5 um. As of
 45538374. If you are mapping a field with any real gradient, get them -- a
 position error d shows up in your data as a field error |grad B| * d, and
 against a 1 mT/mm gradient 47 um is 47 uT, which is 2000x the 0.02 uT noise
-floor that octobee_posecap.py works so hard to reach. Once you have the
+floor that octobee/calib/poses.py works so hard to reach. Once you have the
 files, install them with set_calibration_file() and they apply inside the
 controller from then on.
 
@@ -121,16 +121,16 @@ checked against. Measure it once with the head that is actually fitted.
 
 Usage
 -----
-    python octobee_stage.py list                    # what is on the USB bus
-    python octobee_stage.py status                  # per-axis position + flags
-    python octobee_stage.py home --axis x           # explicit, one axis
-    python octobee_stage.py moveto --x 100 --y 50   # absolute, mm
-    python octobee_stage.py stop                    # profiled stop, all axes
-    python octobee_stage.py estop                   # EMERGENCY: stop now
-    python octobee_stage.py speed                   # motion profile per axis
-    python octobee_stage.py speed --vel 8 --save    # slow it down, permanently
+    python octobee/motion/stage.py list                    # what is on the USB bus
+    python octobee/motion/stage.py status                  # per-axis position + flags
+    python octobee/motion/stage.py home --axis x           # explicit, one axis
+    python octobee/motion/stage.py moveto --x 100 --y 50   # absolute, mm
+    python octobee/motion/stage.py stop                    # profiled stop, all axes
+    python octobee/motion/stage.py estop                   # EMERGENCY: stop now
+    python octobee/motion/stage.py speed                   # motion profile per axis
+    python octobee/motion/stage.py speed --vel 8 --save    # slow it down, permanently
 
-    python octobee_stage.py map --assign x=45502844 --assign z=45502854 \\
+    python octobee/motion/stage.py map --assign x=45502844 --assign z=45502854 \\
                                --assign y=45538374 --invert z
 
 Axis names and mounting come from stages.json (see AXIS_CONFIG); without it the
@@ -523,7 +523,7 @@ def device_info(serial):
     # here returns 0 for success, so checking it with _check() reports a
     # perfectly good call as "Kinesis error 1" -- and on this machine it does
     # so while having filled the struct correctly (typeID 45, "APT Stepper
-    # Motor Controller"). That took out `octobee_stage.py list` entirely.
+    # Motor Controller"). That took out `octobee/motion/stage.py list` entirely.
     if d.TLI_GetDeviceInfo(serial.encode(), C.byref(info)) == 0:
         raise StageError(f"TLI_GetDeviceInfo({serial}) found no such device "
                          f"-- the device list may be stale; rebuild it with "

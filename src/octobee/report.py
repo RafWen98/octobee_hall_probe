@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee_cal.py -- calibration / health report for the 16-sensor OCTO-BEE probe.
+octobee/report.py -- calibration / health report for the 16-sensor OCTO-BEE probe.
 
 What it answers
 ---------------
@@ -25,17 +25,17 @@ only over SPI on the carrier itself -- run onbox/sensor_audit.py for that.
 
 Usage
 -----
-    python octobee_cal.py --seconds 3                 # live capture, then report
-    python octobee_cal.py --load octobee_capture.npz  # report on a saved capture
-    python octobee_cal.py --seconds 20 --plot         # magnet pass + peak analysis
+    python octobee/report.py --seconds 3                 # live capture, then report
+    python octobee/report.py --load octobee_capture.npz  # report on a saved capture
+    python octobee/report.py --seconds 20 --plot         # magnet pass + peak analysis
 """
 
 import argparse
 
 import numpy as np
 
-import octobee as ob
-import octobee_calibration as ocal
+from octobee.acq import carrier as ob
+from octobee.calib import convert as ocal
 
 
 def load_npz(path):
