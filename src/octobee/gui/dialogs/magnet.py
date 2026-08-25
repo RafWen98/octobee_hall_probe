@@ -599,10 +599,10 @@ class MagnetWizard(QtWidgets.QDialog):
                 "Either pick a transverse axis as well, or set the standoff "
                 "axis to none and run the plain axial sweep.")
             return
-        if win._estop_reason is not None:
+        if win.motion.latched:
             QtWidgets.QMessageBox.warning(
                 self, "Guided magnet calibration",
-                f"The emergency stop is latched: {win._estop_reason}.\n\n"
+                f"The emergency stop is latched: {win.motion.reason}.\n\n"
                 f"Reset it before driving the head.")
             return
         for name in (axis, across, normal):
@@ -720,7 +720,7 @@ class MagnetWizard(QtWidgets.QDialog):
         # Without this the main window's stop button does not know this thread
         # exists, and stopping the axes mid-pass would leave it to carry on to
         # the next one -- see MainWindow.register_motion_worker.
-        win.register_motion_worker(self._worker)
+        win.motion.register(self._worker)
         win.session.log(f"guided magnet calibration: pose {len(self.run) + 1} of "
                     f"{omag.N_POSES}, {PASS_NAMES[kind]}, {len(grid)} points "
                     f"-- {grid.describe()}")
@@ -766,11 +766,11 @@ class MagnetWizard(QtWidgets.QDialog):
 
     def on_pass_done(self, fm, error):
         worker, self._worker = self._worker, None
-        self.win.retire_motion_worker(worker)
+        self.win.motion.retire(worker)
         self.bar.setFormat("no sweep running")
         kind, self._pass = self._pass, None
         self.win._sync_stage_controls()
-        if self.win._estop_reason is not None:
+        if self.win.motion.latched:
             # An aborted pass comes back with no error and a partial FieldMap
             # -- that is deliberate, it is how a scan keeps the points it did
             # take. But this routine chains: locate starts cut, cut starts

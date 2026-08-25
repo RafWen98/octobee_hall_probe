@@ -2772,13 +2772,13 @@ def test_gui_estop(app, workdir):
               win.session.stages is None and win.btn_estop.isEnabled())
         win.on_estop()
         check("stopping with nothing connected still latches",
-              win._estop_reason is not None)
+              win.motion.reason is not None)
         # isHidden, not isVisible: the window itself is never shown in this
         # test, so isVisible() is False for every child either way and both
         # checks would pass without testing anything.
         check("and the reset button appears only once latched",
               not win.btn_estop_reset.isHidden())
-        win._estop_reason = None            # reset without opening the modal
+        win.motion._reason = None           # reset without opening the modal
         win._refresh_estop_ui()
         check("clearing the latch hides the reset button",
               win.btn_estop_reset.isHidden())
@@ -2809,10 +2809,10 @@ def test_gui_estop(app, workdir):
         check("and the interlock refuses moves at the point of command", ok,
               "the button cannot reach a thread already past its own check")
 
-        first = win._estop_reason
+        first = win.motion.reason
         win.on_estop()
         check("pressing stop twice does not release the machine",
-              win._estop_reason == first and stages.interlock.tripped is not None,
+              win.motion.reason == first and stages.interlock.tripped is not None,
               "a person in a hurry hits it twice")
 
         # A stopped axis must not accept an absolute move again just because
@@ -2820,7 +2820,7 @@ def test_gui_estop(app, workdir):
         check("a stopped axis is no longer trusted",
               not stages["x"].position_trusted)
         was, lost = stages.reset_interlock()
-        win._estop_reason = None
+        win.motion._reason = None
         check("resetting the latch clears it", was is not None
               and stages.interlock.tripped is None)
         check("but the axes stay untrusted until they are homed",
@@ -2837,7 +2837,9 @@ def test_gui_estop(app, workdir):
               win.session.stages.interlock.tripped is not None,
               "the latch belongs to the rig, not to a StageSet object")
     finally:
-        win._estop_reason = None
+        # Teardown, not an API: the latch is deliberately read-only in
+        # production and only moves through trigger()/reset().
+        win.motion._reason = None
         win.session.stages = None
         win.close()
         app.processEvents()

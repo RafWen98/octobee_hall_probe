@@ -43,6 +43,7 @@ from octobee.motion import scan as oscan
 from octobee.motion import stage as ostage
 from octobee.calib import geometry as pgeom
 from octobee.gui.widgets.probe3d import ProbeView3D
+from octobee.gui.estop import MotionControl, is_running
 from octobee.gui.constants import (
     DEFAULT_VIEW_HZ,
     HEALTH_PERIOD_S,
@@ -71,7 +72,6 @@ from octobee.gui.workers import (
     ScanWorker,
     SnapshotWorker,
     StageWorker,
-    _is_running,
     _stage_set_for,
 )
 
@@ -111,10 +111,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scan_worker = None
         self._scan_t0 = 0.0
 
-        self._motion_workers = []
-        self._retired_workers = []
-        self._estop_reason = None
-        self._estop_alarms = set()
+        # Every thread that can command motion, and the latch that
+        # overrides all of them. Built before _build_ui: the toolbar's
+        # stop button and the Esc shortcut are live from the moment the
+        # window exists, and both go through this.
+        self.motion = MotionControl(self.session, parent=self)
+        self.motion.changed.connect(self._refresh_estop_ui)
         self._state_before_estop = None
 
         self.setWindowTitle("OCTO-BEE Hall probe")
@@ -434,7 +436,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Clear the latch and allow motion again. Deliberately a separate "
             "button: releasing a machine is an act, not the absence of one.")
         self.btn_estop_reset.setVisible(False)
-        self.btn_estop_reset.clicked.connect(self.on_estop_reset)
+        self.btn_estop_reset.clicked.connect(self.motion.reset)
         tb.addWidget(self.btn_estop_reset)
 
         self.sc_estop = QtGui.QShortcut(
@@ -927,7 +929,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "For 'something is wrong', use EMERGENCY STOP in the top right "
             "(or Esc) — that one is immediate and refuses all further motion "
             "until it is reset.")
-        self.btn_stage_stop.clicked.connect(self.on_stage_stop)
+        self.btn_stage_stop.clicked.connect(self.motion.stop)
         f2.addWidget(self.btn_stage_homeall, 5, 0, 1, 3)
         f2.addWidget(self.btn_stage_stop, 5, 5, 1, 2)
         lay.addWidget(g2)
@@ -1031,7 +1033,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not serials:
             msg = ("No stages on the bus. The Kinesis application is running "
                    "and holds all of them — close it and try again."
-                   if ostage.kinesis_is_running() else
+                   if ostage.kinesisis_running() else
                    "No stages on the bus. Check power and USB.")
             self.session.log(f"stages: {msg}")
             if not quiet:
@@ -1161,29 +1163,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _stage_action(self, what, fn):
         """Run one blocking stage command in a worker, one at a time."""
-        if self._estop_reason is not None:
+        if self.motion.latched:
             self.session.log(f"stages: {what} refused — emergency stop is latched "
-                         f"({self._estop_reason}). Reset it first.")
+                         f"({self.motion.reason}). Reset it first.")
             return
-        if self.motion_busy():
+        if self.motion.busy():
             self.session.log("stages: busy — wait for the current move to finish")
             return
         self._stage_worker = StageWorker(what, fn)
         self._stage_worker.progress.connect(self.session.log)
         self._stage_worker.done.connect(self.on_stage_action_done)
-        self.register_motion_worker(self._stage_worker)
+        self.motion.register(self._stage_worker)
         self._stage_worker.start()
         self._sync_stage_controls()
 
     def on_stage_action_done(self, what, error):
-        self.retire_motion_worker(self._stage_worker)
+        self.motion.retire(self._stage_worker)
         if error:
             self.session.log(f"stages: {what} failed — {error}")
             if what == "connect":
                 self._stage_pending = None
                 self.btn_stage_connect.setEnabled(True)
             self._sync_stage_controls()
-            if self._estop_reason is not None:
+            if self.motion.latched:
                 # The move failed because the machine was stopped, which the
                 # operator already knows -- they pressed the button, and the
                 # status bar is red. A modal on top of that is noise, and with
@@ -1194,14 +1196,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if what == "connect":
             self.session.stages = self._stage_pending
             self._stage_pending = None
-            if self._estop_reason is not None:
+            if self.motion.latched:
                 # Latched while disconnected, or latched and then reconnected
                 # to clear it. Neither may release the machine: the interlock
                 # belongs to the rig, not to whichever StageSet object happens
                 # to be alive.
-                self.session.stages.interlock.trip(self._estop_reason)
+                self.session.stages.interlock.trip(self.motion.reason)
                 self.session.log("stages: connected, but motion stays latched off "
-                             f"— {self._estop_reason}")
+                             f"— {self.motion.reason}")
             for ax, row in self.stage_rows.items():
                 have = ax in self.session.stages.names
                 row["present"] = have
@@ -1422,154 +1424,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- stopping -------------------------------------------------------
 
-    def register_motion_worker(self, worker):
-        """Track a thread that commands motion, so a stop can reach it.
-
-        The reason this exists rather than a single `self._scan_worker`: the
-        guided-magnet wizard owns a ScanWorker of its own, and the stop button
-        used to know only about the main window's. Pressing it during a guided
-        run stopped the axis mid-move and then the wizard's thread, which had
-        never been told anything, saw motion end, took its reading at the
-        wrong place and commanded the next pose. The button appeared to do
-        nothing except corrupt a point. Anything that moves the machine
-        registers here.
-        """
-        self._motion_workers = [w for w in self._motion_workers
-                                if w is not worker and _is_running(w)]
-        self._motion_workers.append(worker)
-
-    def retire_motion_worker(self, worker):
-        """This worker has finished; stop counting it as busy.
-
-        Called from the done handlers rather than waiting for isRunning() to
-        go false, because a worker emits done() from inside run() -- so at the
-        moment the handler executes the thread can still report itself as
-        running, and the controls it should have re-enabled stay grey until
-        something else happens to refresh them.
-
-        The reference is kept, not dropped. A QThread garbage-collected while
-        its run() is still unwinding takes the process with it.
-        """
-        self._motion_workers = [w for w in self._motion_workers if w is not worker]
-        self._retired_workers.append(worker)
-        del self._retired_workers[:-8]
-
-    def motion_busy(self):
-        """True if any thread is currently allowed to command motion."""
-        self._motion_workers = [w for w in self._motion_workers if _is_running(w)]
-        return bool(self._motion_workers)
-
-    def _abort_motion_workers(self):
-        """Ask every registered worker to stop. Returns how many were running."""
-        n = 0
-        for w in list(self._motion_workers):
-            if _is_running(w):
-                n += 1
-                if hasattr(w, "abort"):
-                    w.abort()
-        return n
-
     def on_estop(self, _checked=False):
         """The button, the Esc key and the watchdog all come through here."""
-        self.trigger_estop("operator pressed the emergency stop")
-
-    def trigger_estop(self, reason):
-        """Stop the machine and latch it off. The single stop path.
-
-        Ordered hardware first. Aborting the workers first would spend
-        milliseconds in Python while the carriage is still moving, and the
-        whole value of an immediate stop over a profiled one is measured in
-        exactly those milliseconds. The interlock goes down with the stop, so
-        a worker that wakes up in between is refused at the point of command
-        rather than racing us.
-
-        Never raises. It is wired to a button, a key and a status watchdog,
-        and an exception on any of those paths would leave the machine in
-        whatever half-stopped state it got to.
-        """
-        # Kept on the window as well as on the StageSet: the set is created at
-        # connect, so without this a stop pressed while disconnected would be
-        # forgotten by the time something opened the stages again.
-        already = self._estop_reason is not None
-        if not already:
-            self._estop_reason = reason
-        errors = []
-        if self.session.stages is not None:
-            try:
-                errors = self.session.stages.emergency_stop(reason)
-            except Exception as exc:
-                errors = [f"{type(exc).__name__}: {exc}"]
-        stopped = self._abort_motion_workers()
-        self._refresh_estop_ui()
-        if already:
-            self.session.log(f"EMERGENCY STOP (again) — already latched: "
-                         f"{self._estop_reason}")
-            return
-        self.session.log(f"*** EMERGENCY STOP — {reason} ***")
-        if self.session.stages is None:
-            self.session.log("  the stages are not connected here; nothing to "
-                         "stop over USB. If something is moving, cut power "
-                         "to the controllers.")
-        else:
-            self.session.log(f"  {', '.join(self.session.stages.names)}: immediate stop, "
-                         f"all further motion refused until reset")
-        if stopped:
-            self.session.log(f"  {stopped} running job(s) aborted")
-        for e in errors:
-            self.session.log(f"  STOP FAILED on {e} — CUT POWER TO THE "
-                         f"CONTROLLERS IF ANYTHING IS STILL MOVING")
-        if errors:
-            QtWidgets.QMessageBox.critical(
-                self, "Emergency stop did not reach every axis",
-                "The stop could not be delivered to:\n\n  "
-                + "\n  ".join(errors)
-                + "\n\nIf anything is still moving, cut power to the "
-                  "controllers now. This is what a hardware emergency stop "
-                  "is for; the software one needs the USB link to work.")
-
-    def on_estop_reset(self):
-        """Clear the latch, after saying what is still not true afterwards."""
-        if self._estop_reason is None:
-            return
-        lost = self.session.stages.untrusted() if self.session.stages is not None else []
-        box = QtWidgets.QMessageBox(self)
-        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        box.setWindowTitle("Reset the emergency stop")
-        box.setText(f"Latched by: {self._estop_reason}")
-        detail = ("Resetting allows motion again. It does not undo anything "
-                  "— check that whatever caused the stop is actually dealt "
-                  "with, and that the head is where you think it is.")
-        if lost:
-            detail += ("\n\nThese axes will still refuse absolute moves until "
-                       "they are homed, because an immediate stop can lose "
-                       "steps:\n\n  "
-                       + "\n  ".join(f"{n}: {why}" for n, why in lost))
-        box.setInformativeText(detail)
-        go = box.addButton("Reset and allow motion",
-                           QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Stay stopped", QtWidgets.QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        if box.clickedButton() is not go:
-            return
-        was = self._estop_reason
-        self._estop_reason = None
-        if self.session.stages is not None:
-            _, lost = self.session.stages.reset_interlock()
-        self.session.log(f"emergency stop reset (was: {was}) — motion allowed")
-        for name, why in lost:
-            self.session.log(f"  {name}: absolute moves still refused — {why}")
-        self._refresh_estop_ui()
+        self.motion.trigger("operator pressed the emergency stop")
 
     def _refresh_estop_ui(self):
         """Make the latched state impossible to miss or to mistake."""
-        latched = self._estop_reason is not None
+        latched = self.motion.latched
         self.btn_estop_reset.setVisible(latched)
         self.btn_estop.setText("■  STOPPED" if latched
                                else "■  EMERGENCY STOP")
         if latched:
             if self._state_before_estop is None:
                 self._state_before_estop = self.lbl_state.text()
-            self.lbl_state.setText(f"EMERGENCY STOP — {self._estop_reason}")
+            self.lbl_state.setText(f"EMERGENCY STOP — {self.motion.reason}")
             self.lbl_state.setStyleSheet(
                 "color:#fff; background:#c1121f; font-weight:bold; padding:1px 8px;")
         else:
@@ -1593,8 +1461,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if it were its own, and the map would carry on being written with
         every remaining point taken somewhere other than where it says.
         """
-        live = (self.session.stages is not None and self._estop_reason is None
-                and not self.motion_busy())
+        live = (self.session.stages is not None and not self.motion.latched
+                and not self.motion.busy())
         for row in self.stage_rows.values():
             for wdg in row["widgets"]:
                 wdg.setEnabled(live and row.get("present", True))
@@ -1603,71 +1471,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scan_start.setEnabled(live)
         # Stopping stays available in every state that is not "no stages".
         self.btn_stage_stop.setEnabled(self.session.stages is not None)
-
-    def on_stage_stop(self):
-        """End the move in progress, without latching the machine off.
-
-        The graded one: a profiled stop, so nothing loses steps and the
-        positions stay trustworthy. This is "that is far enough", where the
-        red button is "something is wrong". Both abort the running jobs --
-        a stop that leaves the raster thread free to command the next point
-        is not a stop either.
-
-        Not routed through the worker queue: a stop that has to wait behind the
-        move it is trying to interrupt is not a stop button.
-        """
-        stopped = self._abort_motion_workers()
-        if stopped:
-            self.session.log(f"stages: {stopped} running job(s) will stop after "
-                         f"the point in flight")
-        if self.session.stages is None:
-            return
-        try:
-            self.session.stages.stop_all()
-            self.session.log("stages: stopped")
-        except ostage.StageError as exc:
-            self.session.log(f"stages: stop failed — {exc}")
-
-    def _stage_watchdog(self, snap):
-        """One axis in trouble stops the whole machine.
-
-        Runs on the 200 ms stage poll, which is already reading every axis for
-        the table, so this costs nothing extra.
-
-        The convention it implements: on a stacked multi-axis rig the axis
-        that reports the fault is not necessarily the one about to do damage.
-        A motion error means a commanded move did not happen -- stalled,
-        driver fault, obstruction -- and any other axis still executing its
-        half of a coordinated move is now going somewhere that was only safe
-        while all three agreed. Finding a hard limit is the same argument
-        arriving one step later: the soft limits were supposed to stop it and
-        did not.
-
-        Latched through the same path as the button, so the machine ends up in
-        one state with one reason attached, however it got there.
-        """
-        name = snap["name"]
-        if snap["error"]:
-            key = (name, "error")
-            if key not in self._estop_alarms:
-                self._estop_alarms.add(key)
-                self.trigger_estop(f"{name} reported a motion error")
-        elif snap["at_hard_limit"] and not snap["moving"]:
-            key = (name, "limit")
-            if key not in self._estop_alarms:
-                self._estop_alarms.add(key)
-                # Homing ends on the limit switch by design, and so does any
-                # axis parked there afterwards -- so this is a warning, not a
-                # stop, unless it happened while something was driving.
-                if self.motion_busy():
-                    self.trigger_estop(
-                        f"{name} reached a hard limit switch during a move")
-                else:
-                    self.session.log(f"stages: {name} is sitting on a hard limit "
-                                 f"switch")
-        else:
-            self._estop_alarms.discard((name, "error"))
-            self._estop_alarms.discard((name, "limit"))
 
     def refresh_stage_table(self):
         """Position and state per stage, off the DLL's own polling cache."""
@@ -1683,7 +1486,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 snap = st.snapshot()
             except ostage.StageError:
                 continue
-            self._stage_watchdog(snap)
+            self.motion.watchdog(snap)
             # Before opening, all the bus can say is "APT Stepper Motor
             # Controller"; the actual model only arrives with the settings.
             if snap["model"] and self.stage_table.item(r, 1).text() != snap["model"]:
@@ -1748,12 +1551,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_scan_start(self):
         if self.session.stages is None:
             return
-        if self.motion_busy():
+        if self.motion.busy():
             return
-        if self._estop_reason is not None:
+        if self.motion.latched:
             QtWidgets.QMessageBox.warning(
                 self, "Field map",
-                f"The emergency stop is latched: {self._estop_reason}.\n\n"
+                f"The emergency stop is latched: {self.motion.reason}.\n\n"
                 f"Reset it before starting a map.")
             return
         try:
@@ -1832,7 +1635,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scan_worker.progress.connect(self.on_scan_progress)
         self._scan_worker.done.connect(self.on_scan_done)
         self._scan_t0 = time.time()
-        self.register_motion_worker(self._scan_worker)
+        self.motion.register(self._scan_worker)
         self._scan_worker.start()
         self._sync_stage_controls()
 
@@ -1852,11 +1655,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.session.log("field map: stopping after the point in flight")
 
     def on_scan_done(self, fm, error):
-        self.retire_motion_worker(self._scan_worker)
+        self.motion.retire(self._scan_worker)
         self.btn_scan_abort.setEnabled(False)
         self.act_snapshot.setEnabled(True)
         self.bar_scan.setFormat("%v / %m")
-        if self._estop_reason is None:
+        if not self.motion.latched:
             self.lbl_state.setText("disconnected")
         self._sync_stage_controls()
         if error:
@@ -2926,7 +2729,7 @@ class MainWindow(QtWidgets.QMainWindow):
                   f"worst {self.session.lag.max_ms:.0f} ms -- {self.session.lag.verdict()}")
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
-        if self.motion_busy():
+        if self.motion.busy():
             # Ask before walking away from a moving machine. Closing used to
             # go straight through to stages.close(), which does not stop
             # anything -- the move is already in the controller and it runs to
@@ -2945,9 +2748,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.StandardButton.Close:
                 ev.ignore()
                 return
-            self.trigger_estop("the window was closed while a job was running")
+            self.motion.trigger("the window was closed while a job was running")
         for w in [*self._motion_workers, self._stage_worker]:
-            if _is_running(w):
+            if is_running(w):
                 # Bounded: a worker wedged inside a DLL call must not stop the
                 # window closing, or the only way out is Task Manager -- which
                 # is the one exit that leaves the stages held and moving.

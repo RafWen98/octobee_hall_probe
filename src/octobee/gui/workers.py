@@ -179,21 +179,6 @@ def _stage_set_for(mapping):
         home_order=ostage.load_home_order(axes=mapping))
 
 
-def _is_running(worker):
-    """True if this worker thread is alive.
-
-    Tolerates None and a C++ object Qt has already deleted underneath us --
-    both are "not running", and this is called from the stop path, which is
-    the last place that should be able to raise.
-    """
-    if worker is None:
-        return False
-    try:
-        return bool(worker.isRunning())
-    except RuntimeError:
-        return False
-
-
 class StageWorker(QtCore.QThread):
     """
     Run one blocking stage operation off the GUI thread.
