@@ -112,7 +112,7 @@ class MagnetWizard(QtWidgets.QDialog):
         self.txt.setMaximumHeight(250)
         lay.addWidget(self.txt)
 
-        names = list(win.stages.names) if win.stages else ["y"]
+        names = list(win.session.stages.names) if win.session.stages else ["y"]
 
         # ---- which run this is ---------------------------------------------
         # A named choice rather than "set these two axis boxes and hope",
@@ -145,7 +145,7 @@ class MagnetWizard(QtWidgets.QDialog):
             "The axis the tube lies along. The whole argument for this "
             "routine is that every sensor passes the magnet at the same "
             "approach, which is only true along the tube axis.")
-        span, step = omag.suggested_sweep(win.geom)
+        span, step = omag.suggested_sweep(win.session.geom)
         self.spin_span = QtWidgets.QDoubleSpinBox()
         self.spin_span.setRange(10.0, 300.0)
         self.spin_span.setValue(span)
@@ -457,7 +457,7 @@ class MagnetWizard(QtWidgets.QDialog):
     def _positions(self):
         start = self._start_mm
         if start is None:
-            start = self.win.stages[self.cmb_axis.currentText()].position_mm
+            start = self.win.session.stages[self.cmb_axis.currentText()].position_mm
         return oscan.parse_axis_spec(
             f"{start}:{start + self.spin_span.value()}:{self.spin_step.value()}")
 
@@ -534,7 +534,7 @@ class MagnetWizard(QtWidgets.QDialog):
 
     def _check_travel(self, name, lo_off, hi_off, park):
         """True if [park+lo_off, park+hi_off] fits in this axis's envelope."""
-        st = self.win.stages[name]
+        st = self.win.session.stages[name]
         # limit_mm, not travel_mm: this is the check that decides whether a
         # 40-minute unattended run is about to drive the head somewhere, so it
         # has to be against what the axis is allowed to use, not against the
@@ -556,7 +556,7 @@ class MagnetWizard(QtWidgets.QDialog):
 
     def start_pose(self):
         win = self.win
-        if win.stages is None:
+        if win.session.stages is None:
             QtWidgets.QMessageBox.warning(
                 self, "Guided magnet calibration",
                 "The stages are not connected. This routine drives the head "
@@ -606,10 +606,10 @@ class MagnetWizard(QtWidgets.QDialog):
                 f"Reset it before driving the head.")
             return
         for name in (axis, across, normal):
-            if name and not win.stages[name].position_trusted:
+            if name and not win.session.stages[name].position_trusted:
                 QtWidgets.QMessageBox.warning(
                     self, "Guided magnet calibration",
-                    f"Axis {name}: {win.stages[name].distrust_reason}.\n\n"
+                    f"Axis {name}: {win.session.stages[name].distrust_reason}.\n\n"
                     f"Where it says it is and where it is are unrelated. The "
                     f"peaks would still line up with each other, but nothing "
                     f"else could be compared with them afterwards. Home it "
@@ -621,8 +621,8 @@ class MagnetWizard(QtWidgets.QDialog):
         # fixed magnet, so re-reading the stage each time would let a nudged
         # axis redefine the origin halfway through without saying so.
         if self._start_mm is None:
-            self._start_mm = win.stages[axis].position_mm
-            self._park = {n: win.stages[n].position_mm
+            self._start_mm = win.session.stages[axis].position_mm
+            self._park = {n: win.session.stages[n].position_mm
                           for n in (across, normal) if n}
         if not self._check_travel(axis, 0.0, self.spin_span.value(),
                                   self._start_mm):
@@ -699,29 +699,29 @@ class MagnetWizard(QtWidgets.QDialog):
             self._released = True
             if win.act_record.isChecked():
                 win.act_record.setChecked(False)
-            if isinstance(win.source, LiveSource):
-                win.source.stop()
-            win.source = None
+            if isinstance(win.session.source, LiveSource):
+                win.session.source.stop()
+            win.session.source = None
             win.lbl_state.setText("guided magnet calibration in progress...")
-        restore = win.prev_clkdiv if first else {}
+        restore = win.session.prev_clkdiv if first else {}
         if first:
-            win.prev_clkdiv = {}
+            win.session.prev_clkdiv = {}
 
         self.bar.setRange(0, len(grid))
         self.bar.setValue(0)
         self.bar.setFormat("%v / %m")
         self._t0 = time.time()
-        self._worker = ScanWorker(win.hosts, win.stages, grid,
-                                  self.spin_secs.value(), win.cal,
+        self._worker = ScanWorker(win.session.hosts, win.session.stages, grid,
+                                  self.spin_secs.value(), win.session.cal,
                                   self.spin_settle.value(), restore)
-        self._worker.message.connect(win.log.log)
+        self._worker.message.connect(win.session.log)
         self._worker.progress.connect(self.on_progress)
         self._worker.done.connect(self.on_pass_done)
         # Without this the main window's stop button does not know this thread
         # exists, and stopping the axes mid-pass would leave it to carry on to
         # the next one -- see MainWindow.register_motion_worker.
         win.register_motion_worker(self._worker)
-        win.log.log(f"guided magnet calibration: pose {len(self.run) + 1} of "
+        win.session.log(f"guided magnet calibration: pose {len(self.run) + 1} of "
                     f"{omag.N_POSES}, {PASS_NAMES[kind]}, {len(grid)} points "
                     f"-- {grid.describe()}")
         self._worker.start()
@@ -777,14 +777,14 @@ class MagnetWizard(QtWidgets.QDialog):
             # dither. Without this the stop would end one pass and immediately
             # start the next, which is not what anyone pressing it meant, and
             # the pose would be built out of half a sweep.
-            self.win.log.log("guided magnet calibration: stopped by the "
+            self.win.session.log("guided magnet calibration: stopped by the "
                              "emergency stop — this pose is abandoned")
             self._pending = None
             self._rings = None
             self._refresh()
             return
         if error:
-            self.win.log.log(f"guided magnet calibration: {error}")
+            self.win.session.log(f"guided magnet calibration: {error}")
             QtWidgets.QMessageBox.warning(self, "Guided magnet calibration",
                                           error)
             self._refresh()
@@ -797,7 +797,7 @@ class MagnetWizard(QtWidgets.QDialog):
         if kind == "locate":
             self._pending = self._sweep_from(fm, pose)
             self._rings = omag.ring_positions(self._pending)
-            self.win.log.log(
+            self.win.session.log(
                 "guided magnet calibration: rings at "
                 + ", ".join(f"{v:.1f}" for v in self._rings) + " mm")
             if self._across_name():
@@ -828,28 +828,28 @@ class MagnetWizard(QtWidgets.QDialog):
             d = d[np.isfinite(d)]
             extra = (f", standoff {np.mean(d):.1f} mm" if len(d)
                      else ", standoff not fittable -- try a longer average")
-        self.win.log.log(
+        self.win.session.log(
             f"guided magnet calibration: pose {len(self.run)} done, loudest "
             f"S{loud} at {peaks.max():.3f} mT{extra}")
-        self.report.setPlainText(self.run.report(self.win.geom))
+        self.report.setPlainText(self.run.report(self.win.session.geom))
         self._refresh()
 
     # ---- finishing -------------------------------------------------------
     def finish(self):
         win = self.win
-        base = os.path.join(win.out_dir,
+        base = os.path.join(win.session.out_dir,
                             time.strftime("magcal_%Y%m%d_%H%M%S"))
         path = self.run.save(base)
-        win.log.log(f"guided magnet calibration: saved {path}")
+        win.session.log(f"guided magnet calibration: saved {path}")
         # Said before the trim is touched, because it decides what the trim
         # is worth: opposite faces that disagree mean part of it is geometry.
-        balance = self.run.face_balance(win.geom)
+        balance = self.run.face_balance(win.session.geom)
         for note in balance["notes"]:
-            win.log.log(f"guided magnet calibration: {note}")
+            win.session.log(f"guided magnet calibration: {note}")
 
         if self.chk_apply.isChecked():
             resp, _best = self.run.response()
-            _corr, skipped = win.cal.cross_calibrate(resp)
+            _corr, skipped = win.session.cal.cross_calibrate(resp)
             note = (f"kept their previous trim: {', '.join(skipped)}"
                     if skipped else "every live sensor trimmed")
             passes = ["axial"]
@@ -857,13 +857,13 @@ class MagnetWizard(QtWidgets.QDialog):
                 passes.append("plane")
             if any(s.dithers for s in self.run.sweeps):
                 passes.append("standoff dither")
-            win.cal.notes = (f"gain trim from the guided magnet run of "
+            win.session.cal.notes = (f"gain trim from the guided magnet run of "
                              f"{time.strftime('%Y-%m-%d %H:%M')} "
                              f"({os.path.basename(path)}); passes: "
                              f"{', '.join(passes)}; no geometry weighting -- "
                              f"every sensor was measured at its own peak")
-            cal_path = win.cal.save(win.args.calibration)
-            win.log.log(f"gain trim applied from the guided run "
+            cal_path = win.session.cal.save(win.session.args.calibration)
+            win.session.log(f"gain trim applied from the guided run "
                         f"(no geometry weighting needed); {note} -> "
                         f"{cal_path}")
             win._calibration_changed("the gain trim")
@@ -879,13 +879,13 @@ class MagnetWizard(QtWidgets.QDialog):
                       "the face-to-face part of the trim that is carrying "
                       "geometry as well as gain.")
         else:
-            win.log.log(f"gain trim NOT applied. The run is on disk at {path} "
+            win.session.log(f"gain trim NOT applied. The run is on disk at {path} "
                         f"and nothing about it is lost -- it can be applied "
                         f"later without repeating the measurement.")
-        notes = self.run.check_geometry(win.geom)
+        notes = self.run.check_geometry(win.session.geom)
         if notes:
             self.offer_geometry_update(notes)
-        win.log.log("guided magnet calibration: the carriers are still off "
+        win.session.log("guided magnet calibration: the carriers are still off "
                     "the live stream — press Connect to go back to live.")
         self._finished = True
         self.btn_primary.setEnabled(False)
@@ -911,9 +911,9 @@ class MagnetWizard(QtWidgets.QDialog):
                 + f"\n\nIt cannot say what the right answer is, though: "
                   f"{exc}\n\nNothing has been changed.")
             return
-        diff = [(sid, win.geom.slot(sid), slot)
+        diff = [(sid, win.session.geom.slot(sid), slot)
                 for sid, slot in sorted(slots.items())
-                if win.geom.slot(sid) != slot]
+                if win.session.geom.slot(sid) != slot]
         if not diff:
             return
         box = QtWidgets.QMessageBox(self)
@@ -936,11 +936,11 @@ class MagnetWizard(QtWidgets.QDialog):
                       QtWidgets.QMessageBox.ButtonRole.RejectRole)
         box.exec()
         if box.clickedButton() is not write:
-            win.log.log("guided magnet calibration: geometry left as it was")
+            win.session.log("guided magnet calibration: geometry left as it was")
             return
-        changed = self.run.apply_to_geometry(win.geom)
-        path = win.geom.save(win.args.geometry)
-        win.log.log("geometry updated from the magnet run: "
+        changed = self.run.apply_to_geometry(win.session.geom)
+        path = win.session.geom.save(win.session.args.geometry)
+        win.session.log("geometry updated from the magnet run: "
                     + ", ".join(f"S{sid} slot {was}->{now}"
                                 for sid, was, now in changed)
                     + f" -> {path}")
@@ -986,7 +986,7 @@ class MagnetWizard(QtWidgets.QDialog):
             if reply != QtWidgets.QMessageBox.StandardButton.Discard:
                 event.ignore()
                 return
-            self.win.log.log(f"guided magnet calibration: {len(self.run)} "
+            self.win.session.log(f"guided magnet calibration: {len(self.run)} "
                              f"unsaved pose(s) discarded")
         super().closeEvent(event)
 

@@ -34,7 +34,6 @@ from collections import deque
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee import help as ohelp
@@ -61,6 +60,7 @@ from octobee.gui.constants import (
 )
 from octobee.gui.dialogs.magnet import MagnetWizard
 from octobee.gui.rolling import Rolling
+from octobee.gui.session import Session
 from octobee.gui.sources import DemoSource, LiveSource, ReplaySource
 from octobee.gui.widgets.log import LogPane
 from octobee.gui.widgets.plot import LivePlot
@@ -82,71 +82,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self, args):
         super().__init__()
-        self.args = args
-        self.hosts = list(args.uut) if args.uut else list(ob.DEFAULT_UUTS)
-        self.out_dir = getattr(args, "out_dir", None) or paths.captures_dir()
-        # Collected rather than logged: the log pane does not exist yet, and a
-        # config that failed to parse is the first thing the user must be told.
-        self._config_errors = []
-        self.geom = pgeom.Geometry.load_or_default(
-            args.geometry, on_error=self._config_errors.append)
-        self.cal = ocal.Calibration.load_or_default(
-            args.calibration, on_error=self._config_errors.append)
-        # "Present and readable", not merely "present" -- a file that exists
-        # and failed to parse must not be reported as loaded.
-        self.cal_from_file = (os.path.exists(args.calibration)
-                              and not self._config_errors)
-        # The machine the probe is measuring inside: which coils, which of them
-        # are live, and where the head sits among them. Loaded before the UI so
-        # the tab opens showing the last session's placement rather than the
-        # origin -- a pose is measured with a tape, and re-entering it every
-        # morning is how it drifts.
-        self.machine = omach.MachineConfig.load_or_default(
-            args.machine, on_error=self._config_errors.append)
-        self.coils = omach.CoilSet.load_or_none(
-            self.machine.coil_file, on_error=self._config_errors.append)
-        for lost in self.machine.adopt(self.coils):
-            self._config_errors.append(f"{args.machine}: {lost}")
-        self._probe_cloud = None
-        self._machine_key = None
-        self._machine_quiet = False
-        self._machine_travel_taken = False
-        self.source = None
-        self.prev_clkdiv = {}
-        self.out_rate = 500.0
+        self.session = Session(args)
+
+        # ---- this window's own state ---------------------------------------
+        # Everything below belongs to the window or to exactly one of its tabs.
+        # What more than one tab reads lives on the session above.
         self.window_s = 20.0
-        self.roll = Rolling(int(self.out_rate * self.window_s))
+        self.session.roll = Rolling(int(self.session.out_rate * self.window_s))
         self.raw_hist = None
         self.raw_hist_n = 0
-        self.csv_rec = None
-        self.raw_rec = None
-        self.collecting = None          # 'tare' | 'magnet' | 'sweep'
-        self.sweeps = {}                # tag -> opc.RollSweep
-        self.pose_solution = None
-        self.magnet_peaks = None
-        self.last_health = None
+        self.paused = False
+        self._draw_ms = 0.0
         self._last_table = None
         self._last_health_t = 0.0
         self._last_dropped = 0
-        self.paused = False
-        self._draw_ms = 0.0
-        self.prof = oprof.Profiler(enabled=bool(getattr(args, "profile", False)))
-        self.lag = oprof.LagMonitor(interval_ms=100)
+        self._machine_key = None
+        self._machine_quiet = False
+        self._machine_travel_taken = False
         self._connect_worker = None
         self._snap_worker = None
-        self.stages = None
+        self._connect_was_automatic = False
+        self._connecting = False
         self.stage_combos = {}
         self._stage_pending = None
         self._stage_worker = None
         self._magnet_wizard = None
-        self._connect_was_automatic = False
-        self._connecting = False
         self._scan_worker = None
         self._scan_t0 = 0.0
-        # Every thread that can command motion, and the latch that overrides
-        # all of them. Set before _build_ui: the toolbar's stop button and the
-        # Esc shortcut are live from the moment the window exists, and both
-        # read these.
+
         self._motion_workers = []
         self._retired_workers = []
         self._estop_reason = None
@@ -173,7 +136,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Asks for exactly 100 ms and records how late it actually gets it.
         # That difference is the honest measure of "is the app blocked".
         self.lag_timer = QtCore.QTimer(self)
-        self.lag_timer.timeout.connect(self.lag.tick)
+        self.lag_timer.timeout.connect(self.session.lag.tick)
         self.lag_timer.start(100)
         self.prof_timer = QtCore.QTimer(self)
         self.prof_timer.timeout.connect(self.refresh_profile)
@@ -190,25 +153,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stage_timer.timeout.connect(self.refresh_machine)
         self.stage_timer.start(200)
 
-        for msg in self._config_errors:
-            self.log.log(f"WARNING: {msg}")
+        for msg in self.session.config_errors:
+            self.session.log(f"WARNING: {msg}")
 
-        if self.coils is not None:
-            self.log.log(f"coil set: {self.coils.note} — "
-                         f"{self.machine.coil_file}")
-            self.log.log("machine: " + self.machine.energised_summary(self.coils))
-            self.machine_view.set_coils(self.coils, self.machine.coil_radius_mm,
-                                        self.machine.energised)
+        if self.session.coils is not None:
+            self.session.log(f"coil set: {self.session.coils.note} — "
+                         f"{self.session.machine.coil_file}")
+            self.session.log("machine: " + self.session.machine.energised_summary(self.session.coils))
+            self.machine_view.set_coils(self.session.coils, self.session.machine.coil_radius_mm,
+                                        self.session.machine.energised)
             self.machine_view.reset_camera()
         self._refresh_machine_controls()
         self.refresh_machine(force=True)
 
         if args.demo:
-            self._set_source(DemoSource(self.geom), "demo")
+            self._set_source(DemoSource(self.session.geom), "demo")
         elif args.replay:
             self._set_source(ReplaySource(args.replay), f"replay {args.replay}")
         elif getattr(args, "no_connect", False):
-            self.log.log("ready -- press Connect to take over the stream from "
+            self.session.log("ready -- press Connect to take over the stream from "
                          "Phoebus and start reading both carriers")
         else:
             # Deferred rather than called here: connecting wants a running
@@ -216,22 +179,22 @@ class MainWindow(QtWidgets.QMainWindow):
             # inside show(). A few hundred milliseconds also means the window
             # is painted before the first "connecting..." line arrives, so a
             # slow carrier looks like a slow connect rather than a slow start.
-            self.log.log("connecting automatically -- run with --no-connect "
+            self.session.log("connecting automatically -- run with --no-connect "
                          "to start disconnected")
             QtCore.QTimer.singleShot(300, self._auto_connect)
         self._report_calibration_source()
 
     def _report_calibration_source(self):
-        if self.cal_from_file:
-            self.log.log(f"calibration loaded from {self.args.calibration}: "
-                         + self.cal.summary().replace("\n", "; "))
-            if self.cal.notes:
-                first = self.cal.notes.split(". ")[0]
-                self.log.log(f"  {first}. (full note in "
-                             f"{self.args.calibration})")
+        if self.session.cal_from_file:
+            self.session.log(f"calibration loaded from {self.session.args.calibration}: "
+                         + self.session.cal.summary().replace("\n", "; "))
+            if self.session.cal.notes:
+                first = self.session.cal.notes.split(". ")[0]
+                self.session.log(f"  {first}. (full note in "
+                             f"{self.session.args.calibration})")
         else:
-            self.log.log(
-                f"no {self.args.calibration} found -- using built-in defaults, "
+            self.session.log(
+                f"no {self.session.args.calibration} found -- using built-in defaults, "
                 f"which put every sensor on +/-20 mT / 63 V/T. That matches "
                 f"the probe as audited on 2026-08-19, when all 16 chips were "
                 f"harmonised to gain 3000, but nothing here checks it at run "
@@ -243,15 +206,18 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- construction ----------------------------------------------------
     def _build_ui(self):
         self._build_toolbar()
-        self.log = LogPane()
+        self.log_pane = LogPane()
+        # Everything that wants to say what it did goes through the
+        # session from here on; nothing else needs the widget.
+        self.session.attach_log(self.log_pane)
 
-        self.view3d = ProbeView3D(self.geom, profiler=self.prof)
-        self.machine_view = MachineView3D(self.geom, profiler=self.prof)
-        self.bars = SensorBars(profiler=self.prof)
-        self.plot = LivePlot(self.geom, profiler=self.prof)
-        self.table = SensorTable(self.geom)
+        self.view3d = ProbeView3D(self.session.geom, profiler=self.session.prof)
+        self.machine_view = MachineView3D(self.session.geom, profiler=self.session.prof)
+        self.bars = SensorBars(profiler=self.session.prof)
+        self.plot = LivePlot(self.session.geom, profiler=self.session.prof)
+        self.table = SensorTable(self.session.geom)
         self.table.range_changed.connect(self.on_range_changed)
-        self.table.set_ranges(self.cal.ranges_mt)
+        self.table.set_ranges(self.session.cal.ranges_mt)
 
         left = QtWidgets.QTabWidget()
         left.addTab(self._live_tab(), "Live")
@@ -262,7 +228,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addTab(self._machine_tab(), "Machine")
         left.addTab(self._export_tab(), "Data output")
         left.addTab(self._profile_tab(), "Profile")
-        left.addTab(self.log, "Log")
+        left.addTab(self.log_pane, "Log")
         left.addTab(self._help_tab(), "Help")
         left.setCurrentIndex(0)
         self.tabs = left
@@ -775,7 +741,7 @@ class MainWindow(QtWidgets.QMainWindow):
             b.clicked.connect(slot)
             f4.addWidget(b)
         self.chk_vcm = QtWidgets.QCheckBox("subtract VCM")
-        self.chk_vcm.setChecked(self.cal.subtract_vcm)
+        self.chk_vcm.setChecked(self.session.cal.subtract_vcm)
         self.chk_vcm.setToolTip(
             "Each chip's own virtual ground. The 16 differ by up to ~90 mV, "
             "which is ~1.4 mT of fake field at the 20 mT range. Leave this on.")
@@ -1166,7 +1132,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             serials = ostage.list_devices()
         except ostage.StageError as exc:
-            self.log.log(f"stages: {exc}")
+            self.session.log(f"stages: {exc}")
             if not quiet:
                 QtWidgets.QMessageBox.warning(self, "Stages", str(exc))
             return False
@@ -1175,7 +1141,7 @@ class MainWindow(QtWidgets.QMainWindow):
                    "and holds all of them — close it and try again."
                    if ostage.kinesis_is_running() else
                    "No stages on the bus. Check power and USB.")
-            self.log.log(f"stages: {msg}")
+            self.session.log(f"stages: {msg}")
             if not quiet:
                 QtWidgets.QMessageBox.warning(self, "Stages", msg)
             return False
@@ -1192,7 +1158,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 desc = ostage.device_info(s)["description"]
             except ostage.StageError as exc:
                 desc = "—"
-                self.log.log(f"stages: {s} description unavailable ({exc})")
+                self.session.log(f"stages: {s} description unavailable ({exc})")
             self.stage_table.setItem(r, 0, QtWidgets.QTableWidgetItem(s))
             self.stage_table.setItem(r, 1, QtWidgets.QTableWidgetItem(desc))
             combo = QtWidgets.QComboBox()
@@ -1210,10 +1176,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # whole table twitch.
         for col, width in ((0, 90), (1, 90), (2, 70), (3, 120)):
             self.stage_table.setColumnWidth(col, width)
-        self.log.log(f"stages: found {len(serials)} controller(s): "
+        self.session.log(f"stages: found {len(serials)} controller(s): "
                      f"{', '.join(serials)}")
         if not saved:
-            self.log.log(
+            self.session.log(
                 "stages: no axis map yet. Assign x/y/z in the table — the "
                 "software cannot work out which stage is which physical "
                 "direction, and guessing would silently transpose the "
@@ -1243,7 +1209,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Axis map", "Assign at least one axis first.")
             return
         ostage.save_axis_map(mapping)
-        self.log.log(f"stages: wrote {ostage.AXIS_CONFIG} — "
+        self.session.log(f"stages: wrote {ostage.AXIS_CONFIG} — "
                      + ", ".join(f"{k}={v}" for k, v in mapping.items()))
 
     def on_stage_connect(self):
@@ -1267,7 +1233,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # and mirror every map taken from this window.
         stages = _stage_set_for(mapping)
         self.btn_stage_connect.setEnabled(False)
-        self.log.log("stages: opening " + ", ".join(
+        self.session.log("stages: opening " + ", ".join(
             f"{k}={v}" for k, v in mapping.items()))
 
         def work(emit):
@@ -1292,26 +1258,26 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, "Stages", "A field map is running. Abort it first.")
             return
-        if self.stages is not None:
-            self.stages.close()
-            self.stages = None
+        if self.session.stages is not None:
+            self.session.stages.close()
+            self.session.stages = None
         self._set_stage_controls_enabled(False)
         for r in range(self.stage_table.rowCount()):
             self.stage_table.setItem(r, 3, QtWidgets.QTableWidgetItem("—"))
             self.stage_table.setItem(r, 4, QtWidgets.QTableWidgetItem("closed"))
-        self.log.log("stages: closed")
+        self.session.log("stages: closed")
 
     def _stage_action(self, what, fn):
         """Run one blocking stage command in a worker, one at a time."""
         if self._estop_reason is not None:
-            self.log.log(f"stages: {what} refused — emergency stop is latched "
+            self.session.log(f"stages: {what} refused — emergency stop is latched "
                          f"({self._estop_reason}). Reset it first.")
             return
         if self.motion_busy():
-            self.log.log("stages: busy — wait for the current move to finish")
+            self.session.log("stages: busy — wait for the current move to finish")
             return
         self._stage_worker = StageWorker(what, fn)
-        self._stage_worker.progress.connect(self.log.log)
+        self._stage_worker.progress.connect(self.session.log)
         self._stage_worker.done.connect(self.on_stage_action_done)
         self.register_motion_worker(self._stage_worker)
         self._stage_worker.start()
@@ -1320,7 +1286,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_stage_action_done(self, what, error):
         self.retire_motion_worker(self._stage_worker)
         if error:
-            self.log.log(f"stages: {what} failed — {error}")
+            self.session.log(f"stages: {what} failed — {error}")
             if what == "connect":
                 self._stage_pending = None
                 self.btn_stage_connect.setEnabled(True)
@@ -1334,48 +1300,48 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Stages", error)
             return
         if what == "connect":
-            self.stages = self._stage_pending
+            self.session.stages = self._stage_pending
             self._stage_pending = None
             if self._estop_reason is not None:
                 # Latched while disconnected, or latched and then reconnected
                 # to clear it. Neither may release the machine: the interlock
                 # belongs to the rig, not to whichever StageSet object happens
                 # to be alive.
-                self.stages.interlock.trip(self._estop_reason)
-                self.log.log("stages: connected, but motion stays latched off "
+                self.session.stages.interlock.trip(self._estop_reason)
+                self.session.log("stages: connected, but motion stays latched off "
                              f"— {self._estop_reason}")
             for ax, row in self.stage_rows.items():
-                have = ax in self.stages.names
+                have = ax in self.session.stages.names
                 row["present"] = have
                 if have:
                     # The soft limit, not the travel: a spin box that offers a
                     # number the axis is not allowed to go to is an invitation
                     # to find that out by pressing Go.
-                    lo, hi = self.stages[ax].limit_mm
+                    lo, hi = self.session.stages[ax].limit_mm
                     row["target"].setRange(lo, hi)
             self._set_stage_controls_enabled(True)
             for ax, row in self.scan_rows.items():
-                have = ax in self.stages.names
+                have = ax in self.session.stages.names
                 row["chk"].setEnabled(have)
                 if not have:
                     row["chk"].setChecked(False)
                 else:
-                    lo, hi = self.stages[ax].limit_mm
+                    lo, hi = self.session.stages[ax].limit_mm
                     for sp in row["spins"][:2]:     # start and stop, not step
                         sp.setRange(lo, hi)
                 for sp in row["spins"]:
                     sp.setEnabled(have)
-            vel, acc = next(iter(self.stages)).vel_params
+            vel, acc = next(iter(self.session.stages)).vel_params
             self.spin_stage_vel.setValue(vel)
             self.spin_stage_acc.setValue(acc)
-            self.log.log(f"stages: connected — {vel:.3g} mm/s, "
+            self.session.log(f"stages: connected — {vel:.3g} mm/s, "
                          f"{acc:.3g} mm/s² profile")
             self._report_stage_envelope()
             # Deferred: this opens a modal, and doing that from inside a
             # worker's completion signal blocks the thread's own teardown.
             QtCore.QTimer.singleShot(0, self._prompt_home_if_needed)
         else:
-            self.log.log(f"stages: {what} done")
+            self.session.log(f"stages: {what} done")
         self._sync_stage_controls()
 
     def _report_stage_envelope(self):
@@ -1387,11 +1353,11 @@ class MainWindow(QtWidgets.QMainWindow):
         it at connect is the cheapest place to put that.
         """
         bare, whole = [], []
-        for name in self.stages.names:
-            st = self.stages[name]
+        for name in self.session.stages.names:
+            st = self.session.stages[name]
             lo, hi = st.limit_mm
             if st.limit_mm != st.travel_mm:
-                self.log.log(f"stages: {name} may use {lo:g}..{hi:g} mm "
+                self.session.log(f"stages: {name} may use {lo:g}..{hi:g} mm "
                              f"(soft limit inside {st.travel_mm[0]:g}.."
                              f"{st.travel_mm[1]:g} mm of travel)")
             elif st.limit_declared:
@@ -1403,17 +1369,17 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 bare.append(name)
         if whole:
-            self.log.log(f"stages: {', '.join(whole)} may use their whole "
+            self.session.log(f"stages: {', '.join(whole)} may use their whole "
                          f"travel — declared in {ostage.AXIS_CONFIG}, not "
                          f"merely unset")
         if bare:
-            self.log.log(
+            self.session.log(
                 f"stages: {', '.join(bare)} have NO soft limit — the whole "
                 f"travel is allowed, and the only thing that will stop the "
                 f"head short of the fixture is the limit switch. Set "
                 f'"limit_mm" per axis in {ostage.AXIS_CONFIG}.')
-        self.log.log("stages: home order "
-                     + " → ".join(self.stages.home_sequence()))
+        self.session.log("stages: home order "
+                     + " → ".join(self.session.stages.home_sequence()))
 
     def _update_peak_label(self):
         """Say what the current profile means for the step sizes in the boxes.
@@ -1432,31 +1398,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_stage_speed(self):
         """Apply the profile to every open axis, and remember it."""
-        if self.stages is None:
+        if self.session.stages is None:
             return
         vel = self.spin_stage_vel.value()
         acc = self.spin_stage_acc.value()
 
         def apply(emit):
-            for st in self.stages:
+            for st in self.session.stages:
                 st.set_vel_params(vel, acc)
             ostage.save_axis_motion(velocity_mm_s=vel, accel_mm_s2=acc)
             emit(f"stages: {vel:g} mm/s, {acc:g} mm/s² on "
-                 f"{', '.join(self.stages.names)} — saved to stages.json")
+                 f"{', '.join(self.session.stages.names)} — saved to stages.json")
 
         self._stage_action("set motion profile", apply)
 
     def on_stage_jog(self, axis, delta):
-        if self.stages is None or axis not in self.stages.names:
+        if self.session.stages is None or axis not in self.session.stages.names:
             return
-        st = self.stages[axis]
+        st = self.session.stages[axis]
         self._stage_action(f"jog {axis} {delta:+g} mm",
                            lambda emit: st.move_by(delta))
 
     def on_stage_goto(self, axis, mm):
-        if self.stages is None or axis not in self.stages.names:
+        if self.session.stages is None or axis not in self.session.stages.names:
             return
-        st = self.stages[axis]
+        st = self.session.stages[axis]
         if not st.position_trusted:
             QtWidgets.QMessageBox.warning(
                 self, "Position cannot be trusted",
@@ -1470,12 +1436,12 @@ class MainWindow(QtWidgets.QMainWindow):
                            lambda emit: st.move_to(mm))
 
     def on_stage_home(self, axes):
-        if self.stages is None:
+        if self.session.stages is None:
             return
-        wanted = set(axes or self.stages.names)
+        wanted = set(axes or self.session.stages.names)
         # Ordered even for a subset: home_sequence() is the order that is safe
         # on this rig, and "the two axes you happened to tick" is not.
-        names = [n for n in self.stages.home_sequence() if n in wanted]
+        names = [n for n in self.session.stages.home_sequence() if n in wanted]
         if not names:
             return
         one_at_a_time = ("" if len(names) == 1 else
@@ -1492,7 +1458,7 @@ class MainWindow(QtWidgets.QMainWindow):
             | QtWidgets.QMessageBox.StandardButton.Cancel,
             QtWidgets.QMessageBox.StandardButton.Cancel)
         if reply != QtWidgets.QMessageBox.StandardButton.Yes:
-            self.log.log("stages: homing cancelled")
+            self.session.log("stages: homing cancelled")
             return
         self._home_axes(names)
 
@@ -1505,7 +1471,7 @@ class MainWindow(QtWidgets.QMainWindow):
         which one happens to be slower, and that is not a property anything
         here can check. See StageSet.home_all.
         """
-        stages = [self.stages[n] for n in names]
+        stages = [self.session.stages[n] for n in names]
 
         def work(emit):
             for st in stages:
@@ -1534,12 +1500,12 @@ class MainWindow(QtWidgets.QMainWindow):
         with the probe head and its cable dress mounted; only the person in
         the room can say that is clear.
         """
-        if self.stages is None:
+        if self.session.stages is None:
             return
-        unhomed = [n for n in self.stages.names
-                   if not self.stages[n].position_trusted]
+        unhomed = [n for n in self.session.stages.names
+                   if not self.session.stages[n].position_trusted]
         if not unhomed:
-            self.log.log("stages: every axis is already referenced")
+            self.session.log("stages: every axis is already referenced")
             return
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
@@ -1557,9 +1523,9 @@ class MainWindow(QtWidgets.QMainWindow):
         box.addButton("Not yet", QtWidgets.QMessageBox.ButtonRole.RejectRole)
         box.exec()
         if box.clickedButton() is yes:
-            self._home_axes(self.stages.names)
+            self._home_axes(self.session.stages.names)
         else:
-            self.log.log(f"stages: {', '.join(unhomed)} left unreferenced — "
+            self.session.log(f"stages: {', '.join(unhomed)} left unreferenced — "
                          f"home from the Stages tab before mapping")
 
     # ---- stopping -------------------------------------------------------
@@ -1636,29 +1602,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if not already:
             self._estop_reason = reason
         errors = []
-        if self.stages is not None:
+        if self.session.stages is not None:
             try:
-                errors = self.stages.emergency_stop(reason)
+                errors = self.session.stages.emergency_stop(reason)
             except Exception as exc:
                 errors = [f"{type(exc).__name__}: {exc}"]
         stopped = self._abort_motion_workers()
         self._refresh_estop_ui()
         if already:
-            self.log.log(f"EMERGENCY STOP (again) — already latched: "
+            self.session.log(f"EMERGENCY STOP (again) — already latched: "
                          f"{self._estop_reason}")
             return
-        self.log.log(f"*** EMERGENCY STOP — {reason} ***")
-        if self.stages is None:
-            self.log.log("  the stages are not connected here; nothing to "
+        self.session.log(f"*** EMERGENCY STOP — {reason} ***")
+        if self.session.stages is None:
+            self.session.log("  the stages are not connected here; nothing to "
                          "stop over USB. If something is moving, cut power "
                          "to the controllers.")
         else:
-            self.log.log(f"  {', '.join(self.stages.names)}: immediate stop, "
+            self.session.log(f"  {', '.join(self.session.stages.names)}: immediate stop, "
                          f"all further motion refused until reset")
         if stopped:
-            self.log.log(f"  {stopped} running job(s) aborted")
+            self.session.log(f"  {stopped} running job(s) aborted")
         for e in errors:
-            self.log.log(f"  STOP FAILED on {e} — CUT POWER TO THE "
+            self.session.log(f"  STOP FAILED on {e} — CUT POWER TO THE "
                          f"CONTROLLERS IF ANYTHING IS STILL MOVING")
         if errors:
             QtWidgets.QMessageBox.critical(
@@ -1673,7 +1639,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Clear the latch, after saying what is still not true afterwards."""
         if self._estop_reason is None:
             return
-        lost = self.stages.untrusted() if self.stages is not None else []
+        lost = self.session.stages.untrusted() if self.session.stages is not None else []
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
         box.setWindowTitle("Reset the emergency stop")
@@ -1695,11 +1661,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         was = self._estop_reason
         self._estop_reason = None
-        if self.stages is not None:
-            _, lost = self.stages.reset_interlock()
-        self.log.log(f"emergency stop reset (was: {was}) — motion allowed")
+        if self.session.stages is not None:
+            _, lost = self.session.stages.reset_interlock()
+        self.session.log(f"emergency stop reset (was: {was}) — motion allowed")
         for name, why in lost:
-            self.log.log(f"  {name}: absolute moves still refused — {why}")
+            self.session.log(f"  {name}: absolute moves still refused — {why}")
         self._refresh_estop_ui()
 
     def _refresh_estop_ui(self):
@@ -1735,7 +1701,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if it were its own, and the map would carry on being written with
         every remaining point taken somewhere other than where it says.
         """
-        live = (self.stages is not None and self._estop_reason is None
+        live = (self.session.stages is not None and self._estop_reason is None
                 and not self.motion_busy())
         for row in self.stage_rows.values():
             for wdg in row["widgets"]:
@@ -1744,7 +1710,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stage_speed.setEnabled(live)
         self.btn_scan_start.setEnabled(live)
         # Stopping stays available in every state that is not "no stages".
-        self.btn_stage_stop.setEnabled(self.stages is not None)
+        self.btn_stage_stop.setEnabled(self.session.stages is not None)
 
     def on_stage_stop(self):
         """End the move in progress, without latching the machine off.
@@ -1760,15 +1726,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         stopped = self._abort_motion_workers()
         if stopped:
-            self.log.log(f"stages: {stopped} running job(s) will stop after "
+            self.session.log(f"stages: {stopped} running job(s) will stop after "
                          f"the point in flight")
-        if self.stages is None:
+        if self.session.stages is None:
             return
         try:
-            self.stages.stop_all()
-            self.log.log("stages: stopped")
+            self.session.stages.stop_all()
+            self.session.log("stages: stopped")
         except ostage.StageError as exc:
-            self.log.log(f"stages: stop failed — {exc}")
+            self.session.log(f"stages: stop failed — {exc}")
 
     def _stage_watchdog(self, snap):
         """One axis in trouble stops the whole machine.
@@ -1805,7 +1771,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.trigger_estop(
                         f"{name} reached a hard limit switch during a move")
                 else:
-                    self.log.log(f"stages: {name} is sitting on a hard limit "
+                    self.session.log(f"stages: {name} is sitting on a hard limit "
                                  f"switch")
         else:
             self._estop_alarms.discard((name, "error"))
@@ -1813,9 +1779,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def refresh_stage_table(self):
         """Position and state per stage, off the DLL's own polling cache."""
-        if self.stages is None or not self.stage_table.rowCount():
+        if self.session.stages is None or not self.stage_table.rowCount():
             return
-        by_serial = {st.serial: st for st in self.stages}
+        by_serial = {st.serial: st for st in self.session.stages}
         for r in range(self.stage_table.rowCount()):
             item = self.stage_table.item(r, 0)
             st = by_serial.get(item.text() if item else None)
@@ -1888,7 +1854,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{total / 60:.0f} min ({total / 3600:.1f} h) at {per:.1f} s/point")
 
     def on_scan_start(self):
-        if self.stages is None:
+        if self.session.stages is None:
             return
         if self.motion_busy():
             return
@@ -1903,8 +1869,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Field map", str(exc))
             return
-        unhomed = [(n, self.stages[n].distrust_reason) for n in grid.names
-                   if not self.stages[n].position_trusted]
+        unhomed = [(n, self.session.stages[n].distrust_reason) for n in grid.names
+                   if not self.session.stages[n].position_trusted]
         if unhomed:
             QtWidgets.QMessageBox.warning(
                 self, "Field map",
@@ -1917,7 +1883,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # a point failure two hours in.
         outside = []
         for name, pts in grid.axes.items():
-            lo, hi = self.stages[name].limit_mm
+            lo, hi = self.session.stages[name].limit_mm
             first, last = float(min(pts)), float(max(pts))
             if not (lo <= first and last <= hi):
                 outside.append(f"{name}: asks for {first:g}..{last:g} mm, "
@@ -1949,9 +1915,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
-        if isinstance(self.source, LiveSource):
-            self.source.stop()
-        self.source = None
+        if isinstance(self.session.source, LiveSource):
+            self.session.source.stop()
+        self.session.source = None
         self.lbl_state.setText("field map in progress...")
         self.bar_scan.setRange(0, n)
         self.bar_scan.setValue(0)
@@ -1959,18 +1925,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_snapshot.setEnabled(False)
 
         self._scan_worker = ScanWorker(
-            self.hosts, self.stages, grid, self.spin_scan_s.value(),
-            self.cal, self.spin_scan_settle.value(), self.prev_clkdiv,
+            self.session.hosts, self.session.stages, grid, self.spin_scan_s.value(),
+            self.session.cal, self.spin_scan_settle.value(), self.session.prev_clkdiv,
             # Which coils were on, at what current, and where the probe was
             # bolted. None of it can be recovered from the numbers later, and
             # a map without it is a table of vectors at nowhere in particular.
-            extra_meta={"machine": self.machine.to_scan_meta(
-                self.coils, self._machine_stage_mm(ignore_tracking=True))})
+            extra_meta={"machine": self.session.machine.to_scan_meta(
+                self.session.coils, self._machine_stage_mm(ignore_tracking=True))})
         # As with the snapshot: the worker restores the clock itself, so
         # clearing this now means a failed scan cannot leave a stale value
         # for disconnect to apply on top.
-        self.prev_clkdiv = {}
-        self._scan_worker.message.connect(self.log.log)
+        self.session.prev_clkdiv = {}
+        self._scan_worker.message.connect(self.session.log)
         self._scan_worker.progress.connect(self.on_scan_progress)
         self._scan_worker.done.connect(self.on_scan_done)
         self._scan_t0 = time.time()
@@ -1985,13 +1951,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bar_scan.setFormat(f"%v / %m — {eta / 60:.0f} min left")
         self.lbl_state.setText(f"field map {i}/{n}: {where}")
         if i == 1 or i % 10 == 0 or i == n:
-            self.log.log(f"  point {i}/{n} at {where}: noise {sem_ut:.3f} uT")
+            self.session.log(f"  point {i}/{n} at {where}: noise {sem_ut:.3f} uT")
 
     def on_scan_abort(self):
         if self._scan_worker is not None and self._scan_worker.isRunning():
             self._scan_worker.abort()
             self.btn_scan_abort.setEnabled(False)
-            self.log.log("field map: stopping after the point in flight")
+            self.session.log("field map: stopping after the point in flight")
 
     def on_scan_done(self, fm, error):
         self.retire_motion_worker(self._scan_worker)
@@ -2002,18 +1968,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_state.setText("disconnected")
         self._sync_stage_controls()
         if error:
-            self.log.log(f"field map failed: {error}")
+            self.session.log(f"field map failed: {error}")
             QtWidgets.QMessageBox.warning(self, "Field map", error)
         if fm is None or not len(fm):
             return
         path = fm.save(os.path.join(
-            self.out_dir, time.strftime("fieldmap_%Y%m%d_%H%M%S")))
+            self.session.out_dir, time.strftime("fieldmap_%Y%m%d_%H%M%S")))
         sem = np.array([s.get("sem_ut", np.nan) for s in fm.stats])
-        self.log.log(
+        self.session.log(
             f"field map: {len(fm)} of {fm.meta['n_requested']} points, "
             f"noise median {np.nanmedian(sem):.3f} uT / worst "
             f"{np.nanmax(sem):.3f} uT -> {path}")
-        self.log.log("field map: the carriers are still off the live stream — "
+        self.session.log("field map: the carriers are still off the live stream — "
                      "press Connect to go back to the live view.")
 
     # ---- the machine around the probe ------------------------------------
@@ -2052,7 +2018,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---- 1. the coil set ----
         g1 = QtWidgets.QGroupBox("1. Coil set")
         f1 = QtWidgets.QGridLayout(g1)
-        self.ed_coil_file = QtWidgets.QLineEdit(self.machine.coil_file)
+        self.ed_coil_file = QtWidgets.QLineEdit(self.session.machine.coil_file)
         self.ed_coil_file.setPlaceholderText(
             "a simsopt configuration file, e.g. designA_after_scaled.json")
         btn_browse = QtWidgets.QPushButton("Browse…")
@@ -2073,7 +2039,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_coil_radius.setRange(0.5, 500.0)
         self.spin_coil_radius.setDecimals(1)
         self.spin_coil_radius.setSuffix(" mm")
-        self.spin_coil_radius.setValue(self.machine.coil_radius_mm)
+        self.spin_coil_radius.setValue(self.session.machine.coil_radius_mm)
         self.spin_coil_radius.setToolTip(
             "The circular cross-section swept along each coil centreline — "
             "the volume the probe cannot enter. A simsopt file has no such "
@@ -2101,7 +2067,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_coil_scale.setRange(-1000.0, 1000.0)
         self.spin_coil_scale.setDecimals(5)
         self.spin_coil_scale.setSingleStep(0.01)
-        self.spin_coil_scale.setValue(self.machine.current_scale)
+        self.spin_coil_scale.setValue(self.session.machine.current_scale)
         self.spin_coil_scale.setToolTip(
             "Every current in the chosen configuration is multiplied by this. "
             "The file's numbers are the design point in amp-turns; a bench "
@@ -2154,7 +2120,7 @@ class MainWindow(QtWidgets.QMainWindow):
             spin.setRange(lo, hi)
             spin.setDecimals(1)
             spin.setSuffix(suffix)
-            spin.setValue(getattr(self.machine.pose, attr))
+            spin.setValue(getattr(self.session.machine.pose, attr))
             spin.valueChanged.connect(self.on_machine_pose_edited)
             f3.addWidget(QtWidgets.QLabel(label), row * 2, col)
             f3.addWidget(spin, row * 2 + 1, col)
@@ -2167,7 +2133,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "probe round the machine whatever pitch and roll are set to.")
 
         self.chk_track_stage = QtWidgets.QCheckBox("follow the stages")
-        self.chk_track_stage.setChecked(self.machine.track_stage)
+        self.chk_track_stage.setChecked(self.session.machine.track_stage)
         self.chk_track_stage.setToolTip(
             "Add the live stage reading to the pose, so the drawn head moves "
             "as the rig does. Off, the drawing stays where it was put — which "
@@ -2196,7 +2162,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         row = QtWidgets.QHBoxLayout()
         btn_save = QtWidgets.QPushButton("Save placement")
-        btn_save.setToolTip(f"Writes all of this to {self.args.machine}, so "
+        btn_save.setToolTip(f"Writes all of this to {self.session.args.machine}, so "
                             f"the next session opens where this one left off.")
         btn_save.clicked.connect(self.on_machine_save)
         btn_fit = QtWidgets.QPushButton("Fit machine")
@@ -2206,7 +2172,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self.machine_view.reset_camera())   # noqa: PLW0108
         btn_zoom = QtWidgets.QPushButton("Zoom to probe")
         btn_zoom.clicked.connect(
-            lambda: self.machine_view.look_at_probe(self.machine.pose,
+            lambda: self.machine_view.look_at_probe(self.session.machine.pose,
                                                     self._machine_stage_mm()))
         for b in (btn_save, btn_fit, btn_zoom):
             row.addWidget(b)
@@ -2222,7 +2188,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "being unbolted and moved.")
         chk_reach.toggled.connect(
             lambda on: self.machine_view.set_reach_visible(on,
-                                                           self.machine.pose))
+                                                           self.session.machine.pose))
         chk_names = QtWidgets.QCheckBox("coil labels")
         chk_names.setChecked(True)
         chk_names.toggled.connect(self.machine_view.set_labels_visible)
@@ -2274,21 +2240,21 @@ class MainWindow(QtWidgets.QMainWindow):
         problems = []
         coils = omach.CoilSet.load_or_none(path, on_error=problems.append)
         for msg in problems:
-            self.log.log(f"WARNING: {msg}")
+            self.session.log(f"WARNING: {msg}")
         if coils is None:
             if not quiet:
                 QtWidgets.QMessageBox.warning(
                     self, "Coil set", "\n\n".join(problems)
                     or f"{path} could not be read.")
             return
-        self.coils = coils
-        self.machine.coil_file = path
-        for lost in self.machine.adopt(coils):
-            self.log.log(f"coil set: {lost}")
-        self.log.log(f"coil set: {coils.note} — {path}")
+        self.session.coils = coils
+        self.session.machine.coil_file = path
+        for lost in self.session.machine.adopt(coils):
+            self.session.log(f"coil set: {lost}")
+        self.session.log(f"coil set: {coils.note} — {path}")
         self._refresh_machine_controls()
-        self.machine_view.set_coils(coils, self.machine.coil_radius_mm,
-                                    self.machine.energised)
+        self.machine_view.set_coils(coils, self.session.machine.coil_radius_mm,
+                                    self.session.machine.energised)
         self.machine_view.reset_camera()
         self.refresh_machine(force=True)
 
@@ -2296,15 +2262,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """Push the config into the widgets without echoing back out again."""
         self._machine_quiet = True
         try:
-            self.ed_coil_file.setText(self.machine.coil_file)
+            self.ed_coil_file.setText(self.session.machine.coil_file)
             self.cmb_coil_config.clear()
-            if self.coils is not None:
-                self.cmb_coil_config.addItems(self.coils.configurations)
-                if self.machine.configuration in self.coils.configurations:
+            if self.session.coils is not None:
+                self.cmb_coil_config.addItems(self.session.coils.configurations)
+                if self.session.machine.configuration in self.session.coils.configurations:
                     self.cmb_coil_config.setCurrentIndex(
-                        self.coils.configurations.index(
-                            self.machine.configuration))
-                self.lbl_coil_summary.setText(self.coils.note)
+                        self.session.coils.configurations.index(
+                            self.session.machine.configuration))
+                self.lbl_coil_summary.setText(self.session.coils.note)
             else:
                 self.lbl_coil_summary.setText("no coil set loaded")
             self._fill_coil_table()
@@ -2312,44 +2278,44 @@ class MainWindow(QtWidgets.QMainWindow):
             self._machine_quiet = False
 
     def _fill_coil_table(self):
-        rows = list(self.coils) if self.coils is not None else []
+        rows = list(self.session.coils) if self.session.coils is not None else []
         self.tbl_coils.setRowCount(len(rows))
         for r, coil in enumerate(rows):
             name = QtWidgets.QTableWidgetItem(coil.label)
             name.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable
                           | QtCore.Qt.ItemFlag.ItemIsEnabled)
             name.setCheckState(
-                QtCore.Qt.CheckState.Checked if self.machine.is_on(coil.label)
+                QtCore.Qt.CheckState.Checked if self.session.machine.is_on(coil.label)
                 else QtCore.Qt.CheckState.Unchecked)
             name.setData(QtCore.Qt.ItemDataRole.UserRole, coil.label)
             self.tbl_coils.setItem(r, 0, name)
-            amps = self.machine.current(coil)
+            amps = self.session.machine.current(coil)
             cells = (coil.where(),
                      f"{amps:+,.0f}" if abs(amps) < 10000 else
                      f"{amps / 1000:+,.2f} k",
                      coil.description)
             for c, text in enumerate(cells, start=1):
                 item = QtWidgets.QTableWidgetItem(text)
-                if not self.machine.is_on(coil.label):
+                if not self.session.machine.is_on(coil.label):
                     item.setForeground(QtGui.QColor("#6a7182"))
                 self.tbl_coils.setItem(r, c, item)
         self.tbl_coils.resizeColumnsToContents()
 
     def on_machine_config(self, _index):
-        if self._machine_quiet or self.coils is None:
+        if self._machine_quiet or self.session.coils is None:
             return
-        self.machine.configuration = self.cmb_coil_config.currentText()
+        self.session.machine.configuration = self.cmb_coil_config.currentText()
         self._machine_quiet = True
         try:
             self._fill_coil_table()
         finally:
             self._machine_quiet = False
-        self.log.log("coil set: " + self.machine.energised_summary(self.coils))
+        self.session.log("coil set: " + self.session.machine.energised_summary(self.session.coils))
 
     def on_machine_scale(self, value):
         if self._machine_quiet:
             return
-        self.machine.current_scale = float(value)
+        self.session.machine.current_scale = float(value)
         self._machine_quiet = True
         try:
             self._fill_coil_table()
@@ -2361,37 +2327,37 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         label = item.data(QtCore.Qt.ItemDataRole.UserRole)
         on = item.checkState() == QtCore.Qt.CheckState.Checked
-        energised = [c for c in (self.machine.energised or []) if c != label]
+        energised = [c for c in (self.session.machine.energised or []) if c != label]
         if on:
             energised.append(label)
         # Keep the file's own order, so the list in machine.json reads the same
         # way the table does however the boxes were clicked.
-        order = self.coils.labels if self.coils is not None else energised
-        self.machine.energised = [c for c in order if c in energised]
-        self.machine_view.set_energised(self.machine.energised)
+        order = self.session.coils.labels if self.session.coils is not None else energised
+        self.session.machine.energised = [c for c in order if c in energised]
+        self.machine_view.set_energised(self.session.machine.energised)
         self._machine_quiet = True
         try:
             self._fill_coil_table()
         finally:
             self._machine_quiet = False
-        self.log.log("coil set: " + self.machine.energised_summary(self.coils))
+        self.session.log("coil set: " + self.session.machine.energised_summary(self.session.coils))
 
     def on_machine_all(self, on):
-        if self.coils is None:
+        if self.session.coils is None:
             return
-        self.machine.energised = list(self.coils.labels) if on else []
-        self.machine_view.set_energised(self.machine.energised)
+        self.session.machine.energised = list(self.session.coils.labels) if on else []
+        self.machine_view.set_energised(self.session.machine.energised)
         self._machine_quiet = True
         try:
             self._fill_coil_table()
         finally:
             self._machine_quiet = False
-        self.log.log("coil set: " + self.machine.energised_summary(self.coils))
+        self.session.log("coil set: " + self.session.machine.energised_summary(self.session.coils))
 
     def on_machine_radius(self, value):
         if self._machine_quiet:
             return
-        self.machine.coil_radius_mm = float(value)
+        self.session.machine.coil_radius_mm = float(value)
         self.machine_view.set_radius(value)
         self.refresh_machine(force=True)
 
@@ -2400,11 +2366,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._machine_quiet:
             return
         for attr, spin in self.machine_pose_spins.items():
-            setattr(self.machine.pose, attr, float(spin.value()))
+            setattr(self.session.machine.pose, attr, float(spin.value()))
         self.refresh_machine(force=True)
 
     def on_machine_track(self, on):
-        self.machine.track_stage = bool(on)
+        self.session.machine.track_stage = bool(on)
         self.refresh_machine(force=True)
 
     def on_machine_zero_stage(self):
@@ -2415,18 +2381,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 "The stages are not connected, so there is no reading to "
                 "take. Connect them in the Stages tab first.")
             return
-        self.machine.pose.stage_zero_mm.update(
+        self.session.machine.pose.stage_zero_mm.update(
             {ax: float(v) for ax, v in stage.items()})
-        self.log.log("machine: stage zero taken at "
+        self.session.log("machine: stage zero taken at "
                      + ", ".join(f"{k}={v:.3f} mm"
                                  for k, v in sorted(stage.items())))
         self.refresh_machine(force=True)
 
     def on_machine_save(self):
-        path = self.machine.save(self.args.machine)
-        self.log.log(f"machine: placement written to {path} — "
-                     + self.machine.pose.describe())
-        self.log.log("machine: " + self.machine.energised_summary(self.coils))
+        path = self.session.machine.save(self.session.args.machine)
+        self.session.log(f"machine: placement written to {path} — "
+                     + self.session.machine.pose.describe())
+        self.session.log("machine: " + self.session.machine.energised_summary(self.session.coils))
 
     def _machine_stage_mm(self, ignore_tracking=False):
         """The live stage reading, or None if there is nothing to read.
@@ -2436,13 +2402,13 @@ class MainWindow(QtWidgets.QMainWindow):
         rig would hide exactly the situation someone is trying to understand.
         The label says so.
         """
-        if self.stages is None:
+        if self.session.stages is None:
             return None
-        if not (ignore_tracking or self.machine.track_stage):
+        if not (ignore_tracking or self.session.machine.track_stage):
             return None
         out = {}
-        for name in self.stages.names:
-            st = self.stages[name]
+        for name in self.session.stages.names:
+            st = self.session.stages[name]
             if not st.is_open:
                 continue
             try:
@@ -2453,16 +2419,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _machine_adopt_travel(self):
         """Take the stage envelope from the axes themselves, once they exist."""
-        if self.stages is None:
+        if self.session.stages is None:
             return
-        for name in self.stages.names:
+        for name in self.session.stages.names:
             if name not in omach.Placement.AXES:
                 continue
             try:
-                lo, hi = self.stages[name].limit_mm
+                lo, hi = self.session.stages[name].limit_mm
             except (ostage.StageError, TypeError, ValueError):
                 continue
-            self.machine.pose.travel_mm[name] = (float(lo), float(hi))
+            self.session.machine.pose.travel_mm[name] = (float(lo), float(hi))
 
     def refresh_machine(self, force=False):
         """Redraw the head where it is now, and re-measure the clearance.
@@ -2474,28 +2440,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "machine_view", None) is None:
             return
         stage = self._machine_stage_mm()
-        pose = self.machine.pose
+        pose = self.session.machine.pose
         key = (pose.x_mm, pose.y_mm, pose.z_mm, pose.yaw_deg, pose.pitch_deg,
-               pose.roll_deg, self.machine.coil_radius_mm,
+               pose.roll_deg, self.session.machine.coil_radius_mm,
                tuple(sorted(pose.stage_zero_mm.items())),
                None if stage is None else tuple(sorted(
                    (k, round(v, 3)) for k, v in stage.items())),
-               id(self.coils))
+               id(self.session.coils))
         if key == self._machine_key and not force:
             return
         self._machine_key = key
 
-        if self.stages is not None and not self._machine_travel_taken:
+        if self.session.stages is not None and not self._machine_travel_taken:
             self._machine_adopt_travel()
             self._machine_travel_taken = True
 
-        with self.prof.time("machine view"):
+        with self.session.prof.time("machine view"):
             self.machine_view.set_pose(pose, stage)
-            if self._probe_cloud is None:
-                self._probe_cloud = omach.probe_cloud(self.geom)
-            if self.coils is not None and len(self.coils):
-                gap = omach.clearance(pose.to_machine(self._probe_cloud, stage),
-                                      self.coils, self.machine.coil_radius_mm)
+            if self.session.probe_cloud is None:
+                self.session.probe_cloud = omach.probe_cloud(self.session.geom)
+            if self.session.coils is not None and len(self.session.coils):
+                gap = omach.clearance(pose.to_machine(self.session.probe_cloud, stage),
+                                      self.session.coils, self.session.machine.coil_radius_mm)
                 self.machine_view.set_clearance(gap)
                 self.lbl_clearance.setText(gap.text())
                 self.lbl_clearance.setStyleSheet(
@@ -2508,14 +2474,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if stage is None:
             self.lbl_machine_stage.setText(
                 "not following the stages — the head is drawn at the pose "
-                "above" if self.stages is not None
+                "above" if self.session.stages is not None
                 else "stages not connected — the head is drawn at the pose "
                      "above")
         else:
             where = ", ".join(f"{k}={stage[k]:.3f}" for k in sorted(stage))
             origin = pose.origin_mm(stage)
             untrusted = [n for n in sorted(stage)
-                         if not self.stages[n].position_trusted]
+                         if not self.session.stages[n].position_trusted]
             note = ("  (position not trusted on "
                     + ", ".join(untrusted) + " — home first)") if untrusted else ""
             self.lbl_machine_stage.setText(
@@ -2600,13 +2566,13 @@ class MainWindow(QtWidgets.QMainWindow):
         program -- to look at a saved capture, to edit a calibration -- and a
         dialog to dismiss on every launch would train you to dismiss dialogs.
         """
-        if self.source is not None:
+        if self.session.source is not None:
             return
         self._connect_was_automatic = True
         self.on_connect()
 
     def on_connect(self):
-        if self.source is not None:
+        if self.session.source is not None:
             return
         # A second attempt while the first is still in flight would start a
         # second worker against the same carriers -- and the automatic connect
@@ -2619,9 +2585,9 @@ class MainWindow(QtWidgets.QMainWindow):
         fs = float(self.cmb_rate.currentData())
         self.act_connect.setEnabled(False)
         self.lbl_state.setText("connecting...")
-        self.log.log(f"connecting to {', '.join(self.hosts)}"
+        self.session.log(f"connecting to {', '.join(self.session.hosts)}"
                      + (f", setting {fs/1000:g} kSPS" if fs else ""))
-        self._connect_worker = ConnectWorker(self.hosts, fs)
+        self._connect_worker = ConnectWorker(self.session.hosts, fs)
         self._connect_worker.done.connect(self.on_connected)
         self._connect_worker.progress.connect(self.on_connect_progress)
         self._connecting = True
@@ -2647,7 +2613,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Deliberately broad. This runs inside Connect, and the probe half
             # of the window must come up whatever the motion hardware, the
             # Kinesis install or a stale USB handle is doing.
-            self.log.log(f"stages: not connected — {type(exc).__name__}: {exc}")
+            self.session.log(f"stages: not connected — {type(exc).__name__}: {exc}")
             self._stage_pending = None
             self.btn_stage_connect.setEnabled(True)
             if not quiet:
@@ -2655,13 +2621,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
     def _connect_stages(self, quiet):
-        if self.stages is not None or self._stage_pending is not None:
+        if self.session.stages is not None or self._stage_pending is not None:
             return False
         if self._stage_worker is not None and self._stage_worker.isRunning():
             return False
         mapping = ostage.load_axis_map()
         if not mapping:
-            self.log.log(
+            self.session.log(
                 "stages: no axis map in stages.json, so nothing was connected "
                 "automatically. Assign x/y/z on the Stages tab once and every "
                 "later session picks it up.")
@@ -2671,7 +2637,7 @@ class MainWindow(QtWidgets.QMainWindow):
         missing = [ser for ser in mapping.values()
                    if ser not in (self.stage_combos or {})]
         if missing:
-            self.log.log(f"stages: {', '.join(missing)} is in stages.json but "
+            self.session.log(f"stages: {', '.join(missing)} is in stages.json but "
                          f"not on the bus — connect from the Stages tab once "
                          f"it is back")
             return False
@@ -2686,7 +2652,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Without this the window sits on "connecting..." long enough to look
         # like it has hung, which is exactly how it was first reported.
         self.lbl_state.setText(f"connecting -- {msg}")
-        self.log.log(msg)
+        self.session.log(msg)
 
     def on_connected(self, source, prev, error):
         self._connecting = False
@@ -2695,9 +2661,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_was_automatic = False
         if error:
             self.lbl_state.setText("disconnected")
-            self.log.log(f"connect failed: {error}")
+            self.session.log(f"connect failed: {error}")
             if was_automatic:
-                self.log.log(
+                self.session.log(
                     "the automatic connect is the only thing that failed -- "
                     "everything that does not need the carriers still works, "
                     "and Connect will try again")
@@ -2711,16 +2677,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 with contextlib.suppress(Exception):
                     olive.restore_rate(h, p)
             return
-        self.prev_clkdiv = prev or {}
+        self.session.prev_clkdiv = prev or {}
         self._set_source(source, "live")
 
     def _set_source(self, source, kind):
-        self.source = source
+        self.session.source = source
         # Measure the running state, not the startup: building the window and
         # bringing up the GL context stalls the loop once, and leaving that in
         # the numbers makes a healthy session look blocked.
-        self.prof.reset()
-        self.lag.reset()
+        self.session.prof.reset()
+        self.session.lag.reset()
         # counts-per-volt is read off the box, so the counts scale is only
         # known once a source exists.
         if hasattr(self, "cmb_units"):
@@ -2730,34 +2696,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_state.setText(f"{kind}: {', '.join(source.hosts)} "
                                f"@ {source.fs_hz/1000:g} kSPS")
         self._reset_buffers()
-        self.log.log(f"{kind} source running at {source.fs_hz/1000:g} kSPS, "
-                     f"decimating to {self.out_rate:g} Hz for display and CSV")
+        self.session.log(f"{kind} source running at {source.fs_hz/1000:g} kSPS, "
+                     f"decimating to {self.session.out_rate:g} Hz for display and CSV")
 
     def on_disconnect(self):
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
-        if self.source is not None:
-            self.source.stop()
-            self.source = None
+        if self.session.source is not None:
+            self.session.source.stop()
+            self.session.source = None
         # Symmetry with Connect: one button owns the whole rig. Leaving the
         # stages open would hold the USB devices against the Kinesis app and
         # against the next run of this window, which looks like a cabling
         # fault rather than a stale handle.
-        if self.stages is not None:
+        if self.session.stages is not None:
             self.on_stage_disconnect()
-        for h, p in self.prev_clkdiv.items():
+        for h, p in self.session.prev_clkdiv.items():
             try:
                 olive.restore_rate(h, p)
-                self.log.log(f"{h}: clkdiv restored to {p}")
+                self.session.log(f"{h}: clkdiv restored to {p}")
             except Exception as e:
-                self.log.log(f"{h}: could not restore clkdiv: {e}")
-        self.prev_clkdiv = {}
+                self.session.log(f"{h}: could not restore clkdiv: {e}")
+        self.session.prev_clkdiv = {}
         self.act_disconnect.setEnabled(False)
         self.act_connect.setEnabled(True)
         self.lbl_state.setText("disconnected")
 
     def _reset_buffers(self):
-        self.roll = Rolling(max(4, int(self.out_rate * self.window_s)))
+        self.session.roll = Rolling(max(4, int(self.session.out_rate * self.window_s)))
         self.raw_hist = None
         self.raw_hist_n = 0
         self._last_health_t = 0.0
@@ -2783,31 +2749,31 @@ class MainWindow(QtWidgets.QMainWindow):
         the first -- which is worse than either file alone, because nothing
         about it looks wrong.
         """
-        self.roll.clear()
+        self.session.roll.clear()
         self.view3d.reset_scale()
         if hasattr(self, "cmb_units"):
             self.on_units()
-        if self.collecting is not None and self.collecting["what"] == "magnet":
+        if self.session.collecting is not None and self.session.collecting["what"] == "magnet":
             self.btn_magnet.setChecked(False)
-            self.log.log(f"magnet pass abandoned: {what} changed mid-pass")
+            self.session.log(f"magnet pass abandoned: {what} changed mid-pass")
         self._roll_over_csv(what)
 
     def _roll_over_csv(self, what):
         """Close the CSV in progress and open a fresh one with a new header."""
-        if self.csv_rec is None:
+        if self.session.csv_rec is None:
             return
-        old = self.csv_rec
+        old = self.session.csv_rec
         rows = old.n_rows
         old.close()
-        path = orec.default_name("octobee", "csv", self.out_dir)
-        self.csv_rec = orec.CsvRecorder(
-            path, self.out_rate, self.cal, self.geom,
+        path = orec.default_name("octobee", "csv", self.session.out_dir)
+        self.session.csv_rec = orec.CsvRecorder(
+            path, self.session.out_rate, self.session.cal, self.session.geom,
             tube_frame=self.chk_tube.isChecked(),
-            meta={"hosts": ",".join(self.source.hosts) if self.source else "",
-                  "stream_rate_hz": self.source.fs_hz if self.source else 0.0,
+            meta={"hosts": ",".join(self.session.source.hosts) if self.session.source else "",
+                  "stream_rate_hz": self.session.source.fs_hz if self.session.source else 0.0,
                   "continues": os.path.basename(old.path),
                   "rolled_over_because": f"{what} changed"})
-        self.log.log(
+        self.session.log(
             f"{what} changed while recording: closed {os.path.basename(old.path)} "
             f"at {rows} rows and started {os.path.basename(path)}, so each file "
             f"matches the calibration named in its own header. The raw .bin is "
@@ -2815,46 +2781,46 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @property
     def decim(self):
-        if self.source is None:
+        if self.session.source is None:
             return 1
-        return max(1, int(round(self.source.fs_hz / self.out_rate)))
+        return max(1, int(round(self.session.source.fs_hz / self.session.out_rate)))
 
     # ---- the acquisition tick --------------------------------------------
     def on_tick(self):
-        if self.source is None:
+        if self.session.source is None:
             return
-        with self.prof.time("acquisition tick (total)"):
-            with self.prof.time("  socket read + decode"):
-                blocks = self.source.read()
+        with self.session.prof.time("acquisition tick (total)"):
+            with self.session.prof.time("  socket read + decode"):
+                blocks = self.session.source.read()
             if not blocks or blocks[0].shape[0] == 0:
-                if getattr(self.source, "error", None):
-                    self.log.log(f"stream error: {self.source.error}")
-                    self.source.error = None
+                if getattr(self.session.source, "error", None):
+                    self.session.log(f"stream error: {self.session.source.error}")
+                    self.session.source.error = None
                 return
-            self.prof.note("samples per acquisition tick", blocks[0].shape[0])
+            self.session.prof.note("samples per acquisition tick", blocks[0].shape[0])
 
-            with self.prof.time("  keep raw history"):
+            with self.session.prof.time("  keep raw history"):
                 self._keep_raw(blocks)
-            if self.raw_rec is not None:
-                with self.prof.time("  write raw file"):
-                    self.raw_rec.write(blocks)
+            if self.session.raw_rec is not None:
+                with self.session.prof.time("  write raw file"):
+                    self.session.raw_rec.write(blocks)
 
-            with self.prof.time("  counts -> tesla"):
-                grouped = ocal.assemble(blocks, self.source.vpc,
-                                        self.source.volt_offset)  # (n,16,4) V
-                b = self.cal.to_mt(grouped)                        # (n,16,3) mT
-            with self.prof.time("  decimate + buffer"):
+            with self.session.prof.time("  counts -> tesla"):
+                grouped = ocal.assemble(blocks, self.session.source.vpc,
+                                        self.session.source.volt_offset)  # (n,16,4) V
+                b = self.session.cal.to_mt(grouped)                        # (n,16,3) mT
+            with self.session.prof.time("  decimate + buffer"):
                 bd = ocal.decimate(b, self.decim)
                 if bd.shape[0] == 0:
                     return
-                self.roll.push(bd.astype(np.float32))
+                self.session.roll.push(bd.astype(np.float32))
 
-            if self.csv_rec is not None:
-                with self.prof.time("  write CSV"):
-                    self.csv_rec.write(bd)
+            if self.session.csv_rec is not None:
+                with self.session.prof.time("  write CSV"):
+                    self.session.csv_rec.write(bd)
 
-            if self.collecting is not None:
-                with self.prof.time("  magnet/tare collect"):
+            if self.session.collecting is not None:
+                with self.session.prof.time("  magnet/tare collect"):
                     self._collect_block(b, grouped)
 
     # Drawing is deliberately NOT done here. This tick has to keep draining the
@@ -2864,15 +2830,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_view_tick(self):
         """Redraw the live view. Its rate is the user's to choose."""
-        if self.source is None or self.paused:
+        if self.session.source is None or self.paused:
             return
-        recent = self.roll.view()
+        recent = self.session.roll.view()
         if recent.shape[0] < 2:
             return
         t0 = time.perf_counter()
-        with self.prof.time("view tick (total)"):
+        with self.session.prof.time("view tick (total)"):
             if self.chk_3d.isChecked():
-                with self.prof.time("  3D head: build vectors"):
+                with self.session.prof.time("  3D head: build vectors"):
                     k = min(8, recent.shape[0])
                     fs = self.view3d.update_fields(recent[-k:].mean(axis=0))
                 if (self.chk_auto.isChecked()
@@ -2880,17 +2846,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.spin_fs.blockSignals(True)
                     self.spin_fs.setValue(max(fs, 0.001))
                     self.spin_fs.blockSignals(False)
-            with self.prof.time("  live plot setData"):
-                self.plot.update_data(recent, self.out_rate)
-            with self.prof.time("  peak bars"):
+            with self.session.prof.time("  live plot setData"):
+                self.plot.update_data(recent, self.session.out_rate)
+            with self.session.prof.time("  peak bars"):
                 # Peak over a trailing half second, not the instantaneous
                 # value: a magnet passed by hand is over well inside one
                 # refresh, so sampling one point would miss most passes.
                 n = max(2, min(recent.shape[0],
-                               int(self.out_rate * self.bars.window_s)))
+                               int(self.session.out_rate * self.bars.window_s)))
                 self.bars.update_values(
                     np.linalg.norm(recent[-n:], axis=-1).max(axis=0),
-                    self.cal.dead)
+                    self.session.cal.dead)
         self._note_draw_time((time.perf_counter() - t0) * 1000.0)
 
     def _note_draw_time(self, ms):
@@ -2909,7 +2875,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._draw_ms > 0.7 * interval and interval < MAX_VIEW_INTERVAL_MS:
             new = min(MAX_VIEW_INTERVAL_MS, interval * 2)
             self.view_timer.setInterval(new)
-            self.log.log(
+            self.session.log(
                 f"a redraw is taking {self._draw_ms:.0f} ms, more than the "
                 f"{interval} ms budget -- slowing the view to "
                 f"{1000.0/new:.1f} Hz. Acquisition and recording are unaffected. "
@@ -2919,7 +2885,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _keep_raw(self, blocks):
         """Keep the last few seconds of raw counts for the health analysis."""
-        cap = int(self.source.fs_hz * RAW_HISTORY_S)
+        cap = int(self.session.source.fs_hz * RAW_HISTORY_S)
         if self.raw_hist is None:
             self.raw_hist = [deque() for _ in blocks]
         for i, blk in enumerate(blocks):
@@ -2945,7 +2911,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         if seconds is None:
             return [np.concatenate(list(d), axis=0) for d in self.raw_hist]
-        want = max(1, int(self.source.fs_hz * seconds))
+        want = max(1, int(self.session.source.fs_hz * seconds))
         out = []
         for d in self.raw_hist:
             blocks, n = [], 0
@@ -2960,9 +2926,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return out
 
     def on_slow_tick(self):
-        if self.source is None:
+        if self.session.source is None:
             return
-        recent = self.roll.view()
+        recent = self.session.roll.view()
         if recent.shape[0] < 2:
             return
 
@@ -2976,44 +2942,44 @@ class MainWindow(QtWidgets.QMainWindow):
             raw = self._raw_arrays(HEALTH_WINDOW_S)
             if raw is not None:
                 self._last_health_t = now
-                with self.prof.time("  channel health scan"):
+                with self.session.prof.time("  channel health scan"):
                     rows = ocal.channel_health(
-                        raw, self.source.vpc, self.source.hosts,
-                        self.source.volt_offset)
-                self.last_health = rows
+                        raw, self.session.source.vpc, self.session.source.hosts,
+                        self.session.source.volt_offset)
+                self.session.last_health = rows
                 if self.chk_autodead.isChecked():
                     dead = ocal.suggest_dead(rows)
-                    if dead != self.cal.dead:
-                        self.cal.dead = dead
+                    if dead != self.session.cal.dead:
+                        self.session.cal.dead = dead
                         self._mark_dead_checkboxes(dead)
                         if dead:
-                            self.log.log(
+                            self.session.log(
                                 f"excluding {', '.join(sorted(dead))}: "
                                 + "; ".join(
                                     f"{k} {v[1]}" for k, v in
                                     ocal.health_verdict(rows).items()
                                     if v[0] == "dead"))
-        if self.last_health:
-            table = orec.sensor_table(self.cal, recent.astype(np.float64),
-                                      self.last_health,
-                                      self.source.temperatures(), geom=self.geom)
+        if self.session.last_health:
+            table = orec.sensor_table(self.session.cal, recent.astype(np.float64),
+                                      self.session.last_health,
+                                      self.session.source.temperatures(), geom=self.session.geom)
             self.table.update_rows(table)
             self._last_table = table
 
-        self.plot.set_dead(self.cal.dead)
-        self.view3d.set_dead(self.cal.dead)
+        self.plot.set_dead(self.session.cal.dead)
+        self.view3d.set_dead(self.session.cal.dead)
 
         # A dropped block is a hole in whatever is being recorded, so say so
         # rather than leaving it as a number in the corner of the status bar.
-        dropped = self.source.stats().get("dropped blocks", 0)
+        dropped = self.session.source.stats().get("dropped blocks", 0)
         if dropped > self._last_dropped:
-            if self.csv_rec is not None or self.raw_rec is not None:
-                self.log.log(f"WARNING: {dropped - self._last_dropped} block(s) "
+            if self.session.csv_rec is not None or self.session.raw_rec is not None:
+                self.session.log(f"WARNING: {dropped - self._last_dropped} block(s) "
                              f"dropped while recording -- the file has a gap "
                              f"there. Lower the output rate or the stream rate.")
             self._last_dropped = dropped
 
-        st = dict(self.source.stats())
+        st = dict(self.session.source.stats())
         if self._draw_ms:
             st["draw ms"] = round(self._draw_ms, 1)
         eff = 1000.0 / max(self.view_timer.interval(), 1)
@@ -3028,14 +2994,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- collection (tare, magnet pass) ----------------------------------
     def start_collect(self, what, seconds):
-        if self.source is None:
-            self.log.log("not connected")
+        if self.session.source is None:
+            self.session.log("not connected")
             return
-        self.collecting = {"what": what, "blocks": [], "n": 0,
-                           "need": int(seconds * self.source.fs_hz),
+        self.session.collecting = {"what": what, "blocks": [], "n": 0,
+                           "need": int(seconds * self.session.source.fs_hz),
                            "peak": None, "baseline": None, "tag": None,
                            "decim": self.decim}
-        self.log.log(f"collecting {seconds:g} s for {what}...")
+        self.session.log(f"collecting {seconds:g} s for {what}...")
 
     def _collect_block(self, b, grouped=None):
         """
@@ -3050,7 +3016,7 @@ class MainWindow(QtWidgets.QMainWindow):
         Only the magnet pass, which reports a field rather than deriving a
         calibration, legitimately uses `b`.
         """
-        c = self.collecting
+        c = self.session.collecting
         if c["what"] == "magnet":
             # Deviation from the field that was there when the pass STARTED.
             # Re-deriving the baseline from the rolling window each block would
@@ -3067,7 +3033,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # hertz resolves a hand roll a thousand times over.
         if grouped is None:
             return
-        raw = self.cal.to_mt(grouped, apply_zero=False, apply_gain=False,
+        raw = self.session.cal.to_mt(grouped, apply_zero=False, apply_gain=False,
                              apply_matrix=False)
         c["blocks"].append(ocal.decimate(raw, max(1, c["decim"])))
         c["n"] += b.shape[0]
@@ -3076,7 +3042,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         data = np.concatenate(c["blocks"], axis=0)
         what, tag = c["what"], c["tag"]
-        self.collecting = None
+        self.session.collecting = None
         if what == "sweep":
             self._finish_sweep(data, tag)
         else:
@@ -3098,8 +3064,8 @@ class MainWindow(QtWidgets.QMainWindow):
         trim, silently. Collecting the uncorrected field in the first place
         means there is nothing to invert.
         """
-        z = self.cal.tare(data)
-        self.log.log(f"zeroed on {data.shape[0]} points; "
+        z = self.session.cal.tare(data)
+        self.session.log(f"zeroed on {data.shape[0]} points; "
                      f"largest offset removed {np.abs(z).max():.4f} mT "
                      f"(S{int(np.argmax(np.abs(z).max(axis=1)))+1})")
         self._calibration_changed("the zero point")
@@ -3109,28 +3075,28 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- Earth-field roll calibration ------------------------------------
     def start_sweep(self, tag, seconds):
         """Record one hand-rolled sweep in the mounting orientation `tag`."""
-        if self.source is None:
-            self.log.log("not connected")
+        if self.session.source is None:
+            self.session.log("not connected")
             return
-        fs = self.source.fs_hz
-        self.collecting = {"what": "sweep", "tag": tag, "blocks": [], "n": 0,
+        fs = self.session.source.fs_hz
+        self.session.collecting = {"what": "sweep", "tag": tag, "blocks": [], "n": 0,
                            "need": int(seconds * fs), "peak": None,
                            "baseline": None,
                            # aim for a few hundred Hz, whatever the ADC is at
                            "decim": max(1, int(fs / 200))}
-        self.log.log(f"rolling sweep {tag}: roll the tube steadily through at "
+        self.session.log(f"rolling sweep {tag}: roll the tube steadily through at "
                      f"least two full turns over the next {seconds:g} s")
 
     def _finish_sweep(self, data, tag):
         sw = opc.RollSweep(data, tag=tag,
-                           ranges_mt=self.cal.ranges_mt.copy(),
+                           ranges_mt=self.session.cal.ranges_mt.copy(),
                            temps_c=self._last_temps())
-        self.sweeps[tag] = sw
+        self.session.sweeps[tag] = sw
         amp = sw.amplitudes()
         quiet = [f"S{i+1}" for i in range(N_SENSORS)
                  if amp[i] < opc.MIN_SEED_AMPLITUDE_MT
-                 and not self.cal.is_dead(i + 1)]
-        self.log.log(f"sweep {tag}: {len(sw)} points, median transverse swing "
+                 and not self.session.cal.is_dead(i + 1)]
+        self.session.log(f"sweep {tag}: {len(sw)} points, median transverse swing "
                      f"{np.median(amp)*1e3:.2f} uT"
                      + (f"; SAW ALMOST NOTHING: {', '.join(quiet)}" if quiet else ""))
         self._refresh_sweep_label()
@@ -3140,28 +3106,28 @@ class MainWindow(QtWidgets.QMainWindow):
         return None if t is None else np.asarray(t, float)
 
     def _refresh_sweep_label(self):
-        if not self.sweeps:
+        if not self.session.sweeps:
             self.lbl_sweeps.setText("no sweeps recorded")
             self.btn_solve_roll.setEnabled(False)
             return
-        bits = [f"{t} ({len(s)} pts)" for t, s in sorted(self.sweeps.items())]
+        bits = [f"{t} ({len(s)} pts)" for t, s in sorted(self.session.sweeps.items())]
         self.lbl_sweeps.setText("recorded: " + ", ".join(bits))
         self.btn_solve_roll.setEnabled(True)
 
     def on_clear_sweeps(self):
-        self.sweeps.clear()
-        self.pose_solution = None
+        self.session.sweeps.clear()
+        self.session.pose_solution = None
         self.btn_apply_roll.setEnabled(False)
         self._refresh_sweep_label()
-        self.log.log("roll sweeps cleared")
+        self.session.log("roll sweeps cleared")
 
     def on_solve_roll(self):
-        if not self.sweeps:
+        if not self.session.sweeps:
             return
         try:
-            sol = opc.solve_roll(list(self.sweeps.values()), self.geom,
+            sol = opc.solve_roll(list(self.session.sweeps.values()), self.session.geom,
                                  self.spin_bearth.value(),
-                                 dead=sorted(self.cal.dead),
+                                 dead=sorted(self.session.cal.dead),
                                  anisotropy=("assume_isotropic"
                                              if self.chk_isotropic.isChecked()
                                              else "solve"))
@@ -3169,14 +3135,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # Deliberately not a modal. Solving is a diagnostic step you may run
             # repeatedly while getting a sweep right, and a dialog you have to
             # dismiss in the middle of a live acquisition is worse than useless.
-            self.log.log(f"roll solve failed: {e}")
+            self.session.log(f"roll solve failed: {e}")
             self.cal_report.setPlainText(f"Roll solve failed:\n\n{e}")
-            self.pose_solution = None
+            self.session.pose_solution = None
             self.btn_apply_roll.setEnabled(False)
             return
-        self.pose_solution = sol
-        ids = opc.identify_faces(sol, self.geom)
-        text = [sol.report(dead=self.cal.dead), ""]
+        self.session.pose_solution = sol
+        ids = opc.identify_faces(sol, self.session.geom)
+        text = [sol.report(dead=self.session.cal.dead), ""]
         text.append("face mapping: " + ("agrees with probe_geometry.json"
                                         if ids["agrees"] else
                                         "DISAGREES at " + ", ".join(ids["mismatch"])))
@@ -3184,12 +3150,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     "% of |B|  (a dirty spot shows up here, not in the residual)")
         self.cal_report.setPlainText("\n".join(text))
         self.btn_apply_roll.setEnabled(True)
-        self.log.log("roll solve done; review the report before applying")
+        self.session.log("roll solve done; review the report before applying")
 
     def on_apply_roll(self):
-        if self.pose_solution is None:
+        if self.session.pose_solution is None:
             return
-        sol = self.pose_solution
+        sol = self.session.pose_solution
         warn = []
         if not sol.identified[:, 2].all():
             warn.append("The axial column (chip +Y on every sensor here) was "
@@ -3211,97 +3177,97 @@ class MainWindow(QtWidgets.QMainWindow):
             if r != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
         try:
-            self.cal.apply_pose_solution(sol)
+            self.session.cal.apply_pose_solution(sol)
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Apply roll calibration", str(e))
             return
         g = sol.gains()
-        self.log.log("roll calibration applied: matrix + offsets installed, "
+        self.session.log("roll calibration applied: matrix + offsets installed, "
                      f"magnet gain trim cleared; gain spread was "
                      f"{(np.nanmax(g)-np.nanmin(g))*100:.2f} %")
-        self.chk_vcm.setChecked(self.cal.subtract_vcm)
+        self.chk_vcm.setChecked(self.session.cal.subtract_vcm)
         self._calibration_changed("the roll calibration")
         self.refresh_cal_report()
 
     def on_save_sweeps(self):
-        if not self.sweeps:
+        if not self.session.sweeps:
             return
         d = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Save roll sweeps into", self.out_dir)
+            self, "Save roll sweeps into", self.session.out_dir)
         if not d:
             return
-        for tag, sw in sorted(self.sweeps.items()):
+        for tag, sw in sorted(self.session.sweeps.items()):
             path = sw.save(os.path.join(d, f"rollsweep_{tag}"))
-            self.log.log(f"wrote {path}")
+            self.session.log(f"wrote {path}")
 
     def on_load_sweeps(self):
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Load roll sweeps", self.out_dir, "Roll sweeps (*.npz)")
+            self, "Load roll sweeps", self.session.out_dir, "Roll sweeps (*.npz)")
         for f in files:
             try:
                 sw = opc.RollSweep.load(f)
             except (OSError, ValueError, KeyError) as e:
-                self.log.log(f"could not load {f}: {e}")
+                self.session.log(f"could not load {f}: {e}")
                 continue
-            self.sweeps[sw.tag] = sw
-            self.log.log(f"loaded sweep {sw.tag} from {os.path.basename(f)}")
+            self.session.sweeps[sw.tag] = sw
+            self.session.log(f"loaded sweep {sw.tag} from {os.path.basename(f)}")
         self._refresh_sweep_label()
 
     def on_clear_tare(self):
-        self.cal.clear_tare()
-        self.log.log("zero cleared")
+        self.session.cal.clear_tare()
+        self.session.log("zero cleared")
         self._calibration_changed("the zero point")
         self.refresh_cal_report()
 
     def on_magnet_pass(self, on):
         if on:
-            if self.source is None:
+            if self.session.source is None:
                 self.btn_magnet.setChecked(False)
                 return
-            recent = self.roll.view()
+            recent = self.session.roll.view()
             if recent.shape[0] < 2:
                 self.btn_magnet.setChecked(False)
                 self.lbl_magnet.setText("no data yet -- wait a moment and retry")
                 return
             base = np.median(recent, axis=0).astype(np.float64)
-            self.collecting = {"what": "magnet", "blocks": [], "n": 0,
+            self.session.collecting = {"what": "magnet", "blocks": [], "n": 0,
                                "need": 0, "peak": None, "baseline": base,
                                "tag": None, "decim": self.decim}
             self.btn_magnet.setText("Stop magnet pass")
             self.lbl_magnet.setText("recording -- pass the magnet along the probe, "
                                     "then press stop")
         else:
-            c = self.collecting
-            self.collecting = None
+            c = self.session.collecting
+            self.session.collecting = None
             self.btn_magnet.setText("Start magnet pass")
             if not c or c.get("peak") is None:
                 self.lbl_magnet.setText("no data captured")
                 return
-            self.magnet_peaks = np.asarray(c["peak"], float)
-            live = self.cal.live_mask()
-            rep = ocal.spread_report(self.magnet_peaks, live=live)
+            self.session.magnet_peaks = np.asarray(c["peak"], float)
+            live = self.session.cal.live_mask()
+            rep = ocal.spread_report(self.session.magnet_peaks, live=live)
             n = rep.get("n_responding", 0)
             spread = rep.get("raw_spread")
             self.lbl_magnet.setText(
                 f"{n} sensors responded, peak spread "
                 f"{spread:.2f}x" if spread else f"{n} sensors responded")
             self.btn_apply_gain.setEnabled(True)
-            self.log.log("magnet pass: peak |B| per sensor = "
+            self.session.log("magnet pass: peak |B| per sensor = "
                          + ", ".join(f"S{i+1}={v:.3f}"
-                                     for i, v in enumerate(self.magnet_peaks)))
+                                     for i, v in enumerate(self.session.magnet_peaks)))
             self.refresh_cal_report()
 
     def on_apply_gain(self):
-        if self.magnet_peaks is None:
+        if self.session.magnet_peaks is None:
             return
         w = None
         if self.chk_geom.isChecked():
             pt = (self.spin_mx.value(), self.spin_my.value(), self.spin_mz.value())
-            w = self.geom.expected_response(pt, self.spin_exp.value())
-        _corr, skipped = self.cal.cross_calibrate(self.magnet_peaks, weights=w)
+            w = self.session.geom.expected_response(pt, self.spin_exp.value())
+        _corr, skipped = self.session.cal.cross_calibrate(self.session.magnet_peaks, weights=w)
         note = (f"kept their previous trim (no usable response): "
                 f"{', '.join(skipped)}") if skipped else "every live sensor trimmed"
-        self.log.log(f"gain trim applied using "
+        self.session.log(f"gain trim applied using "
                      f"{'geometry-weighted' if w is not None else 'raw'} peaks; "
                      f"{note}")
         self.lbl_magnet.setText(f"gain trim applied -- {note}")
@@ -3310,7 +3276,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_guided_magnet(self):
         """Open the guided routine, or explain what it needs first."""
-        if self.stages is None:
+        if self.session.stages is None:
             QtWidgets.QMessageBox.information(
                 self, "Guided magnet calibration",
                 "This routine drives the head past a fixed magnet, so it "
@@ -3342,51 +3308,51 @@ class MainWindow(QtWidgets.QMainWindow):
             box.setVisible(bool(on))
 
     def on_clear_gain(self):
-        self.cal.clear_gain()
-        self.log.log("gain trim cleared")
+        self.session.cal.clear_gain()
+        self.session.log("gain trim cleared")
         self._calibration_changed("the gain trim")
         self.refresh_cal_report()
 
     # ---- calibration state -----------------------------------------------
     def on_range_changed(self, row, value):
-        self.cal.ranges_mt[row] = value
-        self.log.log(f"S{row+1} range set to +/-{value:g} mT "
+        self.session.cal.ranges_mt[row] = value
+        self.session.log(f"S{row+1} range set to +/-{value:g} mT "
                      f"({ob.RANGE_TO_VPT[value]:g} V/T)")
         self._calibration_changed(f"the S{row+1} range")
         self.refresh_cal_report()
 
     def on_vcm_toggle(self, on):
-        self.cal.subtract_vcm = bool(on)
+        self.session.cal.subtract_vcm = bool(on)
         if not on:
-            self.log.log("WARNING: VCM subtraction off -- readings now include "
+            self.session.log("WARNING: VCM subtraction off -- readings now include "
                          "each chip's ~2.2 V virtual ground offset")
         self._calibration_changed("VCM subtraction")
         self.refresh_cal_report()
 
     def refresh_cal_report(self):
-        lines = [self.cal.summary(), ""]
-        z = self.cal.zero_mt
-        g = self.cal.gain_corr
+        lines = [self.session.cal.summary(), ""]
+        z = self.session.cal.zero_mt
+        g = self.session.cal.gain_corr
         lines.append(f"{'sensor':>7} {'range':>9} {'zero Bx':>9} {'zero By':>9} "
                      f"{'zero Bz':>9} {'gain trim':>10}")
         for s in range(N_SENSORS):
-            lines.append(f"{'S'+str(s+1):>7} {self.cal.ranges_mt[s]:8.0f}mT "
+            lines.append(f"{'S'+str(s+1):>7} {self.session.cal.ranges_mt[s]:8.0f}mT "
                          f"{z[s,0]:9.4f} {z[s,1]:9.4f} {z[s,2]:9.4f} "
                          f"{g[s].mean():10.4f}")
-        if self.magnet_peaks is not None:
+        if self.session.magnet_peaks is not None:
             lines += ["", "last magnet pass, peak |B| per sensor [mT]:"]
-            live = self.cal.live_mask()
+            live = self.session.cal.live_mask()
             for s in range(N_SENSORS):
                 tag = "" if live[s] else "   (excluded)"
-                lines.append(f"{'S'+str(s+1):>7} {self.magnet_peaks[s]:10.4f}{tag}")
-            rep = ocal.spread_report(self.magnet_peaks, live=live)
+                lines.append(f"{'S'+str(s+1):>7} {self.session.magnet_peaks[s]:10.4f}{tag}")
+            rep = ocal.spread_report(self.session.magnet_peaks, live=live)
             if "raw_spread" in rep:
                 lines.append(f"\nraw spread across responding sensors: "
                              f"{rep['raw_spread']:.2f}x")
             if self.chk_geom.isChecked():
                 pt = (self.spin_mx.value(), self.spin_my.value(),
                       self.spin_mz.value())
-                rep2 = ocal.spread_report(self.magnet_peaks, self.geom, pt,
+                rep2 = ocal.spread_report(self.session.magnet_peaks, self.session.geom, pt,
                                           self.spin_exp.value(), live)
                 if "corrected_spread" in rep2:
                     lines.append(
@@ -3401,11 +3367,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_save_cal(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save calibration", self.args.calibration, "JSON (*.json)")
+            self, "Save calibration", self.session.args.calibration, "JSON (*.json)")
         if path:
-            self.cal.notes = f"saved from octobee_gui {time.strftime('%Y-%m-%d %H:%M')}"
-            self.cal.save(path)
-            self.log.log(f"calibration written to {path}")
+            self.session.cal.notes = f"saved from octobee_gui {time.strftime('%Y-%m-%d %H:%M')}"
+            self.session.cal.save(path)
+            self.session.log(f"calibration written to {path}")
 
     def on_load_cal(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -3418,23 +3384,23 @@ class MainWindow(QtWidgets.QMainWindow):
             # Deliberately not load_or_default: an explicit Load that quietly
             # substituted +/-20 mT defaults would be the worst outcome here.
             # Keep the calibration already in force and say what went wrong.
-            self.log.log(f"could not load {path}: {type(exc).__name__}: {exc}")
+            self.session.log(f"could not load {path}: {type(exc).__name__}: {exc}")
             QtWidgets.QMessageBox.warning(
                 self, "Load calibration",
                 f"{path} could not be read:\n\n{type(exc).__name__}: {exc}\n\n"
                 f"The calibration already loaded is unchanged.")
             return
-        self.cal = cal
-        self.table.set_ranges(self.cal.ranges_mt)
-        self.chk_vcm.setChecked(self.cal.subtract_vcm)
+        self.session.cal = cal
+        self.table.set_ranges(self.session.cal.ranges_mt)
+        self.chk_vcm.setChecked(self.session.cal.subtract_vcm)
         self._calibration_changed("the whole calibration")
         self.refresh_cal_report()
-        self.log.log(f"calibration loaded from {path}")
+        self.session.log(f"calibration loaded from {path}")
 
     def on_edit_geometry(self):
-        path = self.args.geometry
+        path = self.session.args.geometry
         if not os.path.exists(path):
-            self.geom.save(path)
+            self.session.geom.save(path)
         QtWidgets.QMessageBox.information(
             self, "Probe geometry",
             f"The tube layout lives in:\n\n{os.path.abspath(path)}\n\n"
@@ -3444,17 +3410,17 @@ class MainWindow(QtWidgets.QMainWindow):
             f"'Reload geometry'.")
 
     def on_reload_geometry(self):
-        self.geom = pgeom.Geometry.load_or_default(self.args.geometry)
-        self.view3d.rebuild(self.geom)
+        self.session.geom = pgeom.Geometry.load_or_default(self.session.args.geometry)
+        self.view3d.rebuild(self.session.geom)
         # The body that has to clear the coils just changed shape.
-        self.machine_view.set_geometry(self.geom)
-        self._probe_cloud = None
+        self.machine_view.set_geometry(self.session.geom)
+        self.session.probe_cloud = None
         self.refresh_machine(force=True)
-        self.plot.geom = self.geom
-        self.table.refresh_geometry(self.geom)
-        if isinstance(self.source, DemoSource):
-            self.source.geom = self.geom
-        self.log.log(f"geometry reloaded from {self.args.geometry}")
+        self.plot.geom = self.session.geom
+        self.table.refresh_geometry(self.session.geom)
+        if isinstance(self.session.source, DemoSource):
+            self.session.source.geom = self.session.geom
+        self.session.log(f"geometry reloaded from {self.session.args.geometry}")
 
     # ---- diagnostics ------------------------------------------------------
     def on_health(self):
@@ -3462,14 +3428,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if raw is None:
             self.health_text.setPlainText("no data -- connect first")
             return
-        rows = ocal.channel_health(raw, self.source.vpc, self.source.hosts,
-                                   self.source.volt_offset)
-        self.last_health = rows
+        rows = ocal.channel_health(raw, self.session.source.vpc, self.session.source.hosts,
+                                   self.session.source.volt_offset)
+        self.session.last_health = rows
         verdict = ocal.health_verdict(rows)
         n = raw[0].shape[0]
-        out = [f"{n} samples per box at {self.source.fs_hz/1e3:g} kSPS "
-               f"({n/self.source.fs_hz:.2f} s), 1 count = "
-               f"{self.source.vpc[0]*1e6:.1f} uV", ""]
+        out = [f"{n} samples per box at {self.session.source.fs_hz/1e3:g} kSPS "
+               f"({n/self.session.source.fs_hz:.2f} s), 1 count = "
+               f"{self.session.source.vpc[0]*1e6:.1f} uV", ""]
         out.append(f"{'host':>13} {'ch':>3} {'signal':>9} {'mean [V]':>10} "
                    f"{'noise [counts]':>15} {'p-p':>8}  flag")
         for r in rows:
@@ -3491,7 +3457,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vs = np.array([r["mean_v"] for r in vcm])
         if vs.size:
             spread_v = vs.max() - vs.min()
-            vpt = self.cal.volts_per_tesla.mean()
+            vpt = self.session.cal.volts_per_tesla.mean()
             out.append(f"\nVCM spread across the chips: {spread_v*1e3:.1f} mV "
                        f"= {spread_v/vpt*1e3:.2f} mT of apparent field if it "
                        f"were not subtracted.")
@@ -3504,62 +3470,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setCurrentIndex(3)
 
     def on_export_health(self):
-        if not self.last_health:
+        if not self.session.last_health:
             self.on_health()
-        if not self.last_health:
+        if not self.session.last_health:
             return
-        path = orec.default_name("channel_health", "csv", self.out_dir)
-        orec.write_health_csv(path, self.last_health)
+        path = orec.default_name("channel_health", "csv", self.session.out_dir)
+        orec.write_health_csv(path, self.session.last_health)
         self._exported(path)
 
     # ---- data output ------------------------------------------------------
     def on_record(self, on):
         if on:
-            if self.source is None:
+            if self.session.source is None:
                 self.act_record.setChecked(False)
                 return
             if self.chk_csv.isChecked():
-                p = orec.default_name("octobee", "csv", self.out_dir)
-                self.csv_rec = orec.CsvRecorder(
-                    p, self.out_rate, self.cal, self.geom,
+                p = orec.default_name("octobee", "csv", self.session.out_dir)
+                self.session.csv_rec = orec.CsvRecorder(
+                    p, self.session.out_rate, self.session.cal, self.session.geom,
                     tube_frame=self.chk_tube.isChecked(),
-                    meta={"hosts": ",".join(self.source.hosts),
-                          "stream_rate_hz": self.source.fs_hz})
-                self.log.log(f"recording CSV to {p} at {self.out_rate:g} Hz")
+                    meta={"hosts": ",".join(self.session.source.hosts),
+                          "stream_rate_hz": self.session.source.fs_hz})
+                self.session.log(f"recording CSV to {p} at {self.session.out_rate:g} Hz")
             if self.chk_raw.isChecked():
-                p = orec.default_name("octobee", "bin", self.out_dir)
-                self.raw_rec = orec.RawRecorder(
-                    p, self.source.hosts, self.source.vpc,
-                    [self.source.fs_hz] * len(self.source.hosts),
-                    cal=self.cal)
-                self.log.log(f"recording raw counts to {p}")
-            if self.csv_rec is None and self.raw_rec is None:
-                self.log.log("nothing selected to record -- see the Data output tab")
+                p = orec.default_name("octobee", "bin", self.session.out_dir)
+                self.session.raw_rec = orec.RawRecorder(
+                    p, self.session.source.hosts, self.session.source.vpc,
+                    [self.session.source.fs_hz] * len(self.session.source.hosts),
+                    cal=self.session.cal)
+                self.session.log(f"recording raw counts to {p}")
+            if self.session.csv_rec is None and self.session.raw_rec is None:
+                self.session.log("nothing selected to record -- see the Data output tab")
                 self.act_record.setChecked(False)
         else:
-            for rec, kind in ((self.csv_rec, "CSV"), (self.raw_rec, "raw")):
+            for rec, kind in ((self.session.csv_rec, "CSV"), (self.session.raw_rec, "raw")):
                 if rec is not None:
                     p = rec.close()
                     size = os.path.getsize(p) / 1e6 if os.path.exists(p) else 0
                     self._exported(f"{p}  ({size:.2f} MB, {kind})")
-            self.csv_rec = None
-            self.raw_rec = None
+            self.session.csv_rec = None
+            self.session.raw_rec = None
             self.lbl_recinfo.setText("not recording")
 
     def _update_rec_label(self):
         parts = []
-        if self.csv_rec is not None:
-            parts.append(f"CSV {self.csv_rec.n_rows} rows "
-                         f"{self.csv_rec.size_bytes/1e6:.1f} MB")
-        if self.raw_rec is not None:
-            parts.append(f"raw {self.raw_rec.n_samples} samples "
-                         f"{self.raw_rec.size_bytes/1e6:.1f} MB")
+        if self.session.csv_rec is not None:
+            parts.append(f"CSV {self.session.csv_rec.n_rows} rows "
+                         f"{self.session.csv_rec.size_bytes/1e6:.1f} MB")
+        if self.session.raw_rec is not None:
+            parts.append(f"raw {self.session.raw_rec.n_samples} samples "
+                         f"{self.session.raw_rec.size_bytes/1e6:.1f} MB")
         txt = "  |  ".join(parts) if parts else ""
         self.lbl_rec.setText(("REC  " + txt) if parts else "")
         self.lbl_recinfo.setText(txt or "not recording")
 
     def on_snapshot(self):
-        if not isinstance(self.source, LiveSource):
+        if not isinstance(self.session.source, LiveSource):
             QtWidgets.QMessageBox.information(
                 self, "Snapshot",
                 "A full-rate snapshot needs the live hardware.")
@@ -3567,26 +3533,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
         secs = self.spin_snap_s.value()
-        path = orec.default_name("snapshot", "npz", self.out_dir)
-        self.log.log(f"snapshot: stopping the stream, restoring the carriers' "
+        path = orec.default_name("snapshot", "npz", self.session.out_dir)
+        self.session.log(f"snapshot: stopping the stream, restoring the carriers' "
                      f"own clock, and capturing {secs:g} s losslessly")
-        self.source.stop()
-        self.source = None
+        self.session.source.stop()
+        self.session.source = None
         self.act_snapshot.setEnabled(False)
         self.lbl_state.setText("snapshot in progress...")
-        self._snap_worker = SnapshotWorker(self.hosts, secs, path,
-                                           self.prev_clkdiv)
+        self._snap_worker = SnapshotWorker(self.session.hosts, secs, path,
+                                           self.session.prev_clkdiv)
         # The worker puts the clock back itself, so there is nothing left for
         # disconnect to restore. Clearing it here rather than on completion
         # means a failed snapshot cannot leave a stale value behind either.
-        self.prev_clkdiv = {}
+        self.session.prev_clkdiv = {}
         self._snap_worker.done.connect(self.on_snapshot_done)
         self._snap_worker.start()
 
     def on_snapshot_done(self, path, error, fs_hz):
         self.act_snapshot.setEnabled(True)
         if error:
-            self.log.log(f"snapshot failed: {error}")
+            self.session.log(f"snapshot failed: {error}")
             QtWidgets.QMessageBox.critical(self, "Snapshot failed", error)
         else:
             size = os.path.getsize(path) / 1e6
@@ -3598,46 +3564,46 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_export_summary(self):
         table = getattr(self, "_last_table", None)
         if not table:
-            self.log.log("no sensor data yet")
+            self.session.log("no sensor data yet")
             return
-        path = orec.default_name("sensor_summary", "csv", self.out_dir)
+        path = orec.default_name("sensor_summary", "csv", self.session.out_dir)
         orec.write_sensor_csv(path, table)
         self._exported(path)
 
     def on_export_json(self):
         table = getattr(self, "_last_table", None)
         if not table:
-            self.log.log("no sensor data yet")
+            self.session.log("no sensor data yet")
             return
-        live = self.cal.live_mask()
+        live = self.session.cal.live_mask()
         payload = {
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "hosts": list(self.source.hosts) if self.source else [],
-            "stream_rate_hz": self.source.fs_hz if self.source else None,
-            "output_rate_hz": self.out_rate,
-            "calibration": self.cal.to_dict(),
-            "geometry": self.geom.to_dict(),
+            "hosts": list(self.session.source.hosts) if self.session.source else [],
+            "stream_rate_hz": self.session.source.fs_hz if self.session.source else None,
+            "output_rate_hz": self.session.out_rate,
+            "calibration": self.session.cal.to_dict(),
+            "geometry": self.session.geom.to_dict(),
             "sensors": table,
-            "channel_health": self.last_health or [],
+            "channel_health": self.session.last_health or [],
         }
-        if self.magnet_peaks is not None:
+        if self.session.magnet_peaks is not None:
             payload["magnet_pass"] = {
-                "peak_absB_mT": self.magnet_peaks,
-                "spread": ocal.spread_report(self.magnet_peaks, live=live),
+                "peak_absB_mT": self.session.magnet_peaks,
+                "spread": ocal.spread_report(self.session.magnet_peaks, live=live),
             }
             if self.chk_geom.isChecked():
                 pt = [self.spin_mx.value(), self.spin_my.value(),
                       self.spin_mz.value()]
                 payload["magnet_pass"]["magnet_point_mm"] = pt
                 payload["magnet_pass"]["geometry_corrected"] = ocal.spread_report(
-                    self.magnet_peaks, self.geom, pt, self.spin_exp.value(), live)
-        path = orec.default_name("octobee_report", "json", self.out_dir)
+                    self.session.magnet_peaks, self.session.geom, pt, self.spin_exp.value(), live)
+        path = orec.default_name("octobee_report", "json", self.session.out_dir)
         orec.write_report_json(path, payload)
         self._exported(path)
 
     def _exported(self, what):
         self.export_log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {what}")
-        self.log.log(f"wrote {what}")
+        self.session.log(f"wrote {what}")
 
     # ---- misc UI ----------------------------------------------------------
     def _mark_dead_checkboxes(self, dead):
@@ -3658,7 +3624,7 @@ class MainWindow(QtWidgets.QMainWindow):
         quietly misreport half the probe.
         """
         name = self.cmb_units.currentText()
-        vpt = self.cal.volts_per_tesla                     # V/T, per sensor
+        vpt = self.session.cal.volts_per_tesla                     # V/T, per sensor
         if name == "mT":
             k = np.ones(N_SENSORS)
         elif name == "uT":
@@ -3666,8 +3632,8 @@ class MainWindow(QtWidgets.QMainWindow):
         elif name.startswith("mV"):
             k = vpt                                        # mT * V/T -> mV
         else:                                              # ADC counts
-            vpc = np.array([(self.source.vpc[0] if s < 8 else self.source.vpc[-1])
-                            if self.source else 20.0 / 65536.0
+            vpc = np.array([(self.session.source.vpc[0] if s < 8 else self.session.source.vpc[-1])
+                            if self.session.source else 20.0 / 65536.0
                             for s in range(N_SENSORS)])
             k = vpt * 1e-3 / vpc                           # mT -> volts -> counts
         self.plot.set_units(k, {"uT": "µT"}.get(name, name))
@@ -3688,7 +3654,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(w)
         top = QtWidgets.QHBoxLayout()
         self.chk_prof = QtWidgets.QCheckBox("measure where the time goes")
-        self.chk_prof.setChecked(self.prof.enabled)
+        self.chk_prof.setChecked(self.session.prof.enabled)
         self.chk_prof.setToolTip(
             "Times every stage separately, including the OpenGL paint, and "
             "watches the Qt event loop for stalls. Costs almost nothing, so it "
@@ -3712,50 +3678,50 @@ class MainWindow(QtWidgets.QMainWindow):
         return w
 
     def on_profile_toggle(self, on):
-        self.prof.enabled = bool(on)
-        self.prof.reset()
-        self.lag.reset()
-        self.log.log("profiling on" if on else "profiling off")
+        self.session.prof.enabled = bool(on)
+        self.session.prof.reset()
+        self.session.lag.reset()
+        self.session.log("profiling on" if on else "profiling off")
         self.refresh_profile()
 
     def on_profile_reset(self):
-        self.prof.reset()
-        self.lag.reset()
+        self.session.prof.reset()
+        self.session.lag.reset()
         self.refresh_profile()
 
     def refresh_profile(self):
         if not hasattr(self, "profile_text"):
             return
-        if not self.prof.enabled:
-            self.profile_text.setPlainText(self.prof.text())
+        if not self.session.prof.enabled:
+            self.profile_text.setPlainText(self.session.prof.text())
             return
         # Ask the live context what it is, once we have one. A software
         # renderer here is the single most likely explanation for a window
         # that seizes up the moment data starts arriving.
-        if "GL renderer" not in self.prof.notes and self.view3d.isVisible():
+        if "GL renderer" not in self.session.prof.notes and self.view3d.isVisible():
             info = self.view3d.gl_info()
             for k, v in info.items():
-                self.prof.note(k, v)
+                self.session.prof.note(k, v)
             if oprof.is_software_renderer(info):
-                self.prof.note("VERDICT", "no GPU acceleration -- the 3D head "
+                self.session.prof.note("VERDICT", "no GPU acceleration -- the 3D head "
                                           "is being drawn on the CPU")
-                self.log.log(
+                self.session.log(
                     f"OpenGL is running on a software renderer "
                     f"({info.get('GL renderer')}). Every repaint of the probe "
                     f"head is done on the CPU, which is almost certainly why "
                     f"the window struggles. Untick '3D' to confirm.")
-        parts = [self.prof.text(), "",
-                 f"event loop lag: mean {self.lag.mean_ms:.1f} ms, "
-                 f"worst {self.lag.max_ms:.0f} ms",
-                 f"  -> {self.lag.verdict()}"]
-        if self.source is not None:
-            st = self.source.stats()
+        parts = [self.session.prof.text(), "",
+                 f"event loop lag: mean {self.session.lag.mean_ms:.1f} ms, "
+                 f"worst {self.session.lag.max_ms:.0f} ms",
+                 f"  -> {self.session.lag.verdict()}"]
+        if self.session.source is not None:
+            st = self.session.source.stats()
             parts += ["", "stream:"]
             for k, v in st.items():
                 parts.append(f"  {k:<26} {v}")
             qs = [getattr(x, "q", None) for x in
-                  getattr(self.source, "streamers", [])]
-            for h, q in zip(getattr(self.source, "hosts", []), qs):
+                  getattr(self.session.source, "streamers", [])]
+            for h, q in zip(getattr(self.session.source, "hosts", []), qs):
                 if q is not None:
                     parts.append(f"  {h + ' reader queue':<26} {q.qsize()} blocks "
                                  f"waiting")
@@ -3773,36 +3739,36 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_3d_toggle(self, on):
         self.view3d.setVisible(bool(on))
         self._draw_ms = 0.0
-        self.log.log("3D head on" if on else
+        self.session.log("3D head on" if on else
                      "3D head off -- everything else carries on unchanged")
 
     def on_view_rate(self):
         hz = float(self.cmb_view.currentData())
         self.view_timer.setInterval(int(1000 / hz))
         self._draw_ms = 0.0
-        self.log.log(f"view redraw rate {hz:g} Hz "
+        self.session.log(f"view redraw rate {hz:g} Hz "
                      f"(acquisition and recording are unaffected)")
 
     def on_pause(self, on):
         self.paused = bool(on)
-        self.log.log("view paused -- acquisition and recording continue"
+        self.session.log("view paused -- acquisition and recording continue"
                      if on else "view resumed")
 
     def on_out_rate(self):
-        self.out_rate = float(self.cmb_out.currentData())
-        self.roll.resize(max(4, int(self.out_rate * self.window_s)))
-        self.log.log(f"output rate {self.out_rate:g} Hz "
+        self.session.out_rate = float(self.cmb_out.currentData())
+        self.session.roll.resize(max(4, int(self.session.out_rate * self.window_s)))
+        self.session.log(f"output rate {self.session.out_rate:g} Hz "
                      f"(decimation {self.decim}x from the stream)")
 
     def on_window(self, v):
         self.window_s = float(v)
-        self.roll.resize(max(4, int(self.out_rate * self.window_s)))
+        self.session.roll.resize(max(4, int(self.session.out_rate * self.window_s)))
 
     def closeEvent(self, ev):
-        if self.prof.enabled:
-            print(self.prof.text())
-            print(f"\nevent loop lag: mean {self.lag.mean_ms:.1f} ms, "
-                  f"worst {self.lag.max_ms:.0f} ms -- {self.lag.verdict()}")
+        if self.session.prof.enabled:
+            print(self.session.prof.text())
+            print(f"\nevent loop lag: mean {self.session.lag.mean_ms:.1f} ms, "
+                  f"worst {self.session.lag.max_ms:.0f} ms -- {self.session.lag.verdict()}")
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
         if self.motion_busy():
@@ -3832,11 +3798,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 # is the one exit that leaves the stages held and moving.
                 w.wait(30000)
         self.stage_timer.stop()
-        if self.stages is not None:
+        if self.session.stages is not None:
             # These are exclusive-open USB devices: leaving them held means the
             # Kinesis application will not start until this process dies.
             # close() stops each axis on the way out; see Stage.close.
-            self.stages.close()
-            self.stages = None
+            self.session.stages.close()
+            self.session.stages = None
         self.on_disconnect()
         super().closeEvent(ev)

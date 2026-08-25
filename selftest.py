@@ -1057,8 +1057,8 @@ def test_machine_tab(app, workdir):
         titles = [win.tabs.tabText(i) for i in range(win.tabs.count())]
         check("the window has a Machine tab", "Machine" in titles, str(titles))
         check("the coil file named in the placement is loaded on startup",
-              win.coils is not None and len(win.coils) == 2,
-              "nothing loaded" if win.coils is None else win.coils.note)
+              win.session.coils is not None and len(win.session.coils) == 2,
+              "nothing loaded" if win.session.coils is None else win.session.coils.note)
         check("every coil is listed", win.tbl_coils.rowCount() == 2,
               f"{win.tbl_coils.rowCount()} rows")
 
@@ -1066,14 +1066,14 @@ def test_machine_tab(app, workdir):
         item = win.tbl_coils.item(0, 0)
         item.setCheckState(QtCore.Qt.CheckState.Unchecked)
         check("unticking a coil switches it off",
-              win.machine.energised == ["C2"], str(win.machine.energised))
+              win.session.machine.energised == ["C2"], str(win.session.machine.energised))
         check("and the view is told",
               win.machine_view.energised == {"C2"},
               str(win.machine_view.energised))
 
         # A coil that is off is still solid: putting the probe on top of the
         # coil that was just switched off must still report a collision.
-        on_coil = win.coils["C1"].points_mm[0]
+        on_coil = win.session.coils["C1"].points_mm[0]
         for attr, value in zip(("x_mm", "y_mm", "z_mm"), on_coil):
             win.machine_pose_spins[attr].setValue(float(value))
         win.refresh_machine(force=True)
@@ -1095,7 +1095,7 @@ def test_machine_tab(app, workdir):
               f"{saved.pose.x_mm:.1f} mm, {saved.energised}")
 
         # What a field map would carry, built the way on_scan_start builds it.
-        meta = win.machine.to_scan_meta(win.coils, None)
+        meta = win.session.machine.to_scan_meta(win.session.coils, None)
         check("a map started now would record the machine around it",
               meta["summary"].startswith("1/2 coils energised"),
               meta["summary"])
@@ -2769,7 +2769,7 @@ def test_gui_estop(app, workdir):
 
         # With nothing connected it must still work, and still latch.
         check("the stop button is live with no stages connected",
-              win.stages is None and win.btn_estop.isEnabled())
+              win.session.stages is None and win.btn_estop.isEnabled())
         win.on_estop()
         check("stopping with nothing connected still latches",
               win._estop_reason is not None)
@@ -2784,7 +2784,7 @@ def test_gui_estop(app, workdir):
               win.btn_estop_reset.isHidden())
 
         stages = FakeSet({"x": FakeStage("x"), "y": FakeStage("y")})
-        win.stages = stages
+        win.session.stages = stages
         for ax in ("x", "y"):
             win.stage_rows[ax]["present"] = True
         win._sync_stage_controls()
@@ -2829,16 +2829,16 @@ def test_gui_estop(app, workdir):
 
         # Disconnect/reconnect must not be a back door round a latched stop.
         win.on_estop()
-        win.stages = None
+        win.session.stages = None
         win._stage_pending = FakeSet({"x": FakeStage("x")})
         win.on_stage_action_done("connect", "")
         app.processEvents()
         check("reconnecting does not release a latched stop",
-              win.stages.interlock.tripped is not None,
+              win.session.stages.interlock.tripped is not None,
               "the latch belongs to the rig, not to a StageSet object")
     finally:
         win._estop_reason = None
-        win.stages = None
+        win.session.stages = None
         win.close()
         app.processEvents()
 
@@ -2902,7 +2902,7 @@ def test_magnet_wizard_reopens(app, workdir):
         out_dir=os.path.join(workdir, "reopencaps"),
         screenshot=None, screenshot_tab=0, screenshot_warmup=0)
     win = gui.MainWindow(ns)
-    win.stages = FakeSet({"x": FakeStage("x"), "y": FakeStage("y")})
+    win.session.stages = FakeSet({"x": FakeStage("x"), "y": FakeStage("y")})
     try:
         for attempt in (1, 2, 3):
             win.on_guided_magnet()
@@ -2930,7 +2930,7 @@ def test_magnet_wizard_reopens(app, workdir):
         win.on_guided_magnet()
         app.processEvents()
         wiz = win._magnet_wizard
-        g = win.geom
+        g = win.session.geom
         for sweep in _synth_magnet_run(
                 g, np.ones(16),
                 np.array([0.0, 200.0, g.fsv_radius_mm + 25.0])).sweeps[:2]:
@@ -3031,7 +3031,7 @@ def test_magnet_wizard_saves(app, workdir):
     QtWidgets.QMessageBox.exec = lambda self: 0
     try:
         wiz = gui.MagnetWizard(win)
-        g = win.geom
+        g = win.session.geom
         rng = np.random.default_rng(19)
         gain = rng.normal(1.0, 0.07, 16)
         magnet = np.array([0.0, 200.0, g.fsv_radius_mm + 25.0])
@@ -3051,7 +3051,7 @@ def test_magnet_wizard_saves(app, workdir):
               f"trim now spans {after.gain_corr.min():.3f}.."
               f"{after.gain_corr.max():.3f} in the FILE")
         check("and the trim it wrote is the one the run measured",
-              np.allclose(after.gain_corr[:, 0], win.cal.gain_corr[:, 0]))
+              np.allclose(after.gain_corr[:, 0], win.session.cal.gain_corr[:, 0]))
         check("the file records where the trim came from",
               "guided magnet run" in (after.notes or ""), after.notes or "")
         check("and the run itself is on disk beside it",
@@ -3061,7 +3061,7 @@ def test_magnet_wizard_saves(app, workdir):
 
         # Unticked, it must leave the file alone -- and say the run is safe.
         ocal.Calibration().save(cal_path)
-        win.cal = ocal.Calibration.load(cal_path)
+        win.session.cal = ocal.Calibration.load(cal_path)
         wiz2 = gui.MagnetWizard(win)
         for sweep in _synth_magnet_run(g, gain, magnet).sweeps:
             wiz2.run.add(sweep)
@@ -3070,7 +3070,7 @@ def test_magnet_wizard_saves(app, workdir):
         check("unticked, it does not touch the calibration file",
               np.allclose(ocal.Calibration.load(cal_path).gain_corr, 1.0))
         check("and it says the measurement is still recoverable",
-              "nothing about it is lost" in win.log.toPlainText())
+              "nothing about it is lost" in win.log_pane.toPlainText())
         wiz.close()
         wiz2.close()
     finally:
@@ -3143,11 +3143,11 @@ def test_autoconnect(app, workdir):
         check("opening the window starts a connect on its own",
               len(attempts) == 1, f"{len(attempts)} attempt(s)")
         check("a failed automatic connect logs instead of raising a dialog",
-              not modals and "connect failed" in win.log.toPlainText(),
+              not modals and "connect failed" in win.log_pane.toPlainText(),
               f"{len(modals)} modal(s)")
         check("and it says the rest of the window still works",
               "everything that does not need the carriers" in
-              win.log.toPlainText())
+              win.log_pane.toPlainText())
         check("Connect is left enabled to try again",
               win.act_connect.isEnabled())
         win.close()
@@ -3172,14 +3172,14 @@ def test_autoconnect(app, workdir):
         win = build(no_connect=True)
         pump(0.6)
         check("--no-connect starts disconnected", not attempts
-              and "press Connect" in win.log.toPlainText())
+              and "press Connect" in win.log_pane.toPlainText())
         win.close()
 
         attempts.clear()
         win = build(demo=True)
         pump(0.6)
         check("a demo window does not go looking for carriers",
-              not attempts and win.source is not None)
+              not attempts and win.session.source is not None)
         win.close()
     finally:
         gui.ConnectWorker = real_worker
@@ -3212,31 +3212,31 @@ def test_app(app, args, workdir):
         print(f"  carriers found at clkdiv {clkdiv_before}")
         win.on_connect()
         deadline = time.time() + 90
-        while win.source is None and time.time() < deadline:
+        while win.session.source is None and time.time() < deadline:
             app.processEvents()
             time.sleep(0.05)
-    check("source started", win.source is not None)
-    if win.source is None:
+    check("source started", win.session.source is not None)
+    if win.session.source is None:
         return win
 
     pump(win, app, 3.0)
-    check("data is flowing", win.roll.filled > 100,
-          f"{win.roll.filled} points buffered")
+    check("data is flowing", win.session.roll.filled > 100,
+          f"{win.session.roll.filled} points buffered")
     check("sensor table populated", win._last_table is not None
           and len(win._last_table) == 16)
-    check("channel health computed", win.last_health is not None
-          and len(win.last_health) == 64)
-    check("S16 detected as dead", "S16" in win.cal.dead,
-          f"excluded: {sorted(win.cal.dead)}")
+    check("channel health computed", win.session.last_health is not None
+          and len(win.session.last_health) == 64)
+    check("S16 detected as dead", "S16" in win.session.cal.dead,
+          f"excluded: {sorted(win.session.cal.dead)}")
 
     # ---- tare ----
-    v = win.roll.view()
+    v = win.session.roll.view()
     before = np.abs(np.median(v, axis=0)).max() if v.shape[0] else float("nan")
     win.start_collect("tare", 0.5)
     pump(win, app, 2.5)
-    check("tare completed", win.collecting is None)
-    check("tare stored a non-trivial zero", np.any(win.cal.zero_mt != 0),
-          f"max |zero| {np.abs(win.cal.zero_mt).max():.4f} mT (was reading "
+    check("tare completed", win.session.collecting is None)
+    check("tare stored a non-trivial zero", np.any(win.session.cal.zero_mt != 0),
+          f"max |zero| {np.abs(win.session.cal.zero_mt).max():.4f} mT (was reading "
           f"{before:.4f} mT)")
     pump(win, app, 1.0)
 
@@ -3255,23 +3255,23 @@ def test_app(app, args, workdir):
     fixed = np.full((64, pgeom.N_SENSORS, 4), 2.2)         # volts, all at VCM
     fixed[:, :, 0] += 0.063                                # Bx = VCM + 63 mV
     for trim in (1.0, 2.0):
-        win.cal.clear_tare()
-        win.cal.clear_matrix()
-        win.cal.gain_corr = np.full((pgeom.N_SENSORS, 3), trim)
-        win.collecting = {"what": "tare", "blocks": [], "n": 0, "need": 1,
+        win.session.cal.clear_tare()
+        win.session.cal.clear_matrix()
+        win.session.cal.gain_corr = np.full((pgeom.N_SENSORS, 3), trim)
+        win.session.collecting = {"what": "tare", "blocks": [], "n": 0, "need": 1,
                           "peak": None, "baseline": None, "tag": None,
                           "decim": 1}
-        win._collect_block(win.cal.to_mt(fixed), fixed)
-        check(f"tare at trim {trim:g} completed", win.collecting is None)
-        zeros_at[trim] = win.cal.zero_mt.copy()
+        win._collect_block(win.session.cal.to_mt(fixed), fixed)
+        check(f"tare at trim {trim:g} completed", win.session.collecting is None)
+        zeros_at[trim] = win.session.cal.zero_mt.copy()
     d = float(np.abs(zeros_at[2.0] - zeros_at[1.0]).max())
     check("the stored zero does not scale with the gain trim", d < 1e-9,
           f"trim 1.0 -> {zeros_at[1.0][0]}, trim 2.0 -> {zeros_at[2.0][0]}")
     check("and it is the uncorrected field, not the corrected one",
           abs(zeros_at[1.0][0, 0] - 1.0) < 0.01,
           f"63 mV at 63 V/T should tare at 1 mT, got {zeros_at[1.0][0, 0]:.4f}")
-    win.cal.clear_gain()
-    win.cal.clear_tare()
+    win.session.cal.clear_gain()
+    win.session.cal.clear_tare()
     pump(win, app, 1.0)
 
     # ---- magnet pass ----
@@ -3279,24 +3279,24 @@ def test_app(app, args, workdir):
     pump(win, app, 4.0)
     win.btn_magnet.setChecked(False)
     app.processEvents()
-    check("magnet pass captured peaks", win.magnet_peaks is not None)
-    if win.magnet_peaks is not None:
-        live = win.cal.live_mask()
-        resp = int((win.magnet_peaks[live] > 1e-4).sum())
+    check("magnet pass captured peaks", win.session.magnet_peaks is not None)
+    if win.session.magnet_peaks is not None:
+        live = win.session.cal.live_mask()
+        resp = int((win.session.magnet_peaks[live] > 1e-4).sum())
         check("most live sensors responded", resp >= 10, f"{resp}/15 responded")
-        rep = ocal.spread_report(win.magnet_peaks, live=live)
+        rep = ocal.spread_report(win.session.magnet_peaks, live=live)
         check("spread report produced", "raw_spread" in rep,
               f"spread {rep.get('raw_spread', float('nan')):.2f}x")
 
         # ---- gain trim ----
         before_spread = rep.get("raw_spread")
         win.on_apply_gain()
-        trimmed = win.magnet_peaks * win.cal.gain_corr[:, 0]
+        trimmed = win.session.magnet_peaks * win.session.cal.gain_corr[:, 0]
         after = trimmed[live].max() / trimmed[live].min()
         check("gain trim narrows the spread", after < 1.0001,
               f"{before_spread:.2f}x -> {after:.4f}x")
         win.on_clear_gain()
-        check("gain trim clears", np.allclose(win.cal.gain_corr, 1.0))
+        check("gain trim clears", np.allclose(win.session.cal.gain_corr, 1.0))
 
     # ---- Earth-field roll calibration panel ----
     # The demo source is a moving dipole, not a uniform field being rolled
@@ -3312,49 +3312,49 @@ def test_app(app, args, workdir):
     check("solve is disabled with no sweeps recorded",
           not win.btn_solve_roll.isEnabled())
 
-    win.cal.gain_corr = np.full((pgeom.N_SENSORS, 3), 2.0)
+    win.session.cal.gain_corr = np.full((pgeom.N_SENSORS, 3), 2.0)
     for tag in ("A", "B", "C"):
         win.start_sweep(tag, 0.4)
         pump(win, app, 2.0)
-    win.cal.clear_gain()
-    check("all three sweeps recorded", set(win.sweeps) == {"A", "B", "C"},
+    win.session.cal.clear_gain()
+    check("all three sweeps recorded", set(win.session.sweeps) == {"A", "B", "C"},
           win.lbl_sweeps.text())
     check("solve enabled once sweeps exist", win.btn_solve_roll.isEnabled())
 
-    if set(win.sweeps) == {"A", "B", "C"}:
+    if set(win.session.sweeps) == {"A", "B", "C"}:
         # A sweep must be independent of whatever trim was loaded when it was
         # taken -- that is why it is captured pre-correction. The x2 gain above
         # was live during capture and must not show up in the stored data.
-        sw = win.sweeps["A"]
+        sw = win.session.sweeps["A"]
         check("sweeps are stored uncorrected",
               np.abs(sw.b_mt).max() < 1e4 and np.isfinite(sw.b_mt).all())
         check("sweeps record the range they were taken at",
               sw.ranges_mt is not None
-              and np.allclose(sw.ranges_mt, win.cal.ranges_mt))
+              and np.allclose(sw.ranges_mt, win.session.cal.ranges_mt))
 
         win.on_solve_roll()
-        check("roll solve produced a solution", win.pose_solution is not None,
-              "" if win.pose_solution is not None
+        check("roll solve produced a solution", win.session.pose_solution is not None,
+              "" if win.session.pose_solution is not None
               else " ".join(win.cal_report.toPlainText().split())[:300])
         check("apply is enabled after a solve", win.btn_apply_roll.isEnabled())
-        if win.pose_solution is not None:
-            sol = win.pose_solution
+        if win.session.pose_solution is not None:
+            sol = win.session.pose_solution
             check("solve used all three orientations",
                   sorted(sol.tags) == ["A", "B", "C"], f"{sol.tags}")
             check("report reaches the calibration pane",
                   "gain spread" in win.cal_report.toPlainText())
-            win.cal.apply_pose_solution(sol)
+            win.session.cal.apply_pose_solution(sol)
             check("applying installs the matrix and clears the trim",
-                  win.cal.has_matrix and np.allclose(win.cal.gain_corr, 1.0))
+                  win.session.cal.has_matrix and np.allclose(win.session.cal.gain_corr, 1.0))
             check("the applied calibration still converts",
-                  np.isfinite(win.cal.to_mt(
+                  np.isfinite(win.session.cal.to_mt(
                       np.full((4, pgeom.N_SENSORS, 4), 2.2))).all())
-            win.cal.clear_matrix()
-            win.cal.clear_tare()
+            win.session.cal.clear_matrix()
+            win.session.cal.clear_tare()
 
         with tempfile.TemporaryDirectory() as d:
             ok = True
-            for tag, sw in win.sweeps.items():
+            for tag, sw in win.session.sweeps.items():
                 back = opc.RollSweep.load(sw.save(os.path.join(d, f"rs_{tag}")))
                 ok &= (back.tag == tag
                        and back.b_mt.shape == sw.b_mt.shape
@@ -3363,7 +3363,7 @@ def test_app(app, args, workdir):
 
     win.on_clear_sweeps()
     check("clearing sweeps disables solve",
-          not win.sweeps and not win.btn_solve_roll.isEnabled())
+          not win.session.sweeps and not win.btn_solve_roll.isEnabled())
 
     # ---- display cannot starve acquisition ----
     win.cmb_view.setCurrentIndex(list(gui.VIEW_RATES).index(10.0))
@@ -3387,16 +3387,16 @@ def test_app(app, args, workdir):
           f"back to {win.view_timer.interval()} ms")
 
     win.chk_3d.setChecked(False)
-    before = win.roll.filled
+    before = win.session.roll.filled
     pump(win, app, 1.0)
-    check("acquisition continues with the 3D head off", win.roll.filled >= before)
+    check("acquisition continues with the 3D head off", win.session.roll.filled >= before)
     win.chk_3d.setChecked(True)
 
     win.act_pause.setChecked(True)
-    n_before = win.roll.filled
+    n_before = win.session.roll.filled
     pump(win, app, 1.0)
     check("pausing the view does not pause acquisition",
-          win.roll.filled >= n_before and win.paused)
+          win.session.roll.filled >= n_before and win.paused)
     win.act_pause.setChecked(False)
 
     # ---- recording ----
@@ -3404,14 +3404,14 @@ def test_app(app, args, workdir):
     win.chk_raw.setChecked(True)
     win.chk_tube.setChecked(False)
     win.act_record.setChecked(True)
-    check("CSV recorder opened", win.csv_rec is not None)
-    check("raw recorder opened", win.raw_rec is not None)
-    csv_path = win.csv_rec.path if win.csv_rec else None
-    raw_path = win.raw_rec.path if win.raw_rec else None
+    check("CSV recorder opened", win.session.csv_rec is not None)
+    check("raw recorder opened", win.session.raw_rec is not None)
+    csv_path = win.session.csv_rec.path if win.session.csv_rec else None
+    raw_path = win.session.raw_rec.path if win.session.raw_rec else None
     pump(win, app, 3.0)
-    rows_written = win.csv_rec.n_rows if win.csv_rec else 0
+    rows_written = win.session.csv_rec.n_rows if win.session.csv_rec else 0
     win.act_record.setChecked(False)
-    check("recording stopped cleanly", win.csv_rec is None and win.raw_rec is None)
+    check("recording stopped cleanly", win.session.csv_rec is None and win.session.raw_rec is None)
 
     # ---- read the CSV back and check it ----
     if csv_path and os.path.exists(csv_path):
@@ -3429,8 +3429,8 @@ def test_app(app, args, workdir):
               data.shape[0] == rows_written, f"{data.shape[0]} rows")
         dt = np.diff(data[:, col["t_s"]])
         check("CSV timebase matches the output rate",
-              abs(np.median(dt) - 1.0 / win.out_rate) < 1e-6,
-              f"dt {np.median(dt)*1e3:.3f} ms at {win.out_rate:g} Hz")
+              abs(np.median(dt) - 1.0 / win.session.out_rate) < 1e-6,
+              f"dt {np.median(dt)*1e3:.3f} ms at {win.session.out_rate:g} Hz")
         s1 = data[:, [col["S1_Bx_mT"], col["S1_By_mT"], col["S1_Bz_mT"]]]
         check("CSV |B| column equals the vector norm",
               np.allclose(np.linalg.norm(s1, axis=1), data[:, col["S1_absB_mT"]],
@@ -3448,7 +3448,7 @@ def test_app(app, args, workdir):
         check("raw sample count matches the sidecar",
               x.shape[0] == meta["n_samples"], f"{x.shape[0]} samples")
         boxes = orec.raw_to_boxes(x, meta)
-        b = win.cal.convert(boxes, meta["volts_per_count"])
+        b = win.session.cal.convert(boxes, meta["volts_per_count"])
         check("raw file reconverts to finite field values",
               np.isfinite(b).all() and b.shape[1:] == (16, 3),
               f"shape {b.shape}")
@@ -3476,14 +3476,14 @@ def test_app(app, args, workdir):
 
     # ---- calibration round trip ----
     cal_path = os.path.join(workdir, "roundtrip.json")
-    win.cal.zero_mt[0, 0] = 1.2345
-    win.cal.ranges_mt[5] = 400.0
-    win.cal.save(cal_path)
+    win.session.cal.zero_mt[0, 0] = 1.2345
+    win.session.cal.ranges_mt[5] = 400.0
+    win.session.cal.save(cal_path)
     reloaded = ocal.Calibration.load(cal_path)
     check("calibration survives a save/load round trip",
-          np.allclose(reloaded.zero_mt, win.cal.zero_mt)
-          and np.allclose(reloaded.ranges_mt, win.cal.ranges_mt)
-          and reloaded.dead == win.cal.dead)
+          np.allclose(reloaded.zero_mt, win.session.cal.zero_mt)
+          and np.allclose(reloaded.ranges_mt, win.session.cal.ranges_mt)
+          and reloaded.dead == win.session.cal.dead)
 
     # ---- geometry round trip and rebuild ----
     g = pgeom.Geometry(mapping="ring-major")
@@ -3495,13 +3495,13 @@ def test_app(app, args, workdir):
     check("geometry reload reaches the sensor table",
           win.table.geom.mapping == "ring-major")
     pump(win, app, 1.0)
-    check("still acquiring after a geometry change", win.roll.filled > 100)
+    check("still acquiring after a geometry change", win.session.roll.filled > 100)
 
     # ---- tube frame CSV ----
     win.chk_tube.setChecked(True)
     win.chk_raw.setChecked(False)
     win.act_record.setChecked(True)
-    tube_path = win.csv_rec.path if win.csv_rec else None
+    tube_path = win.session.csv_rec.path if win.session.csv_rec else None
     pump(win, app, 1.5)
     win.act_record.setChecked(False)
     if tube_path and os.path.exists(tube_path):
@@ -3518,7 +3518,7 @@ def test_app(app, args, workdir):
                           atol=1e-4, rtol=1e-3))
 
     if args.live:
-        st = win.source.stats()
+        st = win.session.source.stats()
         check("no stream gaps on the live link", st.get("gaps", 0) == 0,
               f"gaps {st.get('gaps')}, lost {st.get('lost')}")
         # Measure over a window in which the loop is actually being pumped.
@@ -3526,10 +3526,10 @@ def test_app(app, args, workdir):
         # harness -- which deliberately blocks for most of a second at a time
         # parsing files back -- than about the application, whose real contract
         # is that a running session does not shed data.
-        for stream in win.source.streamers:
+        for stream in win.session.source.streamers:
             stream.dropped = 0
         pump(win, app, 3.0)
-        dropped = sum(x.dropped for x in win.source.streamers)
+        dropped = sum(x.dropped for x in win.session.source.streamers)
         check("no blocks dropped while the session is running", dropped == 0,
               f"{dropped} dropped over 3 s of streaming")
 
