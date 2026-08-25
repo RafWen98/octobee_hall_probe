@@ -2786,11 +2786,11 @@ def test_gui_estop(app, workdir):
         stages = FakeSet({"x": FakeStage("x"), "y": FakeStage("y")})
         win.session.stages = stages
         for ax in ("x", "y"):
-            win.stage_rows[ax]["present"] = True
-        win._sync_stage_controls()
+            win.tab_stages.stage_rows[ax]["present"] = True
+        win.tab_stages.sync_controls()
         check("motion controls are live before the stop",
-              win.stage_rows["x"]["target"].isEnabled()
-              and win.btn_scan_start.isEnabled())
+              win.tab_stages.stage_rows["x"]["target"].isEnabled()
+              and win.tab_stages.btn_scan_start.isEnabled())
 
         win.on_estop()
         check("the stop reaches every axis",
@@ -2799,8 +2799,8 @@ def test_gui_estop(app, workdir):
         check("and latches the machine, not just the axis that was moving",
               stages.interlock.tripped is not None)
         check("motion controls go dead while latched",
-              not win.stage_rows["x"]["target"].isEnabled()
-              and not win.btn_scan_start.isEnabled())
+              not win.tab_stages.stage_rows["x"]["target"].isEnabled()
+              and not win.tab_stages.btn_scan_start.isEnabled())
         try:
             stages.interlock.require_clear("a move")
             ok = False
@@ -2830,8 +2830,8 @@ def test_gui_estop(app, workdir):
         # Disconnect/reconnect must not be a back door round a latched stop.
         win.on_estop()
         win.session.stages = None
-        win._stage_pending = FakeSet({"x": FakeStage("x")})
-        win.on_stage_action_done("connect", "")
+        win.tab_stages._stage_pending = FakeSet({"x": FakeStage("x")})
+        win.tab_stages.on_stage_action_done("connect", "")
         app.processEvents()
         check("reconnecting does not release a latched stop",
               win.session.stages.interlock.tripped is not None,
@@ -3130,7 +3130,7 @@ def test_autoconnect(app, workdir):
         w = gui.MainWindow(ns)
         # Before any event is processed, so the deferred connect cannot reach
         # the real stages when it fires.
-        w.connect_stages = lambda quiet=False: False
+        w.tab_stages.connect_stages = lambda quiet=False: False
         return w
 
     def pump(seconds=1.0):

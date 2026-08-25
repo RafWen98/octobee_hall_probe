@@ -769,7 +769,7 @@ class MagnetWizard(QtWidgets.QDialog):
         self.win.motion.retire(worker)
         self.bar.setFormat("no sweep running")
         kind, self._pass = self._pass, None
-        self.win._sync_stage_controls()
+        self.win.tab_stages.sync_controls()
         if self.win.motion.latched:
             # An aborted pass comes back with no error and a partial FieldMap
             # -- that is deliberate, it is how a scan keeps the points it did
