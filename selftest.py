@@ -3400,9 +3400,9 @@ def test_app(app, args, workdir):
     win.act_pause.setChecked(False)
 
     # ---- recording ----
-    win.chk_csv.setChecked(True)
-    win.chk_raw.setChecked(True)
-    win.chk_tube.setChecked(False)
+    win.tab_export.chk_csv.setChecked(True)
+    win.tab_export.chk_raw.setChecked(True)
+    win.tab_export.chk_tube.setChecked(False)
     win.act_record.setChecked(True)
     check("CSV recorder opened", win.session.csv_rec is not None)
     check("raw recorder opened", win.session.raw_rec is not None)
@@ -3454,17 +3454,17 @@ def test_app(app, args, workdir):
               f"shape {b.shape}")
 
     # ---- exports ----
-    win.on_export_summary()
-    win.on_export_health()
-    win.on_export_json()
-    win.on_health()
+    win.tab_export.export_summary()
+    win.tab_health.export_csv()
+    win.tab_export.export_json()
+    win.tab_health.analyse()
     app.processEvents()
-    txt = win.health_text.toPlainText()
+    txt = win.tab_health.health_text.toPlainText()
     check("diagnostics text produced", "per-sensor verdict" in txt,
           f"{len(txt)} chars")
     check("diagnostics names the VCM channels", "VCM" in txt)
 
-    exports = [line for line in win.export_log.toPlainText().splitlines()
+    exports = [line for line in win.tab_export.export_log.toPlainText().splitlines()
                if line.strip()]
     check("three one-shot exports logged", len(exports) >= 3,
           f"{len(exports)} entries")
@@ -3498,8 +3498,8 @@ def test_app(app, args, workdir):
     check("still acquiring after a geometry change", win.session.roll.filled > 100)
 
     # ---- tube frame CSV ----
-    win.chk_tube.setChecked(True)
-    win.chk_raw.setChecked(False)
+    win.tab_export.chk_tube.setChecked(True)
+    win.tab_export.chk_raw.setChecked(False)
     win.act_record.setChecked(True)
     tube_path = win.session.csv_rec.path if win.session.csv_rec else None
     pump(win, app, 1.5)
@@ -3536,7 +3536,7 @@ def test_app(app, args, workdir):
         # The snapshot stops the stream, captures at the full 200 kSPS, and
         # hands the port back. It is the only path that takes over the
         # carriers' stream ownership, so it gets exercised for real.
-        win.spin_snap_s.setValue(1.0)
+        win.tab_export.spin_snap_s.setValue(1.0)
         win.on_snapshot()
         deadline = time.time() + 120
         while (win._snap_worker is not None and win._snap_worker.isRunning()
@@ -3544,7 +3544,7 @@ def test_app(app, args, workdir):
             app.processEvents()
             time.sleep(0.05)
         app.processEvents()
-        snaps = [line for line in win.export_log.toPlainText().splitlines()
+        snaps = [line for line in win.tab_export.export_log.toPlainText().splitlines()
                  if ".npz" in line]
         check("snapshot written", bool(snaps), snaps[-1] if snaps else "none")
         if snaps:

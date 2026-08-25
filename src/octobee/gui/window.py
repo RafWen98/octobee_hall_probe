@@ -36,10 +36,8 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
-from octobee import help as ohelp
 from octobee import live as olive
 from octobee import machine as omach
-from octobee import profile as oprof
 from octobee.calib import roll as opc
 from octobee import record as orec
 from octobee.motion import scan as oscan
@@ -61,6 +59,10 @@ from octobee.gui.constants import (
 from octobee.gui.dialogs.magnet import MagnetWizard
 from octobee.gui.rolling import Rolling
 from octobee.gui.session import Session
+from octobee.gui.tabs.export import ExportTab
+from octobee.gui.tabs.health import HealthTab
+from octobee.gui.tabs.help import HelpTab
+from octobee.gui.tabs.profile import ProfileTab
 from octobee.gui.sources import DemoSource, LiveSource, ReplaySource
 from octobee.gui.widgets.log import LogPane
 from octobee.gui.widgets.plot import LivePlot
@@ -139,7 +141,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lag_timer.timeout.connect(self.session.lag.tick)
         self.lag_timer.start(100)
         self.prof_timer = QtCore.QTimer(self)
-        self.prof_timer.timeout.connect(self.refresh_profile)
+        self.prof_timer.timeout.connect(self.tab_profile.refresh)
         self.prof_timer.start(1000)
         # The stage positions come out of the Kinesis DLL's own polling
         # cache, so this reads memory rather than talking to USB -- it
@@ -184,6 +186,17 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(300, self._auto_connect)
         self._report_calibration_source()
 
+    def _magnet_geometry_correction(self):
+        """The magnet-pass geometry correction, or None if it is not wanted.
+
+        Handed to the Data output tab so a report can carry it. The controls
+        belong to the Calibration tab; what a report needs is the answer.
+        """
+        if not self.chk_geom.isChecked():
+            return None
+        return ([self.spin_mx.value(), self.spin_my.value(),
+                 self.spin_mz.value()], self.spin_exp.value())
+
     def _report_calibration_source(self):
         if self.session.cal_from_file:
             self.session.log(f"calibration loaded from {self.session.args.calibration}: "
@@ -223,13 +236,27 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addTab(self._live_tab(), "Live")
         left.addTab(self.table, "Sensors")
         left.addTab(self._calib_tab(), "Calibration")
-        left.addTab(self._health_tab(), "Diagnostics")
+        self.tab_health = HealthTab(self.session, self._raw_arrays)
+        self.tab_health.wants_focus.connect(
+            lambda: self.tabs.setCurrentWidget(self.tab_health))
+        left.addTab(self.tab_health, "Diagnostics")
         left.addTab(self._stage_tab(), "Stages")
         left.addTab(self._machine_tab(), "Machine")
-        left.addTab(self._export_tab(), "Data output")
-        left.addTab(self._profile_tab(), "Profile")
+        self.tab_export = ExportTab(
+            self.session,
+            sensor_table=lambda: self._last_table,
+            magnet_geometry=self._magnet_geometry_correction)
+        self.tab_export.snapshot_requested.connect(self.on_snapshot)
+        self.tab_health.exported.connect(self.tab_export.note)
+        left.addTab(self.tab_export, "Data output")
+        self.tab_profile = ProfileTab(
+            self.session,
+            gl_info=lambda: (self.view3d.gl_info()
+                             if self.view3d.isVisible() else None))
+        left.addTab(self.tab_profile, "Profile")
         left.addTab(self.log_pane, "Log")
-        left.addTab(self._help_tab(), "Help")
+        self.tab_help = HelpTab(self.session)
+        left.addTab(self.tab_help, "Help")
         left.setCurrentIndex(0)
         self.tabs = left
 
@@ -755,132 +782,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cal_report.setFont(QtGui.QFont("Consolas", 9))
         lay.addWidget(self.cal_report, 1)
         self.refresh_cal_report()
-        return w
-
-    def _help_tab(self):
-        """Searchable documentation, indexed from the README at startup.
-
-        Read from disk once, here, rather than at each search: it is 75 kB and
-        the file does not change while the window is open. If it did -- someone
-        editing the README on the bench machine -- Reload picks it up without
-        restarting.
-        """
-        w = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(w)
-
-        top = QtWidgets.QHBoxLayout()
-        self.help_search = QtWidgets.QLineEdit()
-        self.help_search.setPlaceholderText(
-            "Search the documentation — try 'homing', 'roll sweep', "
-            "'why is it loud', 'VCM'")
-        self.help_search.setClearButtonEnabled(True)
-        self.help_search.textChanged.connect(self._help_filter)
-        btn_reload = QtWidgets.QPushButton("Reload")
-        btn_reload.setToolTip("Re-read README.md, for when it has been edited "
-                              "while this window was open.")
-        btn_reload.clicked.connect(self._help_reload)
-        top.addWidget(self.help_search, 1)
-        top.addWidget(btn_reload)
-        lay.addLayout(top)
-
-        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        self.help_list = QtWidgets.QListWidget()
-        self.help_list.currentRowChanged.connect(self._help_show)
-        self.help_view = QtWidgets.QTextBrowser()
-        self.help_view.setOpenExternalLinks(True)
-        self.help_list.setMinimumWidth(300)
-        split.addWidget(self.help_list)
-        split.addWidget(self.help_view)
-        # A truncated heading is a heading you cannot search by eye. These are
-        # long and specific on purpose, so the list gets a real share.
-        split.setSizes([430, 900])
-        split.setStretchFactor(0, 0)
-        split.setStretchFactor(1, 1)
-        lay.addWidget(split, 1)
-
-        self.help_count = QtWidgets.QLabel("")
-        self.help_count.setStyleSheet("color:#9aa3b2;")
-        lay.addWidget(self.help_count)
-
-        self._help_reload()
-        return w
-
-    def _help_reload(self):
-        self.help_topics = ohelp.load_topics()
-        self._help_filter(self.help_search.text()
-                          if hasattr(self, "help_search") else "")
-
-    def _help_filter(self, query):
-        self.help_hits = ohelp.search(self.help_topics, query, limit=200)
-        self.help_list.clear()
-        for t in self.help_hits:
-            item = QtWidgets.QListWidgetItem(
-                ("    " if t.level > 2 else "") + t.title)
-            item.setToolTip(f"{t.title}  —  {t.source}")
-            if t.source == "this window":
-                item.setForeground(QtGui.QColor("#8fc7ff"))
-            self.help_list.addItem(item)
-        n_all = len(self.help_topics)
-        self.help_count.setText(
-            f"{len(self.help_hits)} of {n_all} topics"
-            + (f" matching '{query}'" if query.strip() else
-               " — the README, plus the topics about this window in blue"))
-        if self.help_hits:
-            self.help_list.setCurrentRow(0)
-        else:
-            self.help_view.setMarkdown(
-                f"### Nothing matches '{query}'\n\n"
-                f"Search matches whole words in a heading first, then the "
-                f"text underneath. Try fewer words, or a term the "
-                f"documentation would actually use — 'clkdiv' rather than "
-                f"'sample rate setting'.")
-
-    def _help_show(self, row):
-        if not (0 <= row < len(self.help_hits)):
-            return
-        t = self.help_hits[row]
-        self.help_view.setMarkdown(f"## {t.title}\n\n*from {t.source}*\n\n"
-                                   + t.body)
-        self.help_view.verticalScrollBar().setValue(0)
-
-    def show_help_for(self, query):
-        """Open the Help tab at a search. For 'explain this' buttons."""
-        self.help_search.setText(query)
-        tabs = self.help_search.window().findChild(QtWidgets.QTabWidget)
-        if tabs is not None:
-            for i in range(tabs.count()):
-                if tabs.tabText(i) == "Help":
-                    tabs.setCurrentIndex(i)
-                    break
-
-    def _health_tab(self):
-        w = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(w)
-        top = QtWidgets.QHBoxLayout()
-        b = QtWidgets.QPushButton("Analyse the last few seconds")
-        b.clicked.connect(self.on_health)
-        top.addWidget(b)
-        b2 = QtWidgets.QPushButton("Export channel health CSV")
-        b2.clicked.connect(self.on_export_health)
-        top.addWidget(b2)
-        self.chk_autodead = QtWidgets.QCheckBox(
-            "auto-exclude dead sensors from statistics")
-        self.chk_autodead.setChecked(True)
-        top.addWidget(self.chk_autodead)
-        top.addStretch(1)
-        lay.addLayout(top)
-        self.health_text = QtWidgets.QPlainTextEdit()
-        self.health_text.setReadOnly(True)
-        self.health_text.setFont(QtGui.QFont("Consolas", 9))
-        self.health_text.setPlainText(
-            "Run this with no magnet near the probe.\n\n"
-            "It reports every one of the 64 raw channels: mean, noise, and "
-            "whether it is railed or stuck.\n\n"
-            "Read the VCM rows first. VCM carries no field, so noise there is "
-            "analogue pickup in the cabling and grounding, not a sensor "
-            "problem -- and on this probe it grows steadily along each "
-            "concentrator, which is a wiring fault, not a calibration one.")
-        lay.addWidget(self.health_text)
         return w
 
     # ---- stages ----------------------------------------------------------
@@ -2488,53 +2389,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"stage {where} mm  →  flange at ({origin[0]:+.0f}, "
                 f"{origin[1]:+.0f}, {origin[2]:+.0f}) mm{note}")
 
-    def _export_tab(self):
-        w = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(w)
-
-        g1 = QtWidgets.QGroupBox("Continuous recording (the Record button)")
-        f1 = QtWidgets.QGridLayout(g1)
-        self.chk_csv = QtWidgets.QCheckBox("calibrated CSV (millitesla)")
-        self.chk_csv.setChecked(True)
-        self.chk_raw = QtWidgets.QCheckBox(
-            "raw counts, full stream rate (.bin + .json sidecar)")
-        self.chk_tube = QtWidgets.QCheckBox(
-            "rotate into the common tube frame")
-        self.chk_tube.setToolTip(
-            "Chip-frame axes point 16 different ways, so only |B| is "
-            "comparable between sensors. Tube frame makes the components "
-            "comparable too -- at the cost of depending on the geometry file "
-            "being right.")
-        f1.addWidget(self.chk_csv, 0, 0)
-        f1.addWidget(self.chk_tube, 0, 1)
-        f1.addWidget(self.chk_raw, 1, 0, 1, 2)
-        self.lbl_recinfo = QtWidgets.QLabel("not recording")
-        f1.addWidget(self.lbl_recinfo, 2, 0, 1, 2)
-        lay.addWidget(g1)
-
-        g2 = QtWidgets.QGroupBox("One-shot exports")
-        f2 = QtWidgets.QHBoxLayout(g2)
-        for text, slot in (("Snapshot to .npz (full rate)", self.on_snapshot),
-                           ("Sensor summary CSV", self.on_export_summary),
-                           ("Full report JSON", self.on_export_json)):
-            b = QtWidgets.QPushButton(text)
-            b.clicked.connect(slot)
-            f2.addWidget(b)
-        self.spin_snap_s = QtWidgets.QDoubleSpinBox()
-        self.spin_snap_s.setRange(0.2, 30.0)
-        self.spin_snap_s.setValue(3.0)
-        self.spin_snap_s.setSuffix(" s")
-        f2.addWidget(QtWidgets.QLabel("snapshot length"))
-        f2.addWidget(self.spin_snap_s)
-        f2.addStretch(1)
-        lay.addWidget(g2)
-
-        self.export_log = QtWidgets.QPlainTextEdit()
-        self.export_log.setReadOnly(True)
-        self.export_log.setFont(QtGui.QFont("Consolas", 9))
-        lay.addWidget(self.export_log, 1)
-        return w
-
     def _apply_dark(self):
         self.setStyleSheet("""
             QWidget { background:#12141a; color:#d5d9e2; }
@@ -2768,7 +2622,7 @@ class MainWindow(QtWidgets.QMainWindow):
         path = orec.default_name("octobee", "csv", self.session.out_dir)
         self.session.csv_rec = orec.CsvRecorder(
             path, self.session.out_rate, self.session.cal, self.session.geom,
-            tube_frame=self.chk_tube.isChecked(),
+            tube_frame=self.tab_export.tube_frame(),
             meta={"hosts": ",".join(self.session.source.hosts) if self.session.source else "",
                   "stream_rate_hz": self.session.source.fs_hz if self.session.source else 0.0,
                   "continues": os.path.basename(old.path),
@@ -2947,7 +2801,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         raw, self.session.source.vpc, self.session.source.hosts,
                         self.session.source.volt_offset)
                 self.session.last_health = rows
-                if self.chk_autodead.isChecked():
+                if self.tab_health.auto_exclude_dead():
                     dead = ocal.suggest_dead(rows)
                     if dead != self.session.cal.dead:
                         self.session.cal.dead = dead
@@ -3423,76 +3277,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.log(f"geometry reloaded from {self.session.args.geometry}")
 
     # ---- diagnostics ------------------------------------------------------
-    def on_health(self):
-        raw = self._raw_arrays()
-        if raw is None:
-            self.health_text.setPlainText("no data -- connect first")
-            return
-        rows = ocal.channel_health(raw, self.session.source.vpc, self.session.source.hosts,
-                                   self.session.source.volt_offset)
-        self.session.last_health = rows
-        verdict = ocal.health_verdict(rows)
-        n = raw[0].shape[0]
-        out = [f"{n} samples per box at {self.session.source.fs_hz/1e3:g} kSPS "
-               f"({n/self.session.source.fs_hz:.2f} s), 1 count = "
-               f"{self.session.source.vpc[0]*1e6:.1f} uV", ""]
-        out.append(f"{'host':>13} {'ch':>3} {'signal':>9} {'mean [V]':>10} "
-                   f"{'noise [counts]':>15} {'p-p':>8}  flag")
-        for r in rows:
-            flag = ocal.bad_reason(r).upper()
-            out.append(f"{r['host']:>13} {r['ch']:3d} "
-                       f"{r['sensor']+' '+r['axis']:>9} {r['mean_v']:10.4f} "
-                       f"{r['std_counts']:15.2f} {r['p2p_counts']:8.0f}  {flag}")
-        out += ["", "per-sensor verdict:"]
-        for sid in range(1, N_SENSORS + 1):
-            st, note = verdict[sid]
-            out.append(f"  S{sid:<3d} {st:<8s} {note}")
-
-        vcm = [r for r in rows if r["is_vcm"]]
-        out += ["", "VCM reference channels (these carry NO field, so any noise "
-                    "on them is analogue pickup in the cabling and grounding):"]
-        for r in vcm:
-            out.append(f"  {r['sensor']:>4} {r['std_counts']:7.2f} counts rms "
-                       f"({r['std_uv']:8.1f} uV)   VCM = {r['mean_v']:.4f} V")
-        vs = np.array([r["mean_v"] for r in vcm])
-        if vs.size:
-            spread_v = vs.max() - vs.min()
-            vpt = self.session.cal.volts_per_tesla.mean()
-            out.append(f"\nVCM spread across the chips: {spread_v*1e3:.1f} mV "
-                       f"= {spread_v/vpt*1e3:.2f} mT of apparent field if it "
-                       f"were not subtracted.")
-        trend = [r["std_counts"] for r in vcm]
-        if len(trend) >= 8 and trend[7] > 3 * max(trend[0], 0.1):
-            out.append("VCM noise climbs steadily along the first concentrator "
-                       "-- that pattern is a cabling/ground problem, not a "
-                       "sensor calibration problem.")
-        self.health_text.setPlainText("\n".join(out))
-        self.tabs.setCurrentIndex(3)
-
-    def on_export_health(self):
-        if not self.session.last_health:
-            self.on_health()
-        if not self.session.last_health:
-            return
-        path = orec.default_name("channel_health", "csv", self.session.out_dir)
-        orec.write_health_csv(path, self.session.last_health)
-        self._exported(path)
-
     # ---- data output ------------------------------------------------------
     def on_record(self, on):
         if on:
             if self.session.source is None:
                 self.act_record.setChecked(False)
                 return
-            if self.chk_csv.isChecked():
+            if self.tab_export.csv_enabled():
                 p = orec.default_name("octobee", "csv", self.session.out_dir)
                 self.session.csv_rec = orec.CsvRecorder(
                     p, self.session.out_rate, self.session.cal, self.session.geom,
-                    tube_frame=self.chk_tube.isChecked(),
+                    tube_frame=self.tab_export.tube_frame(),
                     meta={"hosts": ",".join(self.session.source.hosts),
                           "stream_rate_hz": self.session.source.fs_hz})
                 self.session.log(f"recording CSV to {p} at {self.session.out_rate:g} Hz")
-            if self.chk_raw.isChecked():
+            if self.tab_export.raw_enabled():
                 p = orec.default_name("octobee", "bin", self.session.out_dir)
                 self.session.raw_rec = orec.RawRecorder(
                     p, self.session.source.hosts, self.session.source.vpc,
@@ -3507,10 +3306,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 if rec is not None:
                     p = rec.close()
                     size = os.path.getsize(p) / 1e6 if os.path.exists(p) else 0
-                    self._exported(f"{p}  ({size:.2f} MB, {kind})")
+                    self.tab_export.note(f"{p}  ({size:.2f} MB, {kind})")
             self.session.csv_rec = None
             self.session.raw_rec = None
-            self.lbl_recinfo.setText("not recording")
+            self.tab_export.set_recording_text("")
 
     def _update_rec_label(self):
         parts = []
@@ -3522,7 +3321,7 @@ class MainWindow(QtWidgets.QMainWindow):
                          f"{self.session.raw_rec.size_bytes/1e6:.1f} MB")
         txt = "  |  ".join(parts) if parts else ""
         self.lbl_rec.setText(("REC  " + txt) if parts else "")
-        self.lbl_recinfo.setText(txt or "not recording")
+        self.tab_export.set_recording_text(txt)
 
     def on_snapshot(self):
         if not isinstance(self.session.source, LiveSource):
@@ -3532,7 +3331,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
-        secs = self.spin_snap_s.value()
+        secs = self.tab_export.snapshot_seconds()
         path = orec.default_name("snapshot", "npz", self.session.out_dir)
         self.session.log(f"snapshot: stopping the stream, restoring the carriers' "
                      f"own clock, and capturing {secs:g} s losslessly")
@@ -3556,54 +3355,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Snapshot failed", error)
         else:
             size = os.path.getsize(path) / 1e6
-            self._exported(f"{path}  ({size:.2f} MB raw, {fs_hz/1e3:g} kSPS)")
+            self.tab_export.note(f"{path}  ({size:.2f} MB raw, {fs_hz/1e3:g} kSPS)")
         self.lbl_state.setText("disconnected -- press Connect to resume")
         self.act_disconnect.setEnabled(False)
         self.act_connect.setEnabled(True)
-
-    def on_export_summary(self):
-        table = getattr(self, "_last_table", None)
-        if not table:
-            self.session.log("no sensor data yet")
-            return
-        path = orec.default_name("sensor_summary", "csv", self.session.out_dir)
-        orec.write_sensor_csv(path, table)
-        self._exported(path)
-
-    def on_export_json(self):
-        table = getattr(self, "_last_table", None)
-        if not table:
-            self.session.log("no sensor data yet")
-            return
-        live = self.session.cal.live_mask()
-        payload = {
-            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "hosts": list(self.session.source.hosts) if self.session.source else [],
-            "stream_rate_hz": self.session.source.fs_hz if self.session.source else None,
-            "output_rate_hz": self.session.out_rate,
-            "calibration": self.session.cal.to_dict(),
-            "geometry": self.session.geom.to_dict(),
-            "sensors": table,
-            "channel_health": self.session.last_health or [],
-        }
-        if self.session.magnet_peaks is not None:
-            payload["magnet_pass"] = {
-                "peak_absB_mT": self.session.magnet_peaks,
-                "spread": ocal.spread_report(self.session.magnet_peaks, live=live),
-            }
-            if self.chk_geom.isChecked():
-                pt = [self.spin_mx.value(), self.spin_my.value(),
-                      self.spin_mz.value()]
-                payload["magnet_pass"]["magnet_point_mm"] = pt
-                payload["magnet_pass"]["geometry_corrected"] = ocal.spread_report(
-                    self.session.magnet_peaks, self.session.geom, pt, self.spin_exp.value(), live)
-        path = orec.default_name("octobee_report", "json", self.session.out_dir)
-        orec.write_report_json(path, payload)
-        self._exported(path)
-
-    def _exported(self, what):
-        self.export_log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {what}")
-        self.session.log(f"wrote {what}")
 
     # ---- misc UI ----------------------------------------------------------
     def _mark_dead_checkboxes(self, dead):
@@ -3648,93 +3403,6 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.setChecked(on)
             cb.blockSignals(False)
         self.on_sensor_toggle()
-
-    def _profile_tab(self):
-        w = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(w)
-        top = QtWidgets.QHBoxLayout()
-        self.chk_prof = QtWidgets.QCheckBox("measure where the time goes")
-        self.chk_prof.setChecked(self.session.prof.enabled)
-        self.chk_prof.setToolTip(
-            "Times every stage separately, including the OpenGL paint, and "
-            "watches the Qt event loop for stalls. Costs almost nothing, so it "
-            "is fine to leave on.")
-        self.chk_prof.toggled.connect(self.on_profile_toggle)
-        top.addWidget(self.chk_prof)
-        b_reset = QtWidgets.QPushButton("Reset")
-        b_reset.clicked.connect(self.on_profile_reset)
-        top.addWidget(b_reset)
-        b_copy = QtWidgets.QPushButton("Copy to clipboard")
-        b_copy.clicked.connect(
-            lambda: QtWidgets.QApplication.clipboard().setText(
-                self.profile_text.toPlainText()))
-        top.addWidget(b_copy)
-        top.addStretch(1)
-        lay.addLayout(top)
-        self.profile_text = QtWidgets.QPlainTextEdit()
-        self.profile_text.setReadOnly(True)
-        self.profile_text.setFont(QtGui.QFont("Consolas", 9))
-        lay.addWidget(self.profile_text)
-        return w
-
-    def on_profile_toggle(self, on):
-        self.session.prof.enabled = bool(on)
-        self.session.prof.reset()
-        self.session.lag.reset()
-        self.session.log("profiling on" if on else "profiling off")
-        self.refresh_profile()
-
-    def on_profile_reset(self):
-        self.session.prof.reset()
-        self.session.lag.reset()
-        self.refresh_profile()
-
-    def refresh_profile(self):
-        if not hasattr(self, "profile_text"):
-            return
-        if not self.session.prof.enabled:
-            self.profile_text.setPlainText(self.session.prof.text())
-            return
-        # Ask the live context what it is, once we have one. A software
-        # renderer here is the single most likely explanation for a window
-        # that seizes up the moment data starts arriving.
-        if "GL renderer" not in self.session.prof.notes and self.view3d.isVisible():
-            info = self.view3d.gl_info()
-            for k, v in info.items():
-                self.session.prof.note(k, v)
-            if oprof.is_software_renderer(info):
-                self.session.prof.note("VERDICT", "no GPU acceleration -- the 3D head "
-                                          "is being drawn on the CPU")
-                self.session.log(
-                    f"OpenGL is running on a software renderer "
-                    f"({info.get('GL renderer')}). Every repaint of the probe "
-                    f"head is done on the CPU, which is almost certainly why "
-                    f"the window struggles. Untick '3D' to confirm.")
-        parts = [self.session.prof.text(), "",
-                 f"event loop lag: mean {self.session.lag.mean_ms:.1f} ms, "
-                 f"worst {self.session.lag.max_ms:.0f} ms",
-                 f"  -> {self.session.lag.verdict()}"]
-        if self.session.source is not None:
-            st = self.session.source.stats()
-            parts += ["", "stream:"]
-            for k, v in st.items():
-                parts.append(f"  {k:<26} {v}")
-            qs = [getattr(x, "q", None) for x in
-                  getattr(self.session.source, "streamers", [])]
-            for h, q in zip(getattr(self.session.source, "hosts", []), qs):
-                if q is not None:
-                    parts.append(f"  {h + ' reader queue':<26} {q.qsize()} blocks "
-                                 f"waiting")
-        parts += ["", "how to read this:",
-                  "  'GL paint (probe head)' large  -> the 3D view is the cost;"
-                  " untick 3D or lower the refresh rate",
-                  "  'counts -> tesla' large        -> the data processing is"
-                  " the cost; lower the stream rate",
-                  "  reader queue growing           -> acquisition is falling"
-                  " behind and recordings will have holes",
-                  "  event loop lag large but every row small -> something"
-                  " outside this list is blocking"]
-        self.profile_text.setPlainText("\n".join(parts))
 
     def on_3d_toggle(self, on):
         self.view3d.setVisible(bool(on))
