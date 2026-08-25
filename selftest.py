@@ -26,7 +26,7 @@ import tempfile
 import time
 
 import numpy as np
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from octobee import paths
 from octobee.acq import carrier as ob
@@ -34,6 +34,7 @@ from octobee.calib import convert as ocal
 from octobee.gui import window as gui
 from octobee.gui.crash import CrashHandler
 from octobee.gui.dialogs.magnet import MagnetWizard
+from octobee.gui.widgets.plot import LivePlot
 from octobee.calib import roll as opc
 from octobee.calib import poses as opcap
 from octobee.calib import poses as pcap
@@ -2967,7 +2968,7 @@ def test_live_plot_reset(app, workdir):
     not on the axis limits.
     """
     print("\nlive plot reset view")
-    plot = gui.LivePlot(pgeom.Geometry())
+    plot = LivePlot(pgeom.Geometry())
     vb = plot.plot.getViewBox()
 
     rng = np.random.default_rng(4)
@@ -3080,6 +3081,36 @@ def test_magnet_wizard_saves(app, workdir):
         QtWidgets.QMessageBox.warning = real_warn
         QtWidgets.QMessageBox.exec = real_exec
         win.close()
+
+
+def test_close_is_clean(app, workdir):
+    """closeEvent must not raise, because Qt will not tell you if it does.
+
+    Qt calls closeEvent from C++ and swallows whatever comes back, so a stale
+    attribute reference in there is invisible: the window still disappears, the
+    test still passes, and the shutdown work after the failing line -- waiting
+    for motion workers, stopping the poll timer, releasing the USB handles --
+    silently does not happen. Releasing those handles is the part that matters:
+    they are exclusive-open, so a missed close means Kinesis will not start
+    again until the process dies.
+
+    So this calls closeEvent directly, where an exception propagates.
+    """
+    print("\nclean shutdown")
+    ns = argparse.Namespace(
+        uut=None, demo=True, replay=None, no_connect=True,
+        geometry=os.path.join(workdir, "close_geom.json"),
+        calibration=os.path.join(workdir, "close_cal.json"),
+        machine=os.path.join(workdir, "close_machine.json"),
+        out_dir=os.path.join(workdir, "closecaps"),
+        screenshot=None, screenshot_tab=0, screenshot_warmup=0)
+    win = gui.MainWindow(ns)
+    try:
+        win.closeEvent(QtGui.QCloseEvent())
+        check("closeEvent completes without raising", True)
+    finally:
+        win.close()
+        app.processEvents()
 
 
 def test_autoconnect(app, workdir):
@@ -3389,11 +3420,11 @@ def test_app(app, args, workdir):
           win.view_timer.interval() == start_interval,
           f"back to {win.view_timer.interval()} ms")
 
-    win.chk_3d.setChecked(False)
+    win.probe_pane.chk_3d.setChecked(False)
     before = win.session.roll.filled
     pump(win, app, 1.0)
     check("acquisition continues with the 3D head off", win.session.roll.filled >= before)
-    win.chk_3d.setChecked(True)
+    win.probe_pane.chk_3d.setChecked(True)
 
     win.act_pause.setChecked(True)
     n_before = win.session.roll.filled
@@ -3494,7 +3525,7 @@ def test_app(app, args, workdir):
     g.save(ns.geometry)
     win.tab_calib.on_reload_geometry()
     check("geometry reload reaches the 3D view",
-          abs(win.view3d.geom.tube_width_mm - 55.0) < 1e-9)
+          abs(win.probe_pane.view3d.geom.tube_width_mm - 55.0) < 1e-9)
     check("geometry reload reaches the sensor table",
           win.table.geom.mapping == "ring-major")
     pump(win, app, 1.0)
@@ -3621,6 +3652,7 @@ def main():
         test_magnet_wizard_reopens(app, workdir)
         test_live_plot_reset(app, workdir)
         test_magnet_wizard_saves(app, workdir)
+        test_close_is_clean(app, workdir)
         test_autoconnect(app, workdir)
         test_machine_tab(app, workdir)
         test_app(app, args, workdir)

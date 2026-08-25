@@ -88,6 +88,15 @@ class MotionControl(QtCore.QObject):
         self._workers = [w for w in self._workers if is_running(w)]
         return bool(self._workers)
 
+    def all_workers(self):
+        """Every worker this run has registered, live or recently retired.
+
+        Retired ones are included on purpose: retire() is called from a done
+        handler, which runs while the thread is still unwinding out of run().
+        Anything waiting for the machine to be quiet has to wait for those too.
+        """
+        return [*self._workers, *self._retired]
+
     def abort_all(self):
         """Ask every registered worker to stop. Returns how many were running."""
         n = 0

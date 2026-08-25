@@ -37,14 +37,12 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from octobee.calib import convert as ocal
 from octobee import live as olive
 from octobee import record as orec
-from octobee.gui.widgets.probe3d import ProbeView3D
 from octobee.gui.estop import MotionControl, is_running
 from octobee.gui.constants import (
     DEFAULT_VIEW_HZ,
     HEALTH_PERIOD_S,
     HEALTH_WINDOW_S,
     MAX_VIEW_INTERVAL_MS,
-    N_SENSORS,
     OUT_RATES,
     RAW_HISTORY_S,
     STREAM_RATES,
@@ -56,13 +54,13 @@ from octobee.gui.tabs.calibration import CalibrationTab
 from octobee.gui.tabs.export import ExportTab
 from octobee.gui.tabs.health import HealthTab
 from octobee.gui.tabs.help import HelpTab
+from octobee.gui.tabs.live import LiveTab, ProbeHeadPane
 from octobee.gui.tabs.machine import MachineTab
 from octobee.gui.tabs.stages import StagesTab
 from octobee.gui.tabs.profile import ProfileTab
 from octobee.gui.sources import DemoSource, LiveSource, ReplaySource
 from octobee.gui.widgets.log import LogPane
-from octobee.gui.widgets.plot import LivePlot
-from octobee.gui.widgets.sensors import SensorBars, SensorTable
+from octobee.gui.widgets.sensors import SensorTable
 from octobee.gui.workers import (
     ConnectWorker,
     SnapshotWorker,
@@ -183,8 +181,8 @@ class MainWindow(QtWidgets.QMainWindow):
         knowing which of them exist -- it says the geometry moved and this
         decides what that means.
         """
-        self.view3d.rebuild(self.session.geom)
-        self.plot.geom = self.session.geom
+        self.probe_pane.set_geometry(self.session.geom)
+        self.tab_live.set_geometry(self.session.geom)
         self.table.refresh_geometry(self.session.geom)
         self.tab_machine.set_geometry(self.session.geom)
 
@@ -209,15 +207,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # session from here on; nothing else needs the widget.
         self.session.attach_log(self.log_pane)
 
-        self.view3d = ProbeView3D(self.session.geom, profiler=self.session.prof)
-        self.bars = SensorBars(profiler=self.session.prof)
-        self.plot = LivePlot(self.session.geom, profiler=self.session.prof)
+        self.probe_pane = ProbeHeadPane(self.session)
+        self.tab_live = LiveTab(self.session)
         self.table = SensorTable(self.session.geom)
         # connected once the Calibration tab exists
         self.table.set_ranges(self.session.cal.ranges_mt)
 
         left = QtWidgets.QTabWidget()
-        left.addTab(self._live_tab(), "Live")
+        left.addTab(self.tab_live, "Live")
         left.addTab(self.table, "Sensors")
         self.tab_calib = CalibrationTab(self.session,
                                         set_ranges=self.table.set_ranges)
@@ -247,8 +244,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addTab(self.tab_export, "Data output")
         self.tab_profile = ProfileTab(
             self.session,
-            gl_info=lambda: (self.view3d.gl_info()
-                             if self.view3d.isVisible() else None))
+            gl_info=self.probe_pane.gl_info)
         left.addTab(self.tab_profile, "Profile")
         left.addTab(self.log_pane, "Log")
         self.tab_help = HelpTab(self.session)
@@ -256,21 +252,9 @@ class MainWindow(QtWidgets.QMainWindow):
         left.setCurrentIndex(0)
         self.tabs = left
 
-        right = QtWidgets.QWidget()
-        rl = QtWidgets.QVBoxLayout(right)
-        rl.setContentsMargins(4, 4, 4, 4)
-        head = QtWidgets.QLabel("Probe head — colour and arrow length are |B|, "
-                                "arrows are the tube-frame field direction")
-        head.setWordWrap(True)
-        head.setStyleSheet("color:#9aa3b2; font-size:11px;")
-        rl.addWidget(head)
-        rl.addWidget(self.view3d, 3)
-        rl.addWidget(self._view3d_controls())
-        rl.addWidget(self.bars, 1)
-
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         split.addWidget(left)
-        split.addWidget(right)
+        split.addWidget(self.probe_pane)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([1000, 720])
@@ -447,93 +431,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sc_estop.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
         self.sc_estop.activated.connect(self.on_estop)
 
-    def _view3d_controls(self):
-        w = QtWidgets.QWidget()
-        row = QtWidgets.QHBoxLayout(w)
-        row.setContentsMargins(0, 0, 0, 0)
-        self.chk_auto = QtWidgets.QCheckBox("auto scale")
-        self.chk_auto.setChecked(True)
-        self.chk_auto.toggled.connect(
-            lambda v: setattr(self.view3d, "auto_scale", v))
-        row.addWidget(self.chk_auto)
-        row.addWidget(QtWidgets.QLabel("full scale"))
-        self.spin_fs = QtWidgets.QDoubleSpinBox()
-        self.spin_fs.setRange(0.001, 4000.0)
-        self.spin_fs.setDecimals(3)
-        self.spin_fs.setValue(1.0)
-        self.spin_fs.setSuffix(" mT")
-        self.spin_fs.valueChanged.connect(
-            lambda v: setattr(self.view3d, "full_scale_mt", v))
-        row.addWidget(self.spin_fs)
-        self.chk_3d = QtWidgets.QCheckBox("3D")
-        self.chk_3d.setChecked(True)
-        self.chk_3d.setToolTip(
-            "Draw the probe head. This is the most expensive thing in the "
-            "window -- untick it if the display cannot keep up. Nothing else "
-            "changes: acquisition, calibration and recording are unaffected.")
-        self.chk_3d.toggled.connect(self.on_3d_toggle)
-        row.addWidget(self.chk_3d)
-        chk_arrows = QtWidgets.QCheckBox("arrows")
-        chk_arrows.setChecked(True)
-        chk_arrows.toggled.connect(self.view3d.set_arrows_visible)
-        row.addWidget(chk_arrows)
-        chk_lbl = QtWidgets.QCheckBox("labels")
-        chk_lbl.setChecked(True)
-        chk_lbl.toggled.connect(self.view3d.set_labels_visible)
-        row.addWidget(chk_lbl)
-        btn = QtWidgets.QPushButton("reset view")
-        btn.clicked.connect(self.view3d.reset_camera)
-        row.addWidget(btn)
-        row.addStretch(1)
-        return w
-
-    def _live_tab(self):
-        w = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(w)
-        top = QtWidgets.QHBoxLayout()
-        top.addWidget(QtWidgets.QLabel("show"))
-        self.cmb_mode = QtWidgets.QComboBox()
-        self.cmb_mode.addItems(LivePlot.MODES)
-        self.cmb_mode.currentTextChanged.connect(self.plot.set_mode)
-        top.addWidget(self.cmb_mode)
-        top.addWidget(QtWidgets.QLabel(" in "))
-        self.cmb_units = QtWidgets.QComboBox()
-        self.cmb_units.addItems(LivePlot.UNITS)
-        self.cmb_units.setToolTip(
-            "The pipeline always works in millitesla. These walk that back "
-            "down the conversion chain so you can see the electrical signal "
-            "itself: 'mV (chip output)' is the chip's own output with its VCM "
-            "reference subtracted, and 'ADC counts' is what came off the wire. "
-            "Any tare or gain trim in force is still applied.")
-        self.cmb_units.currentTextChanged.connect(self.on_units)
-        top.addWidget(self.cmb_units)
-        top.addSpacing(12)
-        self.chk_sensors = []
-        for s in range(N_SENSORS):
-            cb = QtWidgets.QCheckBox(f"{s+1}")
-            cb.setChecked(True)
-            cb.toggled.connect(self.on_sensor_toggle)
-            self.chk_sensors.append(cb)
-            top.addWidget(cb)
-        btn_all = QtWidgets.QPushButton("all")
-        btn_all.clicked.connect(lambda: self._set_all_sensors(True))
-        btn_none = QtWidgets.QPushButton("none")
-        btn_none.clicked.connect(lambda: self._set_all_sensors(False))
-        top.addWidget(btn_all)
-        top.addWidget(btn_none)
-        top.addStretch(1)
-        btn_reset = QtWidgets.QPushButton("reset view")
-        btn_reset.setToolTip(
-            "Put the axes back on auto after a drag or a scroll. Zooming a "
-            "pyqtgraph plot silently stops it auto-ranging, so the traces "
-            "stop filling the axes and it looks like the signal changed "
-            "rather than the view.")
-        btn_reset.clicked.connect(self.plot.reset_view)
-        top.addWidget(btn_reset)
-        lay.addLayout(top)
-        lay.addWidget(self.plot)
-        return w
-
     # ---- stages ----------------------------------------------------------
     # ---- stopping -------------------------------------------------------
 
@@ -673,8 +570,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.lag.reset()
         # counts-per-volt is read off the box, so the counts scale is only
         # known once a source exists.
-        if hasattr(self, "cmb_units"):
-            self.on_units()
+        self.tab_live.refresh_units()
         self.act_disconnect.setEnabled(True)
         self.act_connect.setEnabled(kind != "live")
         self.lbl_state.setText(f"{kind}: {', '.join(source.hosts)} "
@@ -734,9 +630,8 @@ class MainWindow(QtWidgets.QMainWindow):
         about it looks wrong.
         """
         self.session.roll.clear()
-        self.view3d.reset_scale()
-        if hasattr(self, "cmb_units"):
-            self.on_units()
+        self.probe_pane.reset_scale()
+        self.tab_live.refresh_units()
         self._roll_over_csv(what)
 
     def _roll_over_csv(self, what):
@@ -812,26 +707,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         t0 = time.perf_counter()
         with self.session.prof.time("view tick (total)"):
-            if self.chk_3d.isChecked():
-                with self.session.prof.time("  3D head: build vectors"):
-                    k = min(8, recent.shape[0])
-                    fs = self.view3d.update_fields(recent[-k:].mean(axis=0))
-                if (self.chk_auto.isChecked()
-                        and abs(fs - self.spin_fs.value()) > 1e-4):
-                    self.spin_fs.blockSignals(True)
-                    self.spin_fs.setValue(max(fs, 0.001))
-                    self.spin_fs.blockSignals(False)
-            with self.session.prof.time("  live plot setData"):
-                self.plot.update_data(recent, self.session.out_rate)
-            with self.session.prof.time("  peak bars"):
-                # Peak over a trailing half second, not the instantaneous
-                # value: a magnet passed by hand is over well inside one
-                # refresh, so sampling one point would miss most passes.
-                n = max(2, min(recent.shape[0],
-                               int(self.session.out_rate * self.bars.window_s)))
-                self.bars.update_values(
-                    np.linalg.norm(recent[-n:], axis=-1).max(axis=0),
-                    self.session.cal.dead)
+            self.probe_pane.draw(recent)
+            self.tab_live.draw(recent)
         self._note_draw_time((time.perf_counter() - t0) * 1000.0)
 
     def _note_draw_time(self, ms):
@@ -926,7 +803,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     dead = ocal.suggest_dead(rows)
                     if dead != self.session.cal.dead:
                         self.session.cal.dead = dead
-                        self._mark_dead_checkboxes(dead)
+                        self.tab_live.mark_dead(dead)
                         if dead:
                             self.session.log(
                                 f"excluding {', '.join(sorted(dead))}: "
@@ -941,8 +818,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.table.update_rows(table)
             self._last_table = table
 
-        self.plot.set_dead(self.session.cal.dead)
-        self.view3d.set_dead(self.session.cal.dead)
+        self.tab_live.set_dead(self.session.cal.dead)
+        self.probe_pane.set_dead(self.session.cal.dead)
 
         # A dropped block is a hole in whatever is being recorded, so say so
         # rather than leaving it as a number in the corner of the status bar.
@@ -1055,55 +932,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_connect.setEnabled(True)
 
     # ---- misc UI ----------------------------------------------------------
-    def _mark_dead_checkboxes(self, dead):
-        for s, cb in enumerate(self.chk_sensors):
-            bad = f"S{s+1}" in dead
-            cb.setStyleSheet("color:#c05050;" if bad else "")
-            cb.setToolTip("excluded: railed or stuck channels" if bad else "")
-
-    def on_units(self, *_):
-        """
-        Build the per-sensor factor that takes millitesla to the chosen unit.
-
-        All 16 chips currently run gain 3000, so the factor is the same for
-        every sensor. It stays per-sensor anyway because the range is a
-        per-sensor setting and the two halves genuinely have differed -- they
-        were 34.65 and 63 V/T until the 2026-08-19 harmonisation. Under a split
-        gain one field is not one voltage, and a single global factor would
-        quietly misreport half the probe.
-        """
-        name = self.cmb_units.currentText()
-        vpt = self.session.cal.volts_per_tesla                     # V/T, per sensor
-        if name == "mT":
-            k = np.ones(N_SENSORS)
-        elif name == "uT":
-            k = np.full(N_SENSORS, 1e3)
-        elif name.startswith("mV"):
-            k = vpt                                        # mT * V/T -> mV
-        else:                                              # ADC counts
-            vpc = np.array([(self.session.source.vpc[0] if s < 8 else self.session.source.vpc[-1])
-                            if self.session.source else 20.0 / 65536.0
-                            for s in range(N_SENSORS)])
-            k = vpt * 1e-3 / vpc                           # mT -> volts -> counts
-        self.plot.set_units(k, {"uT": "µT"}.get(name, name))
-
-    def on_sensor_toggle(self, _=None):
-        self.plot.set_visible_sensors(
-            {i for i, cb in enumerate(self.chk_sensors) if cb.isChecked()})
-
-    def _set_all_sensors(self, on):
-        for cb in self.chk_sensors:
-            cb.blockSignals(True)
-            cb.setChecked(on)
-            cb.blockSignals(False)
-        self.on_sensor_toggle()
-
-    def on_3d_toggle(self, on):
-        self.view3d.setVisible(bool(on))
-        self._draw_ms = 0.0
-        self.session.log("3D head on" if on else
-                     "3D head off -- everything else carries on unchanged")
-
     def on_view_rate(self):
         hz = float(self.cmb_view.currentData())
         self.view_timer.setInterval(int(1000 / hz))
@@ -1153,7 +981,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ev.ignore()
                 return
             self.motion.trigger("the window was closed while a job was running")
-        for w in [*self._motion_workers, self._stage_worker]:
+        for w in self.motion.all_workers():
             if is_running(w):
                 # Bounded: a worker wedged inside a DLL call must not stop the
                 # window closing, or the only way out is Task Manager -- which
