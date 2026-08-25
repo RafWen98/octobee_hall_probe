@@ -63,6 +63,8 @@ import argparse
 import json
 import os
 
+from octobee import paths
+
 import numpy as np
 
 N_SENSORS = 16
@@ -218,7 +220,8 @@ class Geometry:
                 "notes": self.notes,
                 "sensors": self.sensors}
 
-    def save(self, path=CONFIG_NAME):
+    def save(self, path=None):
+        path = path or paths.config(CONFIG_NAME)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
         return path
@@ -235,7 +238,8 @@ class Geometry:
         "notes", "board_plane"))
 
     @classmethod
-    def load(cls, path=CONFIG_NAME):
+    def load(cls, path=None):
+        path = path or paths.config(CONFIG_NAME)
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         if not isinstance(doc, dict):
@@ -244,7 +248,7 @@ class Geometry:
         return cls(**{k: v for k, v in doc.items() if k in cls._FIELDS})
 
     @classmethod
-    def load_or_default(cls, path=CONFIG_NAME, on_error=None):
+    def load_or_default(cls, path=None, on_error=None):
         """
         Load `path`, or fall back to the nominal geometry.
 
@@ -253,6 +257,7 @@ class Geometry:
         a wrong one produces a tube-frame export that looks entirely
         plausible -- so silently substituting it is the worst of the options.
         """
+        path = path or paths.config(CONFIG_NAME)
         if path and os.path.exists(path):
             try:
                 return cls.load(path)
@@ -535,7 +540,7 @@ def chip_mesh(geom, sensor_id, size_mm=CHIP_SIZE_MM):
 
 def main():
     p = argparse.ArgumentParser(description="probe geometry helper")
-    p.add_argument("--config", default=CONFIG_NAME)
+    p.add_argument("--config", default=paths.config(CONFIG_NAME))
     p.add_argument("--mapping", choices=MAPPINGS,
                    help="rewrite the config with this sensor->face mapping")
     p.add_argument("--mount-style", choices=MOUNT_STYLES)

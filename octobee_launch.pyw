@@ -14,10 +14,13 @@ So this wrapper catches whatever went wrong, writes it to a log next to this
 file, and puts it on screen in a native message box -- native because if the
 failure was PyQt6 itself, a Qt dialog is not available to report it with.
 
-It also pins the working directory to the checkout. Shortcuts do not reliably
-set one, and the GUI resolves calibration.json, probe_geometry.json, stages.json
-and captures/ relative to the CWD: launched from the wrong place it would come
-up with built-in defaults and no visible sign that it had.
+It no longer needs to pin the working directory. It used to: the GUI resolved
+calibration.json, probe_geometry.json, stages.json and captures/ relative to
+the CWD, so a shortcut that set the wrong one -- and shortcuts do not reliably
+set any -- brought the window up on built-in defaults with no visible sign. The
+package locates its own configuration now (octobee/paths.py), so every entry
+point behaves the same way from anywhere, and this wrapper is back to doing the
+one thing it is for: saying what went wrong.
 """
 
 import os
@@ -52,9 +55,6 @@ def report(title, body):
 
 
 def main():
-    os.chdir(HERE)
-    if HERE not in sys.path:
-        sys.path.insert(0, HERE)
     try:
         from octobee.gui import window
     except Exception:

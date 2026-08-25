@@ -28,6 +28,7 @@ import time
 import numpy as np
 from PyQt6 import QtCore, QtWidgets
 
+from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.gui import window as gui
@@ -2495,10 +2496,11 @@ def test_shipped_calibration():
     rather than trusting.
     """
     print("\nshipped calibration")
-    if not os.path.exists(ocal.CONFIG_NAME):
-        check("calibration.json is present", False)
+    shipped = paths.config(ocal.CONFIG_NAME)
+    if not os.path.exists(shipped):
+        check(f"{shipped} is present", False)
         return
-    cal = ocal.Calibration.load(ocal.CONFIG_NAME)
+    cal = ocal.Calibration.load(shipped)
     # Re-read live with: ssh root@acq1001_69x 'python3 /tmp/gain_config.py show'
     # All 16 confirmed at gain 3000 / EGain_sel 0x00 on 2026-08-19.
     check("all 16 are on the SPI-audited +/-20 mT range",
@@ -3399,7 +3401,6 @@ def test_app(app, args, workdir):
     win.chk_csv.setChecked(True)
     win.chk_raw.setChecked(True)
     win.chk_tube.setChecked(False)
-    os.makedirs("captures", exist_ok=True)
     win.act_record.setChecked(True)
     check("CSV recorder opened", win.csv_rec is not None)
     check("raw recorder opened", win.raw_rec is not None)

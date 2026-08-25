@@ -33,6 +33,7 @@ import time
 
 import numpy as np
 
+from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.calib import geometry as pg
@@ -45,7 +46,8 @@ def _stamp():
     return time.strftime("%Y%m%d_%H%M%S")
 
 
-def default_name(prefix, ext, directory="captures"):
+def default_name(prefix, ext, directory=None):
+    directory = directory or paths.captures_dir()
     os.makedirs(directory, exist_ok=True)
     return os.path.join(directory, f"{prefix}_{_stamp()}.{ext}")
 

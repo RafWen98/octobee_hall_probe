@@ -113,6 +113,7 @@ import os
 
 import numpy as np
 
+from octobee import paths
 from octobee.calib import convert as ocal
 from octobee.calib import geometry as pg
 
@@ -1050,7 +1051,7 @@ def main(argv=None):
                          "unresolved and says so (default); 'assume_isotropic' "
                          "fixes it by assuming the median chip has equal "
                          "sensitivity on all three axes")
-    ap.add_argument("--geometry", default=pg.CONFIG_NAME)
+    ap.add_argument("--geometry", default=paths.config(pg.CONFIG_NAME))
     ap.add_argument("--save", help="write the PoseSolution here as JSON")
     ap.add_argument("--apply", metavar="CALFILE",
                     help="fold the solution into this calibration.json")

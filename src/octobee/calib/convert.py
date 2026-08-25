@@ -35,6 +35,7 @@ import os
 
 import numpy as np
 
+from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import geometry as pg
 
@@ -182,7 +183,8 @@ class Calibration:
                 "dead": sorted(self.dead),
                 "notes": self.notes}
 
-    def save(self, path=CONFIG_NAME):
+    def save(self, path=None):
+        path = path or paths.config(CONFIG_NAME)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
         return path
@@ -196,7 +198,8 @@ class Calibration:
                          "subtract_vcm", "dead", "notes", "version"))
 
     @classmethod
-    def load(cls, path=CONFIG_NAME):
+    def load(cls, path=None):
+        path = path or paths.config(CONFIG_NAME)
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         if not isinstance(doc, dict):
@@ -205,7 +208,7 @@ class Calibration:
         return cls(**{k: v for k, v in doc.items() if k in cls._FIELDS})
 
     @classmethod
-    def load_or_default(cls, path=CONFIG_NAME, on_error=None):
+    def load_or_default(cls, path=None, on_error=None):
         """
         Load `path`, or fall back to built-in defaults.
 
@@ -215,6 +218,7 @@ class Calibration:
         which is a plausible-looking calibration that would rescale every field
         number if the real one said something else.
         """
+        path = path or paths.config(CONFIG_NAME)
         if path and os.path.exists(path):
             try:
                 return cls.load(path)
@@ -592,7 +596,7 @@ def main():
     p.add_argument("capture", help="an .npz written by octobee/acq/carrier.py capture")
     p.add_argument("--range", type=float, default=20.0, choices=sorted(ob.RANGE_TO_VPT))
     p.add_argument("--tare", action="store_true", help="tare on this capture")
-    p.add_argument("--save", nargs="?", const=CONFIG_NAME,
+    p.add_argument("--save", nargs="?", const=paths.config(CONFIG_NAME),
                    help="write the resulting calibration.json")
     a = p.parse_args()
 

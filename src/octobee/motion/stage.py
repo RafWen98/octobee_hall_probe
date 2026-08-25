@@ -146,6 +146,8 @@ import subprocess
 import sys
 import time
 
+from octobee import paths
+
 AXIS_CONFIG = "stages.json"
 
 # The install path is fixed by the Kinesis installer. Overridable because a
@@ -1258,7 +1260,7 @@ class StageSet:
     # ---- construction ----
 
     @classmethod
-    def from_config(cls, path=AXIS_CONFIG, serials=None):
+    def from_config(cls, path=None, serials=None):
         """Build from stages.json, falling back to bus order.
 
         stages.json looks like:
@@ -1275,6 +1277,7 @@ class StageSet:
         bracket runs it backwards is declared once here rather than corrected
         at each call site.
         """
+        path = path or paths.config(AXIS_CONFIG)
         found = list(serials) if serials is not None else list_devices()
         if not found:
             hint = (" -- the Kinesis application is running and holds all "
@@ -1483,7 +1486,8 @@ class StageSet:
 # axis map persistence
 # ---------------------------------------------------------------------------
 
-def load_axis_map(path=AXIS_CONFIG):
+def load_axis_map(path=None):
+    path = path or paths.config(AXIS_CONFIG)
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as fh:
@@ -1491,7 +1495,7 @@ def load_axis_map(path=AXIS_CONFIG):
     return {str(k): str(v) for k, v in doc.get("axes", {}).items()}
 
 
-def load_axis_frames(path=AXIS_CONFIG):
+def load_axis_frames(path=None):
     """axis -> {"invert": bool, "origin_mm": float|None, "limit_mm": pair|None}.
 
     Kept beside the axis map rather than derived from it because which way a
@@ -1500,6 +1504,7 @@ def load_axis_frames(path=AXIS_CONFIG):
     is the same kind of fact -- the working envelope belongs to the fixture,
     not to the leadscrew.
     """
+    path = path or paths.config(AXIS_CONFIG)
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as fh:
@@ -1524,7 +1529,7 @@ def load_axis_frames(path=AXIS_CONFIG):
     return out
 
 
-def load_home_order(path=AXIS_CONFIG, axes=()):
+def load_home_order(path=None, axes=()):
     """The order home_all() should reference the axes in, safest first.
 
     Declared rather than inferred: which axis has to retract before the others
@@ -1533,6 +1538,7 @@ def load_home_order(path=AXIS_CONFIG, axes=()):
     machine is ignored rather than an error -- the safe order for a three-axis
     rig should stay valid when you unplug one to work on it.
     """
+    path = path or paths.config(AXIS_CONFIG)
     if not os.path.exists(path):
         return ()
     with open(path, encoding="utf-8") as fh:
@@ -1542,7 +1548,7 @@ def load_home_order(path=AXIS_CONFIG, axes=()):
     return tuple(str(n) for n in order if known is None or n in known)
 
 
-def load_axis_motion(path=AXIS_CONFIG, axes=()):
+def load_axis_motion(path=None, axes=()):
     """axis -> (velocity_mm_s, accel_mm_s2), the profile each axis opens with.
 
     stages.json carries it as
@@ -1555,6 +1561,7 @@ def load_axis_motion(path=AXIS_CONFIG, axes=()):
     number. Anything left unsaid falls back to the module defaults, so a rig
     with no stages.json still opens quiet rather than at Kinesis's 20 mm/s.
     """
+    path = path or paths.config(AXIS_CONFIG)
     doc = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
@@ -1579,13 +1586,14 @@ def load_axis_motion(path=AXIS_CONFIG, axes=()):
     return out
 
 
-def save_axis_motion(path=AXIS_CONFIG, velocity_mm_s=None, accel_mm_s2=None,
+def save_axis_motion(path=None, velocity_mm_s=None, accel_mm_s2=None,
                      axis=None):
     """Write the motion profile into stages.json, leaving the rest of it alone.
 
     With no axis this sets the block that applies to everything; with one it
     writes an override for that axis only.
     """
+    path = path or paths.config(AXIS_CONFIG)
     doc = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
@@ -1603,7 +1611,8 @@ def save_axis_motion(path=AXIS_CONFIG, velocity_mm_s=None, accel_mm_s2=None,
     return path
 
 
-def save_axis_map(mapping, path=AXIS_CONFIG, frames=None):
+def save_axis_map(mapping, path=None, frames=None):
+    path = path or paths.config(AXIS_CONFIG)
     doc = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
@@ -1937,7 +1946,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", default=AXIS_CONFIG,
+    p.add_argument("--config", default=paths.config(AXIS_CONFIG),
                    help=f"axis -> serial map (default {AXIS_CONFIG})")
     sub = p.add_subparsers(dest="cmd", required=True)
 

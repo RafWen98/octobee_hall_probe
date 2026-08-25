@@ -397,7 +397,7 @@ def _ranges_from_calibration(n_boxes):
     disagree cannot be summarised by one number -- say so rather than pick one.
     """
     try:
-        cal = ocal.Calibration.load(ocal.CONFIG_NAME)
+        cal = ocal.Calibration.load()
     except (OSError, ValueError, TypeError):
         print("no readable calibration.json -- assuming +/-20 mT (gain 3000); "
               "override with --range")

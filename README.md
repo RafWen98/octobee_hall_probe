@@ -1127,6 +1127,35 @@ but it is not a resolution win and it is not a priority.
 
 ## 5. Files
 
+### Where the repository keeps things
+
+```
+src/octobee/     the application, installed with `pip install -e ".[gui,dev]"`
+config/          calibration.json, probe_geometry.json, stages.json, machine.json
+captures/        recordings, exports and field maps (not in version control)
+onbox/           scripts that run on the carriers, not here
+docs/            this documentation, the screenshots, and the vendor PDFs
+```
+
+Configuration is **located, not just named**. Every tool resolves
+`calibration.json` and its neighbours through `octobee/paths.py`, in this
+order:
+
+1. `$OCTOBEE_CONFIG_DIR`, if set — the way to keep a second, separate set
+2. `config/` in this checkout — what the bench uses
+3. the platform's per-user config directory, for an installed copy with no
+   checkout (`%APPDATA%\octobee` on Windows)
+
+Captures follow the same pattern under `$OCTOBEE_CAPTURES_DIR`.
+
+This matters more than it sounds. These files were once opened by bare
+filename, so what got loaded depended on the working directory the process
+happened to start in — and a tool that cannot find `calibration.json` does not
+fail, it falls back to built-in ±20 mT defaults and produces numbers that look
+entirely reasonable and are uniformly wrong.
+
+### What each file is
+
 | file | runs on | purpose |
 |---|---|---|
 | `octobee/acq/carrier.py` | PC | core library: UUT knobs, frame decode, capture. `info` / `capture` / `restore` CLI |
@@ -1238,10 +1267,13 @@ catches whatever went wrong, writes `octobee_launch_error.log` next to itself,
 and reports it in a native message box — native rather than Qt, because if the
 thing that failed *was* PyQt6 then a Qt dialog is not available to say so.
 
-It also pins the working directory to the checkout. Shortcuts do not reliably
-set one, and `calibration.json`, `probe_geometry.json`, `stages.json` and
-`captures/` are all resolved relative to it: launched from the wrong place the
-GUI would come up on built-in defaults with nothing on screen to say it had.
+It used to pin the working directory to the checkout as well, and no longer
+needs to. `calibration.json`, `probe_geometry.json`, `stages.json` and
+`captures/` were once resolved relative to the CWD, so a shortcut that set the
+wrong one — and shortcuts do not reliably set any — brought the GUI up on
+built-in defaults with nothing on screen to say it had. The package locates its
+own configuration now (see §5), so every entry point behaves identically from
+any directory.
 
 To recreate the shortcut, or point it at a checkout somewhere else:
 

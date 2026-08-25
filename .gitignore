@@ -3,6 +3,8 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+build/
+dist/
 
 # captured data and generated reports
 *.npz
@@ -12,9 +14,9 @@ captures/
 octobee_cal.png
 smoketest*.png
 
-# local overrides
-probe_geometry_local.json
-calibration_local.json
+# local configuration overrides. For a whole alternative set, point
+# $OCTOBEE_CONFIG_DIR at another directory instead of editing these.
+config/*_local.json
 octobee_launch_error.log
 
 # on-box firmware/config snapshots (contain private keys and password hashes)

@@ -64,6 +64,7 @@ import time
 
 import numpy as np
 
+from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.calib import poses as opcap
@@ -439,8 +440,8 @@ def main(argv=None):
                         f"{DEFAULT_SETTLE_S})")
     p.add_argument("--out", default=None,
                    help="output basename (default captures/fieldmap_<time>)")
-    p.add_argument("--cal", default=ocal.CONFIG_NAME)
-    p.add_argument("--config", default=ostage.AXIS_CONFIG,
+    p.add_argument("--cal", default=paths.config(ocal.CONFIG_NAME))
+    p.add_argument("--config", default=paths.config(ostage.AXIS_CONFIG),
                    help="axis -> stage serial map")
     p.add_argument("--settle-scan", metavar="AXIS",
                    help="instead of scanning, measure how long AXIS takes to "
@@ -505,7 +506,7 @@ def main(argv=None):
         return rc
 
     out = a.out or os.path.join(
-        "captures", time.strftime("fieldmap_%Y%m%d_%H%M%S"))
+        paths.captures_dir(), time.strftime("fieldmap_%Y%m%d_%H%M%S"))
     path = fm.save(out)
     n_req = fm.meta.get("n_requested", len(fm))
     partial = "" if len(fm) == n_req else f" of {n_req} requested -- PARTIAL"

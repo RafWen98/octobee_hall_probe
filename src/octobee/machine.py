@@ -69,6 +69,7 @@ import sys
 
 import numpy as np
 
+from octobee import paths
 from octobee.calib import geometry as pgeom
 
 CONFIG_NAME = "machine.json"
@@ -946,13 +947,15 @@ class MachineConfig:
                          "current_scale", "energised", "track_stage", "pose",
                          "notes"))
 
-    def save(self, path=CONFIG_NAME):
+    def save(self, path=None):
+        path = path or paths.config(CONFIG_NAME)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
         return path
 
     @classmethod
-    def load(cls, path=CONFIG_NAME):
+    def load(cls, path=None):
+        path = path or paths.config(CONFIG_NAME)
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         if not isinstance(doc, dict):
@@ -961,7 +964,8 @@ class MachineConfig:
         return cls(**{k: v for k, v in doc.items() if k in cls._FIELDS})
 
     @classmethod
-    def load_or_default(cls, path=CONFIG_NAME, on_error=None):
+    def load_or_default(cls, path=None, on_error=None):
+        path = path or paths.config(CONFIG_NAME)
         if path and os.path.exists(path):
             try:
                 return cls.load(path)
@@ -986,7 +990,7 @@ def main(argv=None):
     p.add_argument("coil_file", nargs="?",
                    help="a simsopt configuration file (default: whatever "
                         f"{CONFIG_NAME} points at)")
-    p.add_argument("--config", default=CONFIG_NAME,
+    p.add_argument("--config", default=paths.config(CONFIG_NAME),
                    help=f"placement file to read (default: {CONFIG_NAME})")
     p.add_argument("--at", nargs=3, type=float, metavar=("X", "Y", "Z"),
                    help="stage reading, mm, to place the probe at")
@@ -1015,7 +1019,7 @@ def main(argv=None):
     if args.at:
         stage = dict(zip(Placement.AXES, args.at))
         print("stage at " + ", ".join(f"{k}={v:g} mm" for k, v in stage.items()))
-    geom = pgeom.Geometry.load_or_default(pgeom.CONFIG_NAME, on_error=print)
+    geom = pgeom.Geometry.load_or_default(on_error=print)
     cloud = cfg.pose.to_machine(probe_cloud(geom), stage)
     gap = clearance(cloud, coils, cfg.coil_radius_mm)
     print(f"probe flange at {cfg.pose.origin_mm(stage)} mm")

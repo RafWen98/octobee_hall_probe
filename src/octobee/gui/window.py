@@ -2096,7 +2096,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.args = args
         self.hosts = list(args.uut) if args.uut else list(ob.DEFAULT_UUTS)
-        self.out_dir = getattr(args, "out_dir", None) or "captures"
+        self.out_dir = getattr(args, "out_dir", None) or paths.captures_dir()
         # Collected rather than logged: the log pane does not exist yet, and a
         # config that failed to parse is the first thing the user must be told.
         self._config_errors = []
@@ -5958,8 +5958,7 @@ def _apply_app_icon(app):
     groups this with every other Python process -- leaving the desktop shortcut
     as the only place the application looks like itself.
     """
-    root = paths.repo_root()
-    path = os.path.join(root, ICON_NAME) if root else ICON_NAME
+    path = paths.asset(ICON_NAME)
     if not os.path.exists(path):
         return
     if sys.platform == "win32":
@@ -5982,15 +5981,15 @@ def main():
     p.add_argument("--demo", action="store_true",
                    help="synthetic probe, no hardware needed")
     p.add_argument("--replay", help="play back a saved .npz capture")
-    p.add_argument("--geometry", default=pgeom.CONFIG_NAME)
-    p.add_argument("--calibration", default=ocal.CONFIG_NAME)
-    p.add_argument("--machine", default=omach.CONFIG_NAME,
+    p.add_argument("--geometry", default=paths.config(pgeom.CONFIG_NAME))
+    p.add_argument("--calibration", default=paths.config(ocal.CONFIG_NAME))
+    p.add_argument("--machine", default=paths.config(omach.CONFIG_NAME),
                    help="where the coil set, the energised coils and the "
                         "probe's placement in the machine are remembered "
                         f"(default: {omach.CONFIG_NAME})")
-    p.add_argument("--out-dir", default="captures",
+    p.add_argument("--out-dir", default=paths.captures_dir(),
                    help="where recordings, snapshots and exports are written "
-                        "(default: captures)")
+                        f"(default: {paths.captures_dir()})")
     p.add_argument("--no-connect", action="store_true",
                    help="start disconnected. Without this the window connects "
                         "to the carriers and the stages as soon as it opens")

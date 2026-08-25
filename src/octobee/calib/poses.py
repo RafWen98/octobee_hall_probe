@@ -70,6 +70,7 @@ import time
 
 import numpy as np
 
+from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.calib import roll as opc
@@ -464,8 +465,8 @@ def main(argv=None):
                     help="wait this long after you press Enter before reading")
     ap.add_argument("--uut", action="append", default=None,
                     help="carrier hostname/IP, repeatable")
-    ap.add_argument("--out-dir", default="captures")
-    ap.add_argument("--cal", default=ocal.CONFIG_NAME,
+    ap.add_argument("--out-dir", default=paths.captures_dir())
+    ap.add_argument("--cal", default=paths.config(ocal.CONFIG_NAME),
                     help="calibration.json, read for the per-sensor RANGES only")
     ap.add_argument("--no-closure", action="store_true",
                     help="skip the repeat of pose 1 that measures session drift")
