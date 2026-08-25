@@ -28,16 +28,23 @@ hits, whole-word hits outrank partial ones, and a section that contains all the
 words outranks one that contains any.
 """
 
-import os
+import pathlib
 import re
 
 from octobee import paths
 
 README_NAME = "README.md"
+DOCS_DIR = "docs"
 
 # Only these levels become topics. `#` is the document title and `####` and
 # below are usually a detail inside a topic rather than one of their own.
-HEADING_RE = re.compile(r"^(#{2,3})\s+(.*?)\s*#*$", re.M)
+# `#` is a document title. It is indexed too, and because these titles
+# carry no text of their own the contents-page rule below turns each one
+# into a list of what its document covers -- so a search for "stages"
+# answers with the stages document, not with whichever subsection happens
+# to say the word most often. `####` and below stay out: they are a
+# detail inside a topic rather than one of their own.
+HEADING_RE = re.compile(r"^(#{1,3})\s+(.*?)\s*#*$", re.M)
 
 # Fenced code must not be scanned for headings: a '## ' inside a bash block is
 # a comment, and splitting on it produces a topic made of half a command.
@@ -296,22 +303,51 @@ def gui_topics():
             for t, body in GUI_TOPICS]
 
 
-def load_topics(readme_path=None):
-    """Every topic the Help tab offers: the window's own, then the README's.
+def doc_files(root=None):
+    """Every document to index, README first and then docs/, sorted.
 
-    A missing README is not an error -- the window still explains itself, and
-    says where the rest went.
+    Sorted so the list is the same on every machine: a search result that
+    names its source is only useful if that name is stable.
+    """
+    root = pathlib.Path(root) if root else paths.repo_root()
+    if root is None:
+        return []
+    out = []
+    readme = root / README_NAME
+    if readme.is_file():
+        out.append(readme)
+    docs = root / DOCS_DIR
+    if docs.is_dir():
+        out += sorted(p for p in docs.glob("*.md"))
+    return out
+
+
+def load_topics(readme_path=None, root=None):
+    """Every topic the Help tab offers: the window's own, then the documents'.
+
+    Indexing the whole docs/ tree rather than one file is what makes a result
+    worth reading: a topic now says it came from stages.md or calibration.md,
+    which tells you where to go on for the rest of it. When this was one 2,400
+    line README every result said "README.md" and meant nothing.
+
+    Missing documentation is not an error -- the window still explains itself,
+    and says where the rest went.
     """
     topics = gui_topics()
-    root = paths.repo_root()
-    path = readme_path or (os.path.join(root, README_NAME) if root else README_NAME)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            topics += split_markdown(fh.read(), source=os.path.basename(path))
-    except OSError:
+    paths_to_read = [pathlib.Path(readme_path)] if readme_path else doc_files(root)
+    read_any = False
+    for path in paths_to_read:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        read_any = True
+        topics += split_markdown(text, source=path.name)
+    if not read_any:
+        where = readme_path or (root or "the checkout")
         topics.append(Topic(
-            "The README could not be read",
-            f"Help topics are indexed from `{path}`, which is not readable "
+            "The documentation could not be read",
+            f"Help topics are indexed from `{where}`, which is not readable "
             f"from here. Only the topics about this window are available.",
             source="this window"))
     return topics
