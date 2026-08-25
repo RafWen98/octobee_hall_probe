@@ -2,15 +2,22 @@
 # name when the desktop icon fails to start. pyproject.toml is the source of
 # truth for versions; these mirror it.
 #
-#   pip install -r requirements.txt      # everything, including the GUI
-#   pip install -e .                     # command-line tools only
-#   pip install -e ".[gui,dev]"          # plus the GUI and ruff
+# Note that this file installs the DEPENDENCIES only. The application itself is
+# a package under src/, and wants an editable install:
+#
+#   pip install -e ".[gui,dev]"          # what the bench and CI both use
+#   pip install -e .                     # command-line tools, no GUI
+#   pip install -r requirements.txt      # dependencies alone, no octobee
+#
+# -e is not optional. A plain `pip install .` copies the package into
+# site-packages, and from then on the files being edited are not the files
+# being run.
 
-# Command-line tools (octobee.py, octobee_cal.py, octobee_live.py, ...)
+# Command-line tools (octobee.acq.carrier, octobee.report, octobee.live, ...)
 numpy>=1.24
 matplotlib>=3.7
 
-# Additionally required by the GUI (octobee_gui.py)
+# Additionally required by the GUI (octobee.gui)
 PyQt6>=6.5
 pyqtgraph>=0.13
 PyOpenGL>=3.1

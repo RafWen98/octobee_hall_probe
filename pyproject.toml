@@ -2,22 +2,21 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-# No modules are installed, deliberately. This is not a library -- it is a set
-# of scripts that run from the checkout, importing each other as siblings, with
-# the desktop shortcut and every CLI pointing at that checkout. Installing
-# copies under site-packages would give a second set of files that shadow the
-# ones being edited, which is worse than useless on the bench.
+[tool.setuptools.packages.find]
+# src-layout: the package is the only thing under src/, so setuptools has
+# nothing to guess at and cannot pick up captures/ or the on-box backups.
 #
-# So `pip install -e ".[gui,dev]"` exists to bring in the DEPENDENCIES, and
-# that is all CI wants from it.
-#
-# The empty list is also what makes the install work at all. Without it,
-# setuptools tries to guess what to package, finds twenty top-level modules
-# sitting in the repository root next to captures/ and the on-box backups, and
-# refuses -- "Multiple top-level packages discovered in a flat-layout" -- which
-# is a build failure ten seconds into CI with nothing to do with the code.
-py-modules = []
+# Install it with `pip install -e ".[gui,dev]"`. An EDITABLE install does not
+# copy anything into site-packages -- it writes a path hook back to this
+# checkout, so the files being edited are the files being run, which is the
+# property the bench needs. A plain `pip install .` would make the second,
+# shadowing copy this project spent a while avoiding; keep the -e.
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The taskbar icon ships inside the package, so an installed copy has it
+# without needing the checkout it was built from.
+octobee = ["data/*"]
 
 [project]
 name = "octobee"
@@ -29,6 +28,16 @@ dependencies = [
     "matplotlib>=3.7",
 ]
 
+[project.scripts]
+# One command with the instruments under it. `octobee` on its own lists them.
+octobee = "octobee.cli.main:main"
+
+[project.gui-scripts]
+# gui-scripts, not scripts: on Windows this builds an entry point that runs
+# under pythonw.exe, so the desktop shortcut opens the window without a console
+# behind it. That is the whole reason octobee_launch.pyw existed.
+octobee-gui = "octobee.gui.app:main"
+
 [project.optional-dependencies]
 # The GUI. The command-line tools need none of this.
 gui = [
@@ -36,15 +45,21 @@ gui = [
     "pyqtgraph>=0.13",
     "PyOpenGL>=3.1",
 ]
-dev = ["ruff>=0.6"]
+dev = ["ruff>=0.6", "pytest>=8.0"]
+
+[tool.pytest.ini_options]
+# rootdir-relative imports, so `from tests.helpers import check` works whether
+# pytest is run from the checkout or from anywhere else.
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.ruff]
 line-length = 88
 target-version = "py310"
 # The on-box scripts run on the carrier against a vendor library that is not
 # installed here, so they cannot be import-checked from this machine. Their
-# gain tables ARE checked, by selftest.test_gain_tables().
-extend-exclude = ["fw_backup_*", "rcuser_backup"]
+# gain tables ARE checked, by tests/test_onbox.py.
+extend-exclude = ["fw_backup_*", "onbox/rc.user"]
 
 [tool.ruff.lint]
 select = [
@@ -91,6 +106,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # The Qt event-loop entry points genuinely need a few long argument lists.
-"octobee_gui.py" = ["PLR0913"]
-# Test names read as sentences and the file is one long script by design.
-"selftest.py" = ["PLR0915"]
+"src/octobee/gui/window.py" = ["PLR0913"]
+# Test names read as sentences, and a test that asserts thirty things
+# about one calibration run is doing its job, not sprawling.
+"tests/**" = ["PLR0915"]
