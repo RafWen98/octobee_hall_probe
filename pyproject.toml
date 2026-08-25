@@ -1,3 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# No modules are installed, deliberately. This is not a library -- it is a set
+# of scripts that run from the checkout, importing each other as siblings, with
+# the desktop shortcut and every CLI pointing at that checkout. Installing
+# copies under site-packages would give a second set of files that shadow the
+# ones being edited, which is worse than useless on the bench.
+#
+# So `pip install -e ".[gui,dev]"` exists to bring in the DEPENDENCIES, and
+# that is all CI wants from it.
+#
+# The empty list is also what makes the install work at all. Without it,
+# setuptools tries to guess what to package, finds twenty top-level modules
+# sitting in the repository root next to captures/ and the on-box backups, and
+# refuses -- "Multiple top-level packages discovered in a flat-layout" -- which
+# is a build failure ten seconds into CI with nothing to do with the code.
+py-modules = []
+
 [project]
 name = "octobee"
 version = "0.1.0"
