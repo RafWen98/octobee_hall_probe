@@ -29,7 +29,7 @@ _now = time.perf_counter
 class _Span:
     """One reusable timing context. Not reentrant, which it never needs to be."""
 
-    __slots__ = ("prof", "name", "t0")
+    __slots__ = ("name", "prof", "t0")
 
     def __init__(self, prof, name):
         self.prof = prof
@@ -207,7 +207,7 @@ def gl_info(widget):
     millisecond into a second, which is exactly what a freeze feels like.
     """
     try:
-        from OpenGL import GL
+        from OpenGL import GL  # noqa: PLC0415  (optional dependency)
         widget.makeCurrent()
         try:
             def s(enum):
@@ -218,7 +218,7 @@ def gl_info(widget):
                     "GL version": s(GL.GL_VERSION)}
         finally:
             widget.doneCurrent()
-    except Exception as e:                            # noqa: BLE001
+    except Exception as e:
         return {"GL renderer": f"could not query ({type(e).__name__}: {e})"}
 
 

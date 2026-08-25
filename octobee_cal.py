@@ -35,6 +35,7 @@ import argparse
 import numpy as np
 
 import octobee as ob
+import octobee_calibration as ocal
 
 
 def load_npz(path):
@@ -211,7 +212,7 @@ def report(boxes, ranges, do_plot, plot_path):
     print("=" * 78)
     print("OCTO-BEE probe report")
     print("=" * 78)
-    for bi, bx in enumerate(boxes):
+    for bx in boxes:
         n = bx["ai"].shape[0]
         gaps, lost = ob.check_continuity(bx["sam_cnt"])
         print(f"{bx['host']}: {n} samples ({n/bx['fs_hz']:.2f} s @ {bx['fs_hz']/1e3:g} kHz), "
@@ -340,9 +341,11 @@ def report(boxes, ranges, do_plot, plot_path):
 
 
 def _plot(boxes, peaks, mags, path):
-    import matplotlib
+    # Lazy: --plot is optional and matplotlib costs seconds to import, which a
+    # report that is usually read as text should not pay.
+    import matplotlib  # noqa: PLC0415
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    import matplotlib.pyplot as plt  # noqa: PLC0415
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 9), height_ratios=[2, 1])
 
@@ -361,7 +364,7 @@ def _plot(boxes, peaks, mags, path):
                 ax1.plot(t, x, lw=0.7, alpha=0.8,
                          label=f"S{gs} {nm}" if a == 0 and gs % 4 == 1 else None)
     ax1.set_xlabel("time [s]")
-    ax1.set_ylabel(f"B [mT]  (VCM subtracted, baseline removed)")
+    ax1.set_ylabel("B [mT]  (VCM subtracted, baseline removed)")
     ax1.set_title("All 48 field channels overlaid, 16 sensors ("
                   + ", ".join(f"{b['host']} +/-{b['range_mt']:g} mT" for b in boxes)
                   + ")")
@@ -394,16 +397,15 @@ def _ranges_from_calibration(n_boxes):
     disagree cannot be summarised by one number -- say so rather than pick one.
     """
     try:
-        import octobee_calibration as ocal
         cal = ocal.Calibration.load(ocal.CONFIG_NAME)
-    except (OSError, ValueError, TypeError, ImportError):
+    except (OSError, ValueError, TypeError):
         print("no readable calibration.json -- assuming +/-20 mT (gain 3000); "
               "override with --range")
         return [20.0] * n_boxes
     out = []
     for bi in range(n_boxes):
         part = cal.ranges_mt[bi * ob.SENSORS_PER_BOX:(bi + 1) * ob.SENSORS_PER_BOX]
-        vals = sorted(set(float(v) for v in part))
+        vals = sorted({float(v) for v in part})
         if len(vals) != 1:
             print(f"WARNING: box {bi} has chips on {vals} mT in calibration.json; "
                   f"this report assumes {vals[0]:g} mT for all of them")

@@ -1,3 +1,16 @@
+<!--
+THIRD-PARTY DOCUMENT -- not part of this project.
+
+Verbatim copy of D-TACQ Solutions' own ACQ400RELEASE README, kept here so the
+carrier firmware upgrade procedure is to hand on the bench. It documents
+D-TACQ's process, not this repository's, and nothing here is maintained by us.
+
+  upstream: https://github.com/D-TACQ/ACQ400RELEASE
+  copied:   2026-08-20
+
+The project's own README is README.md.
+-->
+
 # ACQ400RELEASE
 - ACQ400 firmware releases from 2019 on. 
 - If your starting release predates March 1, 2019 do not go ahead, please follow special instructions:

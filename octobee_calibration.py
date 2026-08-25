@@ -29,6 +29,7 @@ Nothing here talks to the hardware; it operates on decoded arrays, so it can be
 unit-tested and replayed against saved captures.
 """
 
+import argparse
 import json
 import os
 
@@ -60,10 +61,15 @@ PLAUSIBLE_V = (-0.5, 5.5)
 # raw assembly
 # --------------------------------------------------------------------------
 
-def assemble(ai_by_box, vpc_by_box=None):
+def assemble(ai_by_box, vpc_by_box=None, offset_by_box=None):
     """
     Per-box (n, 32) count arrays -> (n, 16, 4) volts (or counts) ordered
     Bx, By, Bz, VCM per sensor, sensor axis running S1..S16.
+
+    offset_by_box is the volts at ADC count 0 (octobee.Layout.volt_offset),
+    which is zero on every bipolar range and half a span on a unipolar one.
+    Omit it and you get the bipolar answer, which is what every capture taken
+    on this bench so far actually needs.
 
     The two carriers free-run on separate oscillators, so the boxes are trimmed
     to the shorter one and only aligned to about the start of the capture.
@@ -76,6 +82,8 @@ def assemble(ai_by_box, vpc_by_box=None):
         x = ai[:n].astype(np.float64)
         if vpc_by_box is not None:
             x = x * float(vpc_by_box[bi])
+            if offset_by_box is not None:
+                x = x + float(offset_by_box[bi])
         nsens = x.shape[1] // 4
         g = x.reshape(n, nsens, 4)[:, :, GROUP_REORDER]
         out.append(g)
@@ -132,6 +140,16 @@ class Calibration:
                  version=None):
         self.ranges_mt = (np.full(N_SENSORS, 20.0) if ranges_mt is None
                           else np.asarray(ranges_mt, float).reshape(N_SENSORS))
+        # Validate here rather than at the first conversion. An unknown range
+        # used to be accepted, stored, saved, and then raise a bare
+        # KeyError from volts_per_tesla inside a 20 Hz GUI timer -- a long way
+        # from the typo in calibration.json that caused it.
+        bad = sorted({float(r) for r in self.ranges_mt} - set(ob.RANGE_TO_VPT))
+        if bad:
+            raise ValueError(
+                f"ranges_mt contains {bad}, which the SENM3Dx does not have. "
+                f"Legal values are {sorted(ob.RANGE_TO_VPT)} mT "
+                f"(gains 3000/1500/150/15).")
         self.zero_mt = (np.zeros((N_SENSORS, 3)) if zero_mt is None
                         else np.asarray(zero_mt, float).reshape(N_SENSORS, 3))
         self.gain_corr = (np.ones((N_SENSORS, 3)) if gain_corr is None
@@ -169,18 +187,44 @@ class Calibration:
             json.dump(self.to_dict(), f, indent=2)
         return path
 
+    # Keys to_dict() does not write are ignored on load rather than fatal.
+    # cls(**json.load(f)) meant that adding an "operator" or "site" field by
+    # hand raised TypeError, load_or_default() swallowed it, and the probe
+    # silently ran on built-in defaults -- exactly the uniformly-wrong-number
+    # failure the notes in calibration.json warn about.
+    _FIELDS = frozenset(("ranges_mt", "zero_mt", "gain_corr", "matrix",
+                         "subtract_vcm", "dead", "notes", "version"))
+
     @classmethod
     def load(cls, path=CONFIG_NAME):
         with open(path, encoding="utf-8") as f:
-            return cls(**json.load(f))
+            doc = json.load(f)
+        if not isinstance(doc, dict):
+            raise ValueError(f"{path}: expected a JSON object, got "
+                             f"{type(doc).__name__}")
+        return cls(**{k: v for k, v in doc.items() if k in cls._FIELDS})
 
     @classmethod
-    def load_or_default(cls, path=CONFIG_NAME):
+    def load_or_default(cls, path=CONFIG_NAME, on_error=None):
+        """
+        Load `path`, or fall back to built-in defaults.
+
+        A file that exists but cannot be read is reported through `on_error`
+        rather than passed over in silence. That distinction matters more here
+        than almost anywhere else: the defaults put every sensor on +/-20 mT,
+        which is a plausible-looking calibration that would rescale every field
+        number if the real one said something else.
+        """
         if path and os.path.exists(path):
             try:
                 return cls.load(path)
-            except (OSError, ValueError, TypeError):
-                pass
+            except (OSError, ValueError, TypeError) as exc:
+                if on_error is not None:
+                    on_error(f"{path} exists but could not be read "
+                             f"({type(exc).__name__}: {exc}) -- falling back to "
+                             f"built-in defaults, which put every sensor on "
+                             f"+/-20 mT. Fix the file before trusting any "
+                             f"number on screen.")
         return cls()
 
     # ---- conversion -----------------------------------------------------
@@ -212,9 +256,11 @@ class Calibration:
             b = np.einsum("sij,...sj->...si", self.matrix, b)
         return b
 
-    def convert(self, ai_by_box, vpc_by_box, apply_zero=True, apply_gain=True):
+    def convert(self, ai_by_box, vpc_by_box, apply_zero=True, apply_gain=True,
+                offset_by_box=None):
         """Raw per-box counts straight through to (n, 16, 3) millitesla."""
-        return self.to_mt(assemble(ai_by_box, vpc_by_box), apply_zero, apply_gain)
+        return self.to_mt(assemble(ai_by_box, vpc_by_box, offset_by_box),
+                          apply_zero, apply_gain)
 
     # ---- calibration steps ----------------------------------------------
     def tare(self, b_mt):
@@ -368,7 +414,8 @@ def noise_mt(b_mt):
     return np.std(np.asarray(b_mt, float), axis=0)
 
 
-def channel_health(ai_by_box, vpc_by_box, hosts=ob.DEFAULT_UUTS):
+def channel_health(ai_by_box, vpc_by_box, hosts=ob.DEFAULT_UUTS,
+                   offset_by_box=None):
     """
     Per-channel condition of the raw analogue path, before any calibration.
 
@@ -378,17 +425,20 @@ def channel_health(ai_by_box, vpc_by_box, hosts=ob.DEFAULT_UUTS):
     is analogue pickup, i.e. cabling and grounding, not a sensor problem.
     """
     rows = []
-    for bi, ai in enumerate(ai_by_box):
-        ai = np.asarray(ai)
+    for bi, raw_ai in enumerate(ai_by_box):
+        ai = np.asarray(raw_ai)
         vpc = float(vpc_by_box[bi])
+        # Volts at count 0: zero on a bipolar range, half a span on a unipolar
+        # one. Without it PLAUSIBLE_V below would reject all 64 channels the
+        # moment someone moved GAIN:ALL to 0-5V.
+        off = 0.0 if offset_by_box is None else float(offset_by_box[bi])
         for ch in range(ai.shape[1]):
             x = ai[:, ch].astype(np.float64)
             sensor, axis = ob.channel_label(ch + 1, bi)
             std = float(x.std())
             mn, mx = float(x.min()), float(x.max())
-            mean_v = float(x.mean() * vpc)
-            railed = (abs(mn) >= ADC_RAIL or abs(mx) >= ADC_RAIL
-                      or mn <= -32768 or mx >= 32767)
+            mean_v = float(x.mean() * vpc + off)
+            railed = abs(mn) >= ADC_RAIL or abs(mx) >= ADC_RAIL
             stuck = std < 1e-9
             out_of_range = not (PLAUSIBLE_V[0] <= mean_v <= PLAUSIBLE_V[1])
             rows.append({
@@ -461,11 +511,30 @@ def suggest_dead(rows):
 
 
 def temperatures_c(temp_raw_by_box):
-    """Per-box SPAD temperature words -> (16,) degC, S1..S16."""
+    """
+    Per-box SPAD temperature words -> (16,) degC, S1..S16.
+
+    A box whose SPAD is too short to carry temperatures hands back a block of
+    zeros, and a zero code is not 0 degC -- it is -160 degC, which used to be
+    printed in the sensor table as though it were a reading. An absent
+    temperature is NaN, so it renders as blank and never reaches an average.
+
+    See octobee.temp_c on why these are relative, not absolute, numbers.
+    """
     out = []
     for t in temp_raw_by_box:
-        out.append(np.asarray(ob.temp_c(t), float).reshape(-1)[:8])
-    return np.concatenate(out) if out else np.full(N_SENSORS, np.nan)
+        raw = np.asarray(t).reshape(-1)[:ob.SENSORS_PER_BOX]
+        c = np.asarray(ob.temp_c(raw), float)
+        c = np.where(raw == 0, np.nan, c)      # no SPAD word -> no temperature
+        if c.size < ob.SENSORS_PER_BOX:
+            c = np.concatenate([c, np.full(ob.SENSORS_PER_BOX - c.size, np.nan)])
+        out.append(c)
+    if not out:
+        return np.full(N_SENSORS, np.nan)
+    full = np.concatenate(out)
+    if full.size < N_SENSORS:
+        full = np.concatenate([full, np.full(N_SENSORS - full.size, np.nan)])
+    return full[:N_SENSORS]
 
 
 def spread_report(mag_pk, geom=None, magnet_point=None, exponent=3.0,
@@ -501,18 +570,24 @@ def spread_report(mag_pk, geom=None, magnet_point=None, exponent=3.0,
 
 def load_capture(path):
     """Read an octobee.py capture .npz into the shape this module expects."""
-    z = np.load(path, allow_pickle=True)
-    hosts = [str(h) for h in z["hosts"]]
-    ai = [z[f"ai_{i}"] for i in range(len(hosts))]
-    vpc = [float(z[f"vpc_{i}"]) for i in range(len(hosts))]
-    fs = [float(z[f"fs_hz_{i}"]) for i in range(len(hosts))]
-    temp = [z[f"temp_raw_{i}"] for i in range(len(hosts))]
+    with np.load(path, allow_pickle=True) as z:
+        hosts = [str(h) for h in z["hosts"]]
+        ai = [z[f"ai_{i}"] for i in range(len(hosts))]
+        vpc = [float(z[f"vpc_{i}"]) for i in range(len(hosts))]
+        fs = [float(z[f"fs_hz_{i}"]) for i in range(len(hosts))]
+        temp = [z[f"temp_raw_{i}"] for i in range(len(hosts))]
+        rng = [str(z[f"adc_range_{i}"]) for i in range(len(hosts))]
+        # Captures written before the pedestal was carried explicitly have no
+        # volt_offset key. They were all taken on +/-10V, where it is zero, so
+        # deriving it from the recorded range reproduces them exactly.
+        off = [float(z[f"volt_offset_{i}"]) if f"volt_offset_{i}" in z
+               else ob.ADC_RANGES.get(rng[i], (0.0, 0.0))[1]
+               for i in range(len(hosts))]
     return {"hosts": hosts, "ai": ai, "vpc": vpc, "fs_hz": fs, "temp_raw": temp,
-            "adc_range": [str(z[f"adc_range_{i}"]) for i in range(len(hosts))]}
+            "volt_offset": off, "adc_range": rng}
 
 
 def main():
-    import argparse
     p = argparse.ArgumentParser(description="calibration engine self-check")
     p.add_argument("capture", help="an .npz written by octobee.py capture")
     p.add_argument("--range", type=float, default=20.0, choices=sorted(ob.RANGE_TO_VPT))
@@ -531,7 +606,7 @@ def main():
     print(f"{a.capture}: {b.shape[0]} samples, {len(cap['hosts'])} boxes "
           f"@ {cap['fs_hz'][0]/1e3:g} kHz")
     print(f"{'sensor':>7} {'state':>6} {'|B| [mT]':>10} {'noise [uT rms]':>15} "
-          f"{'T [C]':>7}  note")
+          f"{'T [C]*':>7}  note")
     n = noise_mt(b)
     mag = magnitude(np.median(b, axis=0)[None])[0]
     for sid in range(1, N_SENSORS + 1):

@@ -72,11 +72,20 @@ def set_rate(host, fs_hz, settle=3.0):
 
 
 def restore_rate(host, prev):
+    """
+    Put `host` back on the clkdiv set_rate() returned. Returns True if it did.
+
+    `prev` is the raw string the box replied with, and a comms hiccup can make
+    that empty. Returning quietly then leaves the carrier at the reduced rate
+    with nothing said -- the exact state `octobee.py restore` exists to undo --
+    so the caller is told instead of guessing.
+    """
     if not prev:
-        return
+        return False
     u = ob.Uut(host)
     try:
         u.cmd(f"clkdiv {prev}", site=1)
+        return True
     finally:
         u.close()
 
@@ -131,7 +140,7 @@ AXIS_STYLE = {"Bz": "-", "By": "--", "Bx": ":", "VCM": "-."}
 
 
 def build_figure(mode, labels, nsens, window_s, unit, stack_step):
-    import matplotlib.pyplot as plt
+    import matplotlib.pyplot as plt  # noqa: PLC0415  (see main())
 
     cmap = plt.get_cmap("turbo")
     colors = [cmap(i / max(nsens - 1, 1)) for i in range(nsens)]
@@ -206,15 +215,19 @@ def main():
     subtract_vcm = not a.raw
 
     # ---- board setup -----------------------------------------------------
+    # Inside the try, not before it. These calls change hardware state on one
+    # box at a time, so a failure on the second carrier used to leave the first
+    # running at the reduced rate with nothing in the session saying so -- and
+    # a quietly aliased carrier looks exactly like a working one.
     prev_div = {}
-    if a.fs:
-        for h in hosts:
-            prev_div[h], actual = set_rate(h, a.fs)
-            print(f"{h}: clkdiv {prev_div[h]} -> {actual:.0f} Hz "
-                  f"(original restored on exit)")
-
     streamers = []
     try:
+        if a.fs:
+            for h in hosts:
+                prev_div[h], actual = set_rate(h, a.fs)
+                print(f"{h}: clkdiv {prev_div[h]} -> {actual:.0f} Hz "
+                      f"(original restored on exit)")
+
         for h in hosts:
             st = ob.Streamer(h, block_samples=1024, queue_depth=256)
             st.start()
@@ -244,9 +257,11 @@ def main():
                     flat_labels.append((gs, nm))
         nsens = len(hosts) * ob.SENSORS_PER_BOX
 
-        import matplotlib
-        import matplotlib.pyplot as plt
-        from matplotlib.animation import FuncAnimation
+        # matplotlib stays function-local on purpose: octobee_gui imports this
+        # module only for set_rate/restore_rate, and it should not pay a
+        # multi-second matplotlib import to reach two socket helpers.
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+        from matplotlib.animation import FuncAnimation  # noqa: PLC0415
 
         labels = grid_labels if a.mode == "grid" else flat_labels
         fig, axs, lines, colors = build_figure(
@@ -260,7 +275,7 @@ def main():
         state = {"step": a.stack_step, "t0": time.time(), "frames": 0}
 
         def update(_):
-            for bi, (st, roll) in enumerate(zip(streamers, rolls)):
+            for st, roll in zip(streamers, rolls):
                 if st.error:
                     print(f"\n{st.host}: {st.error}", file=sys.stderr)
                     continue
@@ -275,36 +290,44 @@ def main():
             allv = np.concatenate([r.buf for r in rolls], axis=1)
             if np.all(np.isnan(allv)):
                 return lines
-            warn = np.errstate(invalid="ignore")
 
-            if a.mode == "grid":
-                k = 0
-                for gs, (sensor_idx, chans) in enumerate(grid_labels):
-                    bi, s = divmod(sensor_idx, ob.SENSORS_PER_BOX)
-                    col0 = s * len(per_box_axes)
-                    seg = rolls[bi].buf[:, col0:col0 + len(per_box_axes)]
-                    if np.all(np.isnan(seg)):
-                        continue
-                    base = np.nanmedian(seg, axis=0)
-                    for j in range(len(chans)):
-                        lines[k].set_data(t, seg[:, j] - base[j])
+            # The buffers start life all-NaN and a railed channel stays that
+            # way, so nanmedian/nansum legitimately see empty slices here.
+            # This has to be a `with`: building the context manager and not
+            # entering it, which is what used to happen, silences nothing.
+            with np.errstate(invalid="ignore"):
+                if a.mode == "grid":
+                    k = 0
+                    for gs, (sensor_idx, chans) in enumerate(grid_labels):
+                        bi, s = divmod(sensor_idx, ob.SENSORS_PER_BOX)
+                        col0 = s * len(per_box_axes)
+                        seg = rolls[bi].buf[:, col0:col0 + len(per_box_axes)]
+                        if np.all(np.isnan(seg)):
+                            continue
+                        base = np.nanmedian(seg, axis=0)
+                        for j in range(len(chans)):
+                            lines[k].set_data(t, seg[:, j] - base[j])
+                            k += 1
+                        field = seg[:, :3] - base[:3]
+                        lines[k].set_data(
+                            t, np.sqrt(np.nansum(field ** 2, axis=1)))
                         k += 1
-                    field = seg[:, :3] - base[:3]
-                    lines[k].set_data(t, np.sqrt(np.nansum(field ** 2, axis=1)))
-                    k += 1
-                    ax = axs[gs]
-                    ax.set_xlim(-a.window, 0)
-                    ax.relim(); ax.autoscale_view(scaley=True)
-                return lines
+                        ax = axs[gs]
+                        ax.set_xlim(-a.window, 0)
+                        ax.relim()
+                        ax.autoscale_view(scaley=True)
+                    return lines
+
+                base = np.nanmedian(allv, axis=0)
 
             ax = axs[0]
-            base = np.nanmedian(allv, axis=0)
             centred = allv - base
             if a.mode == "overlay":
                 for i, ln in enumerate(lines):
                     ln.set_data(t, centred[:, i])
                 ax.set_xlim(-a.window, 0)
-                ax.relim(); ax.autoscale_view(scaley=True)
+                ax.relim()
+                ax.autoscale_view(scaley=True)
             else:                                    # stack
                 if not state["step"]:
                     spread = np.nanmax(np.abs(centred))
@@ -338,8 +361,17 @@ def main():
         for st in streamers:
             st.stop()
         for h, prev in prev_div.items():
-            restore_rate(h, prev)
-            print(f"{h}: clkdiv restored to {prev}")
+            try:
+                if restore_rate(h, prev):
+                    print(f"{h}: clkdiv restored to {prev}")
+                else:
+                    print(f"{h}: NO clkdiv recorded, so the rate was NOT put "
+                          f"back -- run 'python octobee.py restore'",
+                          file=sys.stderr)
+            except OSError as exc:
+                # One unreachable box must not stop the other being restored.
+                print(f"{h}: could not restore clkdiv ({exc}) -- run "
+                      f"'python octobee.py restore'", file=sys.stderr)
 
 
 if __name__ == "__main__":

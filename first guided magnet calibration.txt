@@ -1,0 +1,38 @@
+guided magnet calibration -- 4 of 4 poses
+magnet: position not noted
+
+ sensor  pose   y peak [mm]  |B| peak [mT]    trim
+     S1     3         42.00        12.4843   0.998
+     S2     3         73.50        12.4408   1.002
+     S3     3        105.00        12.1527   1.025
+     S4     3        136.50        11.8228   1.054
+     S5     2        136.50        13.8851   0.898
+     S6     2        105.00        13.7975   0.903
+     S7     2         73.50        13.4947   0.924
+     S8     2         38.50        13.2194   0.943
+     S9     1        136.50        13.4338   0.928
+    S10     1        105.00        13.5737   0.918
+    S11     1         73.50        11.9463   1.043
+    S12     1         38.50        11.3569   1.097
+    S13     4        136.50        11.0384   1.129
+    S14     4        105.00        12.6386   0.986
+    S15     4         73.50        10.7744   1.157
+    S16     4         38.50        11.1737   1.115
+
+peak spread across the 16: 1.29x  (this is gain only -- every sensor was measured at the same approach)
+rings, in the order they passed the magnet:
+  y =    39.4 mm   S1 S8 S12 S16
+  y =    73.5 mm   S2 S7 S11 S15
+  y =   105.0 mm   S3 S6 S10 S14
+  y =   136.5 mm   S4 S5 S9 S13
+  pose 1 answered: S9, S10, S11, S12
+  pose 2 answered: S5, S6, S7, S8
+  pose 3 answered: S1, S2, S3, S4
+  pose 4 answered: S13, S14, S15, S16
+
+probe_geometry.json disagrees with this run:
+  - sensors S1, S8, S12, S16 passed the magnet together at 39.4 mm, so they share a ring, but the file puts them on slots [0, 3]
+  - sensors S2, S7, S11, S15 passed the magnet together at 73.5 mm, so they share a ring, but the file puts them on slots [1, 2]
+  - sensors S3, S6, S10, S14 passed the magnet together at 105.0 mm, so they share a ring, but the file puts them on slots [1, 2]
+  - sensors S4, S5, S9, S13 passed the magnet together at 136.5 mm, so they share a ring, but the file puts them on slots [0, 3]
+  - the rings passed the magnet in slot order [0, 1, 1, 0], which is not a straight run along the tube

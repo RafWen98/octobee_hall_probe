@@ -1,0 +1,51 @@
+name: checks
+
+# selftest.py is the quality gate for this repository: 245 assertions that
+# convert counts to tesla, solve a synthetic roll calibration, drive the whole
+# Qt application headless and read the written files back. It needs no
+# hardware. Before this workflow existed it had to be remembered and run by
+# hand, which is the same as not having it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gui,dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Self-test
+        # Qt needs a display even offscreen-rendered; libEGL and friends are
+        # not in the base runner image. selftest sets QT_QPA_PLATFORM itself.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libegl1 libgl1 libxkbcommon0 \
+                                      libdbus-1-3 libxcb-cursor0
+          python selftest.py
+
+      - name: Working tree is unchanged
+        # A test run that writes into the repository is a test run that will
+        # eventually be mistaken for data. selftest keeps its output in a
+        # temporary directory; this makes sure it stays that way.
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "selftest.py modified the working tree:"
+            git status --porcelain
+            exit 1
+          fi

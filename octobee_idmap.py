@@ -34,6 +34,7 @@ import argparse
 import numpy as np
 
 import octobee as ob
+import octobee_live as ol
 
 
 def bin_stats(ai, fs, bin_s):
@@ -86,7 +87,6 @@ def main():
     p.add_argument("--save", default=None, help="also save the raw capture to .npz")
     a = p.parse_args()
 
-    import octobee_live as ol
     prev = None
     try:
         if a.fs:
@@ -129,7 +129,7 @@ def main():
         print("ribbon/port order to build your tube-position -> channel table.")
         return
 
-    z, med = robust_z(means)
+    z, _med = robust_z(means)
     zs, _ = robust_z(stds)
     score = np.where(np.abs(z) > np.abs(zs), z, zs)
     events = find_events(score, a.thresh, max(1, int(1.0 / bin_s)))

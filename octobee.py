@@ -42,7 +42,11 @@ Stream frame layout
         uint32 LW  n+6         : PWR_GOOD -- power monitor, latched at boot only
 """
 
+import contextlib
+import argparse
+import queue
 import socket
+import threading
 import time
 
 import numpy as np
@@ -57,12 +61,24 @@ NCHAN_AI = 32               # ACQ423ELF channels per box
 SENSORS_PER_BOX = NCHAN_AI // 4
 AXES = ("Z", "Y", "X", "VCM")
 
-# ACQ423ELF full scale, from the 'GAIN:ALL' knob. Volts per count = span/65536.
+# ACQ423ELF full scale, from the 'GAIN:ALL' knob, as
+#     range name -> (span_volts, volts_at_count_zero)
+#
+# Volts per count is span/65536 for all of them, but WHERE zero sits is not the
+# same. The frame decoder reads signed int16, so on a bipolar range count 0 is
+# 0 V and the second term drops out. On a unipolar range the bottom of the span
+# is at count -32768 instead, which puts 0 V half a span below count 0 -- so
+# reading `counts * volts_per_count` there is low by span/2 on every channel.
+#
+# That is not hypothetical arithmetic: at 0-5V it would put every channel at
+# -2.5 V, outside PLAUSIBLE_V, and channel_health() would report all 64
+# channels broken. Carrying the pedestal explicitly is the difference between
+# the range being a supported setting and being a trap.
 ADC_RANGES = {
-    "+/-10V": 20.0,
-    "+/-5V": 10.0,
-    "0-10V": 10.0,
-    "0-5V": 5.0,
+    "+/-10V": (20.0, 0.0),
+    "+/-5V": (10.0, 0.0),
+    "0-10V": (10.0, 5.0),
+    "0-5V": (5.0, 2.5),
 }
 
 # SENM3Dx v2 datasheet Table 7 / Table 21: amplifier gain -> (range_mT, V_per_T)
@@ -72,7 +88,7 @@ GAIN_TO_RANGE = {
     150: (400.0, 3.78),
     15: (4000.0, 0.378),
 }
-RANGE_TO_VPT = {r: v for r, v in GAIN_TO_RANGE.values()}
+RANGE_TO_VPT = dict(GAIN_TO_RANGE.values())
 
 # Temperature sensor, datasheet Table 11 (analog TA read by the CELF's ADS7128)
 TEMP_V_AT_0C = 1.65
@@ -148,10 +164,8 @@ class Uut:
             s = socket.create_connection((self.host, PORT_SITE0 + site),
                                          timeout=self.timeout)
             s.settimeout(self.BANNER_WAIT)
-            try:
+            with contextlib.suppress(OSError):
                 s.recv(4096)          # drain banner if there is one
-            except OSError:
-                pass
             self._sockets[site] = s
         return self._sockets[site]
 
@@ -187,10 +201,8 @@ class Uut:
 
     def close(self):
         for s in self._sockets.values():
-            try:
+            with contextlib.suppress(OSError):
                 s.close()
-            except OSError:
-                pass
         self._sockets.clear()
 
 
@@ -213,7 +225,16 @@ class Layout:
 
     @property
     def volts_per_count(self):
-        return ADC_RANGES[self.adc_range] / 65536.0
+        return ADC_RANGES[self.adc_range][0] / 65536.0
+
+    @property
+    def volt_offset(self):
+        """Volts at ADC count 0. Non-zero only on a unipolar range."""
+        return ADC_RANGES[self.adc_range][1]
+
+    @property
+    def bipolar(self):
+        return self.volt_offset == 0.0
 
     def __repr__(self):
         return (f"Layout(ssb={self.ssb}B, {self.nchan_ai}ch, "
@@ -233,6 +254,12 @@ def probe_uut(host):
         fs = float(u.value("SIG:CLK_S1:FREQ").split()[-1])
         nchan_ai = int(u.value("NCHAN", site=1))
         rng = u.value("GAIN:ALL", site=1).strip()
+        if rng not in ADC_RANGES:
+            raise RuntimeError(
+                f"{host}: ADC range {rng!r} is not one of "
+                f"{', '.join(sorted(ADC_RANGES))}. Every volts-per-count in "
+                f"this codebase comes from that table, so guessing here would "
+                f"silently rescale every field number.")
         return Layout(ssb, nchan_ai, spad_lw, fs, rng)
     finally:
         u.close()
@@ -290,17 +317,46 @@ def decode(buf, layout):
 
 
 def temp_c(raw16):
-    """ASIC temperature code (16-bit word, upper 12 bits valid) -> degC."""
-    code12 = np.asarray(raw16, dtype=np.float64).astype(np.int64) >> 4
+    """
+    ASIC temperature code (16-bit word, upper 12 bits valid) -> degC.
+
+    UNCALIBRATED, and the offset is per chip. Run over a bench capture this
+    returns 2.9 to 25.9 degC across sixteen chips bolted to one 159 mm
+    aluminium tube in one room, which is not a temperature gradient -- it is
+    the SENM3Dx TA output's own chip-to-chip offset, which the datasheet
+    transfer function below does not remove. The raw codes really do differ
+    (1376-1570 on this probe), so it is not a decode error.
+
+    Treat these as RELATIVE: a change over time on one chip is meaningful, the
+    spread between chips is not, and neither is the absolute value. Anything
+    quoting them to a user should say so -- see TEMP_UNCALIBRATED_NOTE.
+    """
+    code12 = np.asarray(raw16).astype(np.int64) >> 4
     volts = code12 * TEMP_ADC_VREF / (1 << TEMP_ADC_BITS)
     return (volts - TEMP_V_AT_0C) / TEMP_V_PER_C
 
 
+TEMP_UNCALIBRATED_NOTE = (
+    "ASIC temperatures are uncalibrated: each chip's TA output carries its own "
+    "offset, so the spread between sensors is not a real gradient. Read them "
+    "as relative, per chip, over time.")
+
+
 def check_continuity(sam_cnt):
-    """(n_gaps, n_samples_lost) from the SPAD sample counter."""
-    d = np.diff(sam_cnt.astype(np.int64))
+    """
+    (n_gaps, n_samples_lost) from the SPAD sample counter.
+
+    The counter is uint32 and really does wrap: at 200 kSPS it comes round
+    every ~6 hours, which is well inside a long logging run. Differencing in
+    int64 would turn that one wrap into a gap of -4294967295, so the "samples
+    lost" figure in the status bar goes hugely negative and stays there. Mask
+    the difference back into 32 bits instead, which makes the wrap the step of
+    1 that it physically is.
+    """
+    d = np.diff(np.asarray(sam_cnt, dtype=np.uint32).astype(np.int64))
+    d &= 0xFFFFFFFF
     bad = d != 1
-    return int(bad.sum()), int((d[bad] - 1).sum()) if bad.any() else 0
+    return int(bad.sum()), int((d[bad] - 1).sum())
 
 
 # --------------------------------------------------------------------------
@@ -345,13 +401,12 @@ def capture_all(hosts=DEFAULT_UUTS, seconds=2.0, take_over=True, verbose=True):
     200 kHz clock), so the two halves are only aligned to about the start of
     the capture. Fine for magnet-pass amplitude work; not for phase.
     """
-    import threading
     results = {}
 
     def grab(h):
         try:
             results[h] = capture_one(h, seconds, None, take_over, verbose)
-        except Exception as e:                       # noqa: BLE001 - reported below
+        except Exception as e:
             results[h] = e
 
     threads = [threading.Thread(target=grab, args=(h,)) for h in hosts]
@@ -370,8 +425,6 @@ class Streamer:
 
     def __init__(self, host, layout=None, block_samples=4096, take_over=True,
                  queue_depth=64):
-        import queue
-        import threading
         self.host = host
         self.layout = layout or probe_uut(host)
         self.block_bytes = block_samples * self.layout.ssb
@@ -389,7 +442,6 @@ class Streamer:
         self._thread.start()
 
     def _run(self):
-        import queue
         try:
             s = socket.create_connection((self.host, PORT_STREAM), timeout=10)
             s.settimeout(5)
@@ -419,7 +471,6 @@ class Streamer:
             s.close()
 
     def get_all(self):
-        import queue
         out = []
         while True:
             try:
@@ -473,6 +524,7 @@ def _cmd_capture(hosts, seconds, out):
         save[f"pwr_good_{bi}"] = d.get("pwr_good", 0)
         save[f"fs_hz_{bi}"] = lay.fs_hz
         save[f"vpc_{bi}"] = lay.volts_per_count
+        save[f"volt_offset_{bi}"] = lay.volt_offset
         save[f"adc_range_{bi}"] = lay.adc_range
     save["hosts"] = np.array(list(hosts))
     np.savez_compressed(out, **save)
@@ -543,7 +595,6 @@ def _cmd_restore(hosts, fs_hz):
 
 
 def main():
-    import argparse
     p = argparse.ArgumentParser(description="OCTO-BEE stream utilities")
     p.add_argument("--uut", action="append", default=None,
                    help="carrier hostname; repeat for both boxes "

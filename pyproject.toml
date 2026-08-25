@@ -1,0 +1,75 @@
+[project]
+name = "octobee"
+version = "0.1.0"
+description = "Control, live view, calibration and field mapping for the 16-sensor OCTO-BEE Hall probe"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+# The GUI. The command-line tools need none of this.
+gui = [
+    "PyQt6>=6.5",
+    "pyqtgraph>=0.13",
+    "PyOpenGL>=3.1",
+]
+dev = ["ruff>=0.6"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+# The on-box scripts run on the carrier against a vendor library that is not
+# installed here, so they cannot be import-checked from this machine. Their
+# gain tables ARE checked, by selftest.test_gain_tables().
+extend-exclude = ["fw_backup_*", "rcuser_backup"]
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes: undefined names, unused imports, dead locals
+    "E", "W", # pycodestyle
+    "B",      # bugbear: mutable defaults, loop-variable closures
+    "C4",     # comprehensions
+    "SIM",    # simplifications
+    "RET",    # return-path tidiness
+    "PIE", "RSE", "TID",
+    "NPY",    # numpy-specific
+    "PLC", "PLE", "PLW",
+    "RUF",
+]
+ignore = [
+    # This codebase documents its reasoning in prose, and reflowing the
+    # explanations to 88 columns would cost more than it buys. Code itself
+    # stays inside the limit by convention.
+    "E501",
+    # These are command-line instruments. print IS the user interface.
+    "T201",
+    # Matrices are M, R, S, C in the papers this implements; renaming them to
+    # lowercase would make the maths harder to check against its source.
+    "N806", "N803",
+    # --- deliberately not enforced, with reasons -------------------------
+    # zip(..., strict=True) would be an improvement, but turning it on across
+    # 16 existing call sites changes runtime behaviour: what silently truncates
+    # today would start raising, some of it inside the acquisition loop. Each
+    # site needs its own look. Tracked, not ignored forever.
+    "B905",
+    # int(round(x)) is redundant for a Python float and NOT redundant for a
+    # numpy scalar, which is what most of these are. The explicit cast is the
+    # safe form here.
+    "RUF046",
+    # The recorders and the stream reader hold files open across method calls
+    # by design -- that is what a recorder is. A context manager cannot express
+    # "opened on start, closed on stop".
+    "SIM115",
+    # The module-level DLL handle and the test counter are genuinely global.
+    "PLW0603",
+    # "--" and "->" in prose are meant as themselves.
+    "RUF001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The Qt event-loop entry points genuinely need a few long argument lists.
+"octobee_gui.py" = ["PLR0913"]
+# Test names read as sentences and the file is one long script by design.
+"selftest.py" = ["PLR0915"]

@@ -1,3 +1,11 @@
+# Kept as a pip-installable list because octobee_launch.pyw points at it by
+# name when the desktop icon fails to start. pyproject.toml is the source of
+# truth for versions; these mirror it.
+#
+#   pip install -r requirements.txt      # everything, including the GUI
+#   pip install -e .                     # command-line tools only
+#   pip install -e ".[gui,dev]"          # plus the GUI and ruff
+
 # Command-line tools (octobee.py, octobee_cal.py, octobee_live.py, ...)
 numpy>=1.24
 matplotlib>=3.7

@@ -24,6 +24,8 @@ oversampled for the physics, and the raw route exists for when you really do
 need every sample.
 """
 
+import argparse
+import csv
 import hashlib
 import json
 import os
@@ -31,7 +33,9 @@ import time
 
 import numpy as np
 
+import octobee as ob
 import octobee_calibration as ocal
+import probe_geometry as pg
 
 AXES = ocal.AXES
 N_SENSORS = ocal.N_SENSORS
@@ -204,6 +208,15 @@ class RawRecorder:
             self.meta["volts_per_tesla"] = list(map(float, cal.volts_per_tesla))
             self.meta["vcm_subtracted_by_reader"] = bool(cal.subtract_vcm)
         self.meta.update(meta or {})
+        # Write the sidecar NOW, not only on close. Without n_channels the .bin
+        # cannot be reshaped at all, so a recorder killed mid-run -- which is
+        # the normal end of an overnight log -- used to leave an archive file
+        # that nothing could read. Everything except n_samples is already known.
+        self._write_sidecar()
+
+    def _write_sidecar(self):
+        with open(self.path + ".json", "w", encoding="utf-8") as f:
+            json.dump(self.meta, f, indent=2)
 
     def write(self, ai_by_box):
         """Append per-box (n, 32) int16 blocks, trimmed to the shorter one."""
@@ -213,6 +226,11 @@ class RawRecorder:
         n = min(a.shape[0] for a in arrs)
         block = np.concatenate([a[:n] for a in arrs], axis=1).astype("<i2")
         self._f.write(block.tobytes())
+        # Flushed every block, because "the recording survives a crash" is the
+        # point of this route and Python's buffer does not. At the GUI's block
+        # size this is one write() syscall per acquisition tick against the
+        # megabytes it carries, so it costs nothing measurable.
+        self._f.flush()
         self.n_samples += n
         return n
 
@@ -224,8 +242,7 @@ class RawRecorder:
         if self._f and not self._f.closed:
             self._f.close()
         self.meta["n_samples"] = self.n_samples
-        with open(self.path + ".json", "w", encoding="utf-8") as f:
-            json.dump(self.meta, f, indent=2)
+        self._write_sidecar()
         return self.path
 
     def __enter__(self):
@@ -236,7 +253,6 @@ class RawRecorder:
 
 
 def _channel_names(n_boxes, nchan_per_box):
-    import octobee as ob
     names = []
     for b in range(n_boxes):
         for c in range(1, nchan_per_box + 1):
@@ -245,13 +261,24 @@ def _channel_names(n_boxes, nchan_per_box):
     return names
 
 
-def load_raw(path):
-    """Read a RawRecorder file back. Returns (array (n, nchan), meta dict)."""
+def load_raw(path, mmap=False):
+    """
+    Read a RawRecorder file back. Returns (array (n, nchan), meta dict).
+
+    `mmap` maps the file instead of reading it. The writer is explicitly
+    unbounded, so a long log can be larger than RAM; mapping lets you slice a
+    few seconds out of an overnight capture without loading the rest.
+
+    A file whose recorder was killed has no n_samples in its sidecar. The row
+    count comes from the file size either way, so that costs nothing.
+    """
     with open(path + ".json", encoding="utf-8") as f:
         meta = json.load(f)
-    x = np.fromfile(path, dtype="<i2")
-    n = x.size // meta["n_channels"]
-    return x[:n * meta["n_channels"]].reshape(n, meta["n_channels"]), meta
+    nchan = int(meta["n_channels"])
+    x = (np.memmap(path, dtype="<i2", mode="r") if mmap
+         else np.fromfile(path, dtype="<i2"))
+    n = x.size // nchan
+    return x[:n * nchan].reshape(n, nchan), meta
 
 
 def raw_to_boxes(x, meta):
@@ -264,16 +291,32 @@ def raw_to_boxes(x, meta):
 # reports
 # --------------------------------------------------------------------------
 
+def _write_rows(path, keys, rows):
+    """
+    Write `rows` as CSV with `keys` as the header.
+
+    Through csv.DictWriter, not a manual ",".join, because these tables carry
+    free text. health_verdict() produces notes like "Bx railed, By stuck" and
+    "VCM noise 9.0 counts -- analogue pickup, not the sensor", and an unquoted
+    comma in those splits the row into one more field than the header has. The
+    misalignment lands precisely on the faulty sensors -- the rows anyone
+    reading the file cares most about.
+    """
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore",
+                           restval="")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: ("" if r.get(k) is None else r[k]) for k in keys})
+    return path
+
+
 def write_health_csv(path, rows):
     """Per-channel diagnostics from octobee_calibration.channel_health()."""
     keys = ["host", "box", "ch", "sensor", "axis", "mean_counts", "mean_v",
             "std_counts", "std_uv", "min", "max", "p2p_counts", "railed",
             "stuck", "out_of_range", "bad", "is_vcm"]
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(",".join(keys) + "\n")
-        for r in rows:
-            f.write(",".join(str(r[k]) for k in keys) + "\n")
-    return path
+    return _write_rows(path, keys, rows)
 
 
 def write_sensor_csv(path, table):
@@ -283,12 +326,7 @@ def write_sensor_csv(path, table):
     """
     if not table:
         return None
-    keys = list(table[0].keys())
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(",".join(keys) + "\n")
-        for r in table:
-            f.write(",".join("" if r.get(k) is None else str(r[k]) for k in keys) + "\n")
-    return path
+    return _write_rows(path, list(table[0].keys()), table)
 
 
 def write_report_json(path, payload):
@@ -332,7 +370,11 @@ def sensor_table(cal, b_mt, health_rows, temps=None, peaks=None, geom=None):
                "range_mt": cal.ranges_mt[s],
                "vcm_v": round(vcm_v.get(sid, float("nan")), 5),
                "vcm_noise_counts": round(vcm_noise.get(sid, float("nan")), 2),
-               "temp_c": round(float(temps[s]), 1) if temps is not None else None,
+               # Uncalibrated and per-chip-offset: see octobee.temp_c. NaN
+               # means the box carried no SPAD temperature at all, and has to
+               # stay empty rather than become the word "nan" in a CSV.
+               "temp_c": (None if temps is None or not np.isfinite(temps[s])
+                          else round(float(temps[s]), 1)),
                "Bx_mT": round(float(level[s, 0]), 4),
                "By_mT": round(float(level[s, 1]), 4),
                "Bz_mT": round(float(level[s, 2]), 4),
@@ -349,21 +391,21 @@ def sensor_table(cal, b_mt, health_rows, temps=None, peaks=None, geom=None):
     return table
 
 
-if __name__ == "__main__":
-    import argparse
+def main(argv=None):
     p = argparse.ArgumentParser(description="export a saved capture")
     p.add_argument("capture", help=".npz from octobee.py capture")
     p.add_argument("-o", "--out", default=None, help="output CSV")
     p.add_argument("--rate", type=float, default=1000.0, help="output rate Hz")
     p.add_argument("--tube-frame", action="store_true")
-    p.add_argument("--range", type=float, default=20.0)
-    a = p.parse_args()
+    p.add_argument("--range", type=float, default=20.0,
+                   choices=sorted(ob.RANGE_TO_VPT))
+    a = p.parse_args(argv)
 
-    import probe_geometry as pg
     cap = ocal.load_capture(a.capture)
     cal = ocal.Calibration(ranges_mt=np.full(N_SENSORS, a.range))
     geom = pg.Geometry.load_or_default()
-    b = cal.convert(cap["ai"], cap["vpc"])
+    b = cal.convert(cap["ai"], cap["vpc"],
+                    offset_by_box=cap.get("volt_offset"))
     dec = max(1, int(round(cap["fs_hz"][0] / a.rate)))
     b = ocal.decimate(b, dec)
     out = a.out or default_name("export", "csv")
@@ -372,3 +414,8 @@ if __name__ == "__main__":
         rec.write(b)
     print(f"wrote {out}: {b.shape[0]} rows at {cap['fs_hz'][0]/dec:g} Hz, "
           f"{os.path.getsize(out)/1e6:.2f} MB")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

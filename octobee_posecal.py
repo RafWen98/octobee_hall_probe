@@ -107,6 +107,7 @@ Nothing here talks to the hardware. It operates on decoded arrays, so it can be
 unit-tested and replayed against saved captures.
 """
 
+import argparse
 import json
 import os
 
@@ -200,7 +201,7 @@ class RollSweep:
         base = os.path.splitext(path)[0]
         np.savez_compressed(base + ".npz", b_mt=self.b_mt.astype(np.float32))
         side = {"tag": self.tag,
-                "n_samples": int(len(self)),
+                "n_samples": len(self),
                 "ranges_mt": (None if self.ranges_mt is None
                               else self.ranges_mt.tolist()),
                 "temps_c": (None if self.temps_c is None
@@ -242,12 +243,21 @@ class PoseSolution:
     bt, bz      (G,)      transverse and axial field per orientation, mT
     tags        (G,)      the orientation labels, in the same order
     residual_mt (16,)     RMS fit residual per sensor
+    phis        list      the solved roll angle of every sample, one array per
+                          sweep. Diagnostic only -- plot it to see whether a
+                          hand roll actually turned steadily. NOT persisted:
+                          it is thousands of points per sweep and nothing
+                          downstream reads it, so a solution restored with
+                          load() has an empty list here, not the angles.
     """
 
     def __init__(self, M, b, identified, bt, bz, residual_mt, phis,
                  b_earth_ut, ranges_mt=None, n_sweeps=1, notes="",
                  tags=None, anisotropy_identified=True,
                  offset_leverage=0.0):
+        self._singular = []
+        self._decomp_sig = None
+        self._decomp = None
         self.M = np.asarray(M, float).reshape(N_SENSORS, 3, 3)
         self.b = np.asarray(b, float).reshape(N_SENSORS, 3)
         self.identified = np.asarray(identified, bool).reshape(N_SENSORS, 3)
@@ -298,8 +308,7 @@ class PoseSolution:
     @property
     def singular(self):
         """Sensors whose response matrix could not be inverted."""
-        if not hasattr(self, "_singular"):
-            self.chip_to_tube()
+        self.decompose()
         return list(self._singular)
 
     def unusable(self):
@@ -337,7 +346,18 @@ class PoseSolution:
         symmetric positive-definite part -- gain and non-orthogonality, which
         is what belongs in a chip-frame correction. Returns (R, S), both
         (16,3,3).
+
+        Cached on the contents of M, the way Geometry.rotations() caches on its
+        own inputs and for the same reason. gains(), orthogonality_deg(),
+        unusable(), identify_faces() and _anchor_gauge() all call this, and
+        report() reaches it five times over -- 16 inversions plus 16 SVDs each
+        time. _assume_isotropic() mutates M in a loop, so a dirty flag would
+        not do; the fingerprint is the array itself.
         """
+        sig = self.M.tobytes()
+        if sig == self._decomp_sig:
+            return self._decomp
+
         C = self.chip_to_tube()
         R = np.empty_like(C)
         S = np.empty_like(C)
@@ -352,6 +372,7 @@ class PoseSolution:
                 D[2, 2] = -1.0
             R[i] = W @ D @ Vt
             S[i] = V @ D @ np.diag(sv) @ Vt
+        self._decomp_sig, self._decomp = sig, (R, S)
         return R, S
 
     def gains(self):
@@ -547,7 +568,7 @@ def _fit_sensor(design, y):
     return sol[:-1].T, sol[-1]
 
 
-def _update_phi(m, M, b, bt, bz, live, phi):
+def _update_phi(m, M, b, bt, bz, live):
     """
     Re-estimate the roll angle of every sample, given the sensors.
 
@@ -560,6 +581,9 @@ def _update_phi(m, M, b, bt, bz, live, phi):
     point is essentially atan2(-e, -d); a couple of Newton steps on the exact
     derivative mop up the rest. That is much cheaper, and better conditioned,
     than a grid search over every sample.
+
+    Takes no previous phi: the closed-form atan2 below is the starting point,
+    so an incoming estimate was only ever overwritten unread.
     """
     u = M[live, :, 0] * bt                              # (L,3)
     v = M[live, :, 1] * bt
@@ -658,7 +682,6 @@ def solve_roll(sweeps, geometry=None, b_earth_ut=DEFAULT_B_EARTH_UT,
     #   * the SIGN of bz comes from how the group means DIFFER. The offset is
     #     identical in every orientation, so differencing the group means
     #     cancels it exactly and leaves only the axial field.
-    alpha = np.zeros(len(groups))
     mus, amps = [], []
     for g in range(len(groups)):
         sel = [m for m, gg in zip(data, gidx) if gg == g]
@@ -730,8 +753,8 @@ def solve_roll(sweeps, geometry=None, b_earth_ut=DEFAULT_B_EARTH_UT,
                 M[i], b[i] = _fit_sensor(X, Y[:, i, :])
 
         # ---- step B: field, given the sensors -----------------------------
-        phis = [_update_phi(m, M, b, bt[g], bz[g], live, phi)
-                for m, g, phi in zip(data, gidx, phis)]
+        phis = [_update_phi(m, M, b, bt[g], bz[g], live)
+                for m, g in zip(data, gidx)]
 
         # Refit each orientation's (cos, sin) pair unconstrained -- only the
         # RATIO is observable -- then restore the magnitude from |B|. That is
@@ -746,7 +769,8 @@ def solve_roll(sweeps, geometry=None, b_earth_ut=DEFAULT_B_EARTH_UT,
                      + M[live][:, :, 1][None] * np.sin(phi)[:, None, None])
                 q = np.broadcast_to(M[live][:, :, 2][None], p.shape)
                 t = m[:, live, :] - b[live][None]
-                pa.append(p.reshape(-1)); qa.append(q.reshape(-1))
+                pa.append(p.reshape(-1))
+                qa.append(q.reshape(-1))
                 ta.append(t.reshape(-1))
             A = np.column_stack([np.concatenate(pa), np.concatenate(qa)])
             s, *_ = np.linalg.lstsq(A, np.concatenate(ta), rcond=None)
@@ -1007,7 +1031,6 @@ def range_transfer(b_lo_mt, b_hi_mt, min_signal_mt=1.0):
 # --------------------------------------------------------------------------
 
 def main(argv=None):
-    import argparse
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sweeps", nargs="+",

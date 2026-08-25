@@ -24,6 +24,7 @@ Options:
                            commit it to EEPROM. USE DELIBERATELY.
 """
 
+import contextlib
 import argparse
 import sys
 import time
@@ -50,6 +51,11 @@ REGS = [
     ("OFFSET_TC_X", 0x1D), ("OFFSET_TC_Z", 0x1E), ("OFFSET_TC_Y", 0x1F),
 ]
 
+# These duplicate octobee.GAIN_TO_RANGE on the PC side, and they have to:
+# this script runs ON THE CARRIER, where the rest of the codebase is not
+# installed. selftest.py's test_gain_tables() parses both copies and fails if
+# they ever disagree -- the drift these tables can cause is a silent 10x on
+# every field number, which is not something to leave to memory.
 GAIN_BITS = {0: 3000, 1: 1500, 2: 150, 3: 15}       # G_CTRL bits 1:0, Table 22
 GAIN_RANGE_MT = {3000: 20, 1500: 40, 150: 400, 15: 4000}
 
@@ -74,7 +80,7 @@ def decode_gain(dx, g_ctrl):
     if helper is not None:
         try:
             return helper(g_ctrl)
-        except Exception:                            # noqa: BLE001
+        except Exception:
             pass
     if g_ctrl & 0x08:                                # bit 3: 4-bit selection
         pre = 1 if (g_ctrl >> 4) & 1 else 10
@@ -90,7 +96,7 @@ def audit():
     for pos in range(1, NSENS + 1):
         try:
             devs[pos] = open_sensor(pos)
-        except Exception as e:                       # noqa: BLE001
+        except Exception as e:
             print(f"  sensor {pos}: openSPI failed: {e}", file=sys.stderr)
             devs[pos] = None
 
@@ -103,7 +109,7 @@ def audit():
                 continue
             try:
                 cells.append(fmt.format(fn(dx)))
-            except Exception:                        # noqa: BLE001
+            except Exception:
                 cells.append(f"{'ERR':>8}")
         print(f"{name:14s}" + "".join(cells))
 
@@ -137,10 +143,8 @@ def audit():
     def read_all(fn):
         vals = {}
         for p in live:
-            try:
+            with contextlib.suppress(Exception):
                 vals[p] = fn(devs[p])
-            except Exception:                        # noqa: BLE001
-                pass
         return vals
 
     # --- registers that MUST be identical: these are operating-mode settings.
@@ -168,7 +172,7 @@ def audit():
     #     chips agree, not what makes them disagree. Only a value that has
     #     dropped out (0 where every sibling is non-zero) is a real fault.
     print("\ncalibration trims -- these are per-chip and SHOULD differ:")
-    for label, addr, unit in (
+    for label, addr, _unit in (
             ("DAC_X  (Bx Hall bias)", 0x11, "mA"),
             ("DAC_Z  (Bz Hall bias)", 0x12, "mA"),
             ("DAC_Y  (By Hall bias)", 0x13, "mA"),

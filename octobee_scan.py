@@ -69,7 +69,13 @@ import octobee_calibration as ocal
 import octobee_posecap as opcap
 import octobee_stage as ostage
 
-N_SENSORS = 16
+N_SENSORS = ocal.N_SENSORS
+
+# Consecutive failed points before a scan gives up. One point can fail for a
+# reason that clears -- a dropped socket, a carrier still releasing the stream.
+# Three in a row is something that is not going to clear on its own, and
+# grinding through 400 more points to find that out wastes the afternoon.
+MAX_CONSECUTIVE_FAILURES = 3
 
 # How long to wait after the last axis reports "not moving" before trusting
 # the head to be still. The stages report motion complete when the CONTROLLER
@@ -190,7 +196,7 @@ class FieldMap:
         side = dict(self.meta)
         side["axes"] = self.axes
         side["n_points"] = len(self)
-        with open(base + ".json", "w") as fh:
+        with open(base + ".json", "w", encoding="utf-8") as fh:
             json.dump(side, fh, indent=2, default=str)
             fh.write("\n")
         return base + ".npz"
@@ -198,14 +204,15 @@ class FieldMap:
     @classmethod
     def load(cls, path):
         base = os.path.splitext(path)[0]
-        z = np.load(base + ".npz")
+        with np.load(base + ".npz") as z:
+            pos_mm, pos_cmd, b_mt = z["pos_mm"], z["pos_cmd"], z["b_mt"]
+            stats = [{"sem_ut": float(s), "lost": int(n)}
+                     for s, n in zip(z.get("sem_ut", []), z.get("lost", []))]
         side = {}
         if os.path.exists(base + ".json"):
-            with open(base + ".json") as fh:
+            with open(base + ".json", encoding="utf-8") as fh:
                 side = json.load(fh)
-        stats = [{"sem_ut": float(s), "lost": int(l)}
-                 for s, l in zip(z.get("sem_ut", []), z.get("lost", []))]
-        return cls(z["pos_mm"], z["pos_cmd"], z["b_mt"],
+        return cls(pos_mm, pos_cmd, b_mt,
                    side.get("axes", []), meta=side, stats=stats)
 
 
@@ -225,6 +232,13 @@ def measure_settle(stages, axis, distance_mm, hosts, cal, probe_s=0.25,
     Worth running once per mechanical configuration. A cantilevered probe on a
     long Z arm can ring for seconds, and a settle time that is too short does
     not look like an error -- it looks like a field gradient.
+
+    RESOLUTION LIMIT: each probe is a full capture_pose(), which opens fresh
+    sockets to both carriers and decodes, so probes land seconds apart however
+    small `probe_s` is. That is fine for a rig that rings for seconds and
+    useless below about two: a fast rig simply reports "settled at the first
+    probe", which is a floor, not a measurement. Read the result as an upper
+    bound, and do not conclude from it that DEFAULT_SETTLE_S is too generous.
     """
     st = stages[axis]
     st.move_by(distance_mm)
@@ -260,23 +274,46 @@ def run_scan(hosts, stages, grid, seconds, cal, settle_s=DEFAULT_SETTLE_S,
     a scan that quietly ran at the reduced live rate would produce a map that
     looks fine and is four times noisier than it should be.
 
-    Returns a FieldMap. On abort, returns the points completed so far rather
-    than nothing: a partial map of a long scan is still worth having.
+    Returns a FieldMap. On abort OR on failure, returns the points completed so
+    far rather than nothing: a partial map of a long scan is still worth
+    having, and at the settings this module recommends a scan is measured in
+    hours. A point that raises is logged, recorded in meta["failures"], and
+    skipped; MAX_CONSECUTIVE_FAILURES in a row ends the scan, still with the
+    map. The only things that raise out of here are the up-front guards below,
+    which fire before any measuring has been done and so cost nothing.
     """
     unknown = set(grid.names) - set(stages.names)
     if unknown:
         raise ostage.StageError(
             f"scan names axes the stage set does not have: "
             f"{', '.join(sorted(unknown))} (have: {', '.join(stages.names)})")
-    unhomed = [n for n in grid.names if not stages[n].homed]
+    stages.interlock.require_clear("a field map")
+    unhomed = [(n, stages[n].distrust_reason) for n in grid.names
+               if not stages[n].position_trusted]
     if unhomed:
         raise ostage.StageError(
-            f"axes {', '.join(unhomed)} have not been homed, so their position "
-            f"counters are unreferenced and the map would have no origin. "
-            f"Home them first.")
+            "these axes' position counters cannot be believed, so the map "
+            "would have no origin -- home them first: "
+            + "; ".join(f"{n} ({why})" for n, why in unhomed))
+    outside = []
+    for name, pts in grid.axes.items():
+        lo, hi = stages[name].limit_mm
+        if not (lo <= float(pts.min()) and float(pts.max()) <= hi):
+            outside.append(f"{name} asks for {pts.min():g}..{pts.max():g} mm, "
+                           f"allowed {lo:g}..{hi:g} mm")
+    if outside:
+        # Up front rather than at the point that leaves the envelope. Each
+        # move checks itself, but discovering it two hours into a six-hour
+        # raster means the map is already half-taken and the operator has
+        # already gone away.
+        raise ostage.StageError(
+            "the scan range leaves what these axes are allowed to use: "
+            + "; ".join(outside))
 
     n = len(grid)
     pos_mm, pos_cmd, rows, stats = [], [], [], []
+    failures = []
+    consecutive = 0
     t_start = time.time()
     log(f"scan: {n} points, {seconds:g} s each, settle {settle_s:g} s "
         f"-- {grid.describe()}")
@@ -285,16 +322,49 @@ def run_scan(hosts, stages, grid, seconds, cal, settle_s=DEFAULT_SETTLE_S,
         if should_abort and should_abort():
             log(f"scan: aborted after {len(rows)} of {n} points")
             break
-        stages.move_to(settle_s=settle_s, **point)
-        if should_abort and should_abort():
-            log(f"scan: aborted after {len(rows)} of {n} points")
+        try:
+            stages.move_to(settle_s=settle_s, **point)
+            if should_abort and should_abort():
+                log(f"scan: aborted after {len(rows)} of {n} points")
+                break
+
+            row, st = opcap.capture_pose(
+                hosts, seconds, cal,
+                chunk_s=chunk_s or opcap.CHUNK_S, drain_s=drain_s)
+            here = stages.position()
+        except KeyboardInterrupt:
+            # Ctrl-C is not an Exception, so it would otherwise unwind past the
+            # handler below and take the completed points with it.
+            log(f"scan: interrupted, keeping {len(rows)} of {n} points")
             break
+        except ostage.MotionInterlocked as exc:
+            # Its own clause, ABOVE the catch-all, and fatal. The generic
+            # handler below skips a failed point and carries on, which is
+            # right for a point that failed and completely wrong for a machine
+            # that has been stopped: it would spend the next several points
+            # re-commanding moves into a latched interlock, logging a failure
+            # each time, until the consecutive-failure count happened to run
+            # out. A stop should end the scan on the spot.
+            log(f"scan: stopped -- {exc}")
+            log(f"scan: keeping {len(rows)} of {n} points")
+            break
+        except Exception as exc:
+            # Everything measured so far stays. Letting this propagate is how a
+            # six-hour map used to end with nothing on disk, because both
+            # callers only ever saw the exception and never the rows.
+            consecutive += 1
+            where = " ".join(f"{k}={v:g}" for k, v in point.items())
+            failures.append({"index": i, "point": dict(point),
+                             "error": f"{type(exc).__name__}: {exc}"})
+            log(f"  point {i + 1}/{n} at {where} FAILED "
+                f"({type(exc).__name__}: {exc}) -- skipping it and carrying on")
+            if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                log(f"scan: {consecutive} points failed in a row, stopping "
+                    f"with {len(rows)} of {n} points kept")
+                break
+            continue
+        consecutive = 0
 
-        row, st = opcap.capture_pose(
-            hosts, seconds, cal,
-            chunk_s=chunk_s or opcap.CHUNK_S, drain_s=drain_s)
-
-        here = stages.position()
         pos_cmd.append([point.get(a, here.get(a, np.nan)) for a in grid.names])
         pos_mm.append([here.get(a, np.nan) for a in grid.names])
         rows.append(row)
@@ -318,6 +388,8 @@ def run_scan(hosts, stages, grid, seconds, cal, settle_s=DEFAULT_SETTLE_S,
         "settle_s": settle_s,
         "n_requested": n,
         "n_captured": len(rows),
+        "n_failed": len(failures),
+        "failures": failures,
         "grid": {k: v.tolist() for k, v in grid.axes.items()},
         "stage_serials": {name: stages[name].serial for name in grid.names},
         # Without this a map cannot be re-read years later: the positions are
@@ -371,8 +443,10 @@ def main(argv=None):
     a = p.parse_args(argv)
 
     hosts = tuple(a.uut) if a.uut else ob.DEFAULT_UUTS
-    cal = ocal.Calibration.load_or_default(a.cal)
+    cal = ocal.Calibration.load_or_default(
+        a.cal, on_error=lambda m: print(f"warning: {m}", file=sys.stderr))
 
+    fm = None
     try:
         with ostage.StageSet.from_config(a.config) as stages:
             if a.settle_scan:
@@ -394,10 +468,10 @@ def main(argv=None):
             est = len(grid) * (a.seconds + a.settle + 2.0)
             print(f"{len(grid)} points, {grid.describe()}")
             print(f"roughly {est / 60:.0f} min at {a.seconds:g} s per point")
-            if not a.yes:
-                if input("start? [y/N] ").strip().lower() not in ("y", "yes"):
-                    print("aborted")
-                    return 1
+            if not a.yes and input("start? [y/N] ").strip().lower() not in (
+                    "y", "yes"):
+                print("aborted")
+                return 1
 
             # capture_pose takes the stream over at the carriers' own rate, so
             # anything already holding it has to let go first.
@@ -408,22 +482,34 @@ def main(argv=None):
             fm = run_scan(hosts, stages, grid, a.seconds, cal,
                           settle_s=a.settle)
 
+    # A partial map is written on every exit path that reached the scan, so an
+    # interrupt or a stage fault an hour in still leaves the hour on disk.
     except ostage.StageError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        rc = 2
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
-        return 130
+        rc = 130
+    else:
+        rc = 0
+
+    if fm is None or not len(fm):
+        return rc
 
     out = a.out or os.path.join(
         "captures", time.strftime("fieldmap_%Y%m%d_%H%M%S"))
     path = fm.save(out)
-    print(f"\nwrote {path} ({len(fm)} points)")
-    if len(fm):
-        sem = np.array([s.get("sem_ut", np.nan) for s in fm.stats])
+    n_req = fm.meta.get("n_requested", len(fm))
+    partial = "" if len(fm) == n_req else f" of {n_req} requested -- PARTIAL"
+    print(f"\nwrote {path} ({len(fm)} points{partial})")
+    if fm.meta.get("n_failed"):
+        print(f"{fm.meta['n_failed']} point(s) failed and were skipped; see "
+              f"'failures' in the .json sidecar")
+    sem = np.array([s.get("sem_ut", np.nan) for s in fm.stats])
+    if np.isfinite(sem).any():
         print(f"per-point noise: median {np.nanmedian(sem):.3f} uT, "
               f"worst {np.nanmax(sem):.3f} uT")
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

@@ -100,12 +100,26 @@ DRAIN_S = 2.0
 # session left the clock down, or a box is misreporting.
 MIN_FS_HZ = 190000.0
 
+# Single-sample white noise per axis, microtesla, measured on this probe at the
+# +/-20 mT range (README section 7). Averaging N samples divides it by sqrt(N)
+# essentially perfectly, which is what makes the noise estimate below a
+# prediction rather than a guess.
+NOISE_1_SAMPLE_UT = 81.5
+
 
 def check_rate(hosts):
-    """Confirm every box is at full rate before an hour of bench work."""
+    """
+    Confirm every box is at full rate before an hour of bench work.
+
+    Returns (ok, layouts) -- the layouts because the caller needs the REAL
+    sample rate to predict the noise it should see, and assuming 200 kSPS
+    there while checking it here would be its own small lie.
+    """
     ok = True
+    layouts = []
     for h in hosts:
         lay = ob.probe_uut(h)
+        layouts.append(lay)
         flag = "" if lay.fs_hz >= MIN_FS_HZ else "   <-- NOT full rate"
         print(f"  {h}: {lay.fs_hz:.0f} Hz, {lay.adc_range}, "
               f"{lay.volts_per_count * 1e6:.1f} uV/count{flag}")
@@ -114,7 +128,7 @@ def check_rate(hosts):
     if not ok:
         print("\nA killed live session leaves the ADC clock down. Fix it with:")
         print("    python octobee.py restore")
-    return ok
+    return ok, layouts
 
 
 def _block_means(ai, n_blocks):
@@ -233,19 +247,30 @@ def survey_uniformity(row_a, row_b, live):
 
 def survey_consistency(rows, live):
     """
-    Four poses -> the one number a gain error cannot fake.
+    Two opposed pose pairs -> the one number a gain error cannot fake.
 
-    Poses 1&3 and 2&4 are each ~180 deg apart, so each pair yields an
-    independent estimate of the same bt for the same sensor. A wrong GAIN
-    scales both estimates identically and cancels in their ratio. Only a field
-    that CHANGES AS THE ARM SWINGS can make them disagree.
+    Each pair is ~180 deg apart, so each yields an independent estimate of the
+    same bt for the same sensor. A wrong GAIN scales both estimates identically
+    and cancels in their ratio. Only a field that CHANGES AS THE ARM SWINGS can
+    make them disagree.
 
     So `spread` (below) says "these sensors disagree with each other", which
     could be the room or could be the chips, while this ratio says "this sensor
     disagrees with ITSELF between two positions", which can only be the room.
+
+    The opposite of pose i is i + n/2, NOT i + 2. Hard-coding rows[0]-rows[2]
+    is only the same thing at exactly four poses: at --poses 6 it differences
+    two poses 120 deg apart, which scales every bt by sin(60 deg) and -- worse
+    -- scales BOTH pairs identically, so the ratio still comes back at 1.0 and
+    reports the room as clean while the premise has quietly failed.
     """
-    a = np.asarray(rows[0]) - np.asarray(rows[2])
-    b = np.asarray(rows[1]) - np.asarray(rows[3])
+    rows = [np.asarray(r) for r in rows]
+    n = len(rows)
+    if n < 4 or n % 2:
+        raise ValueError(f"need an even number of poses, at least 4, got {n}")
+    half = n // 2
+    a = rows[0] - rows[half]
+    b = rows[1] - rows[1 + half]
     d13 = np.linalg.norm(a, axis=1) / 2.0 * 1e3
     d24 = np.linalg.norm(b, axis=1) / 2.0 * 1e3
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -313,14 +338,23 @@ def survey(hosts, cal, live, seconds, chunk, drain, settle, yes, poses=4):
         k += 1
 
     bt, med, spread_pct = survey_uniformity(rows[0], rows[poses // 2], live)
-    full = poses >= 4
+    # The self-consistency check needs two independent opposed PAIRS, so it
+    # wants an even pose count of at least four. An odd count has no opposite
+    # pose at all and gets the single-pair answer above.
+    full = poses >= 4 and poses % 2 == 0
     if full:
         d13, d24, ratio, worst_self = survey_consistency(rows, live)
         bt = 0.5 * (d13 + d24)
         med = float(np.median(bt[live]))
+    elif poses > 4:
+        print(f"\nnote: {poses} poses is odd, so there is no opposed pair to "
+              f"cross-check with. Use an even count for the self-disagreement "
+              f"column.")
 
+    opp = poses // 2
     hdr = ("  sensor    field it sat in     vs median"
-           + ("     from 1&3   from 2&4   self-disagreement" if full else ""))
+           + (f"     from 1&{1 + opp}   from 2&{2 + opp}   self-disagreement"
+              if full else ""))
     print("\n" + hdr)
     for i in range(opc.N_SENSORS):
         mark = "" if live[i] else "   (excluded)"
@@ -336,7 +370,7 @@ def survey(hosts, cal, live, seconds, chunk, drain, settle, yes, poses=4):
     # down one object.
     mad_pct = float(np.median(np.abs(good - med))) / max(med, 1e-9) * 100.0
     print(f"\nmedian transverse field: {med:.2f} uT"
-          f"   (Earth alone would give ~47 uT here)")
+          f"   (Earth alone would give ~{opc.DEFAULT_B_EARTH_UT:.0f} uT here)")
     print(f"spread across the head : {good.min():.2f}-{good.max():.2f} uT "
           f"= {spread_pct if not full else (good.max()-good.min())/med*100:.1f} % "
           f"peak-to-peak, {mad_pct:.1f} % median deviation")
@@ -349,12 +383,12 @@ def survey(hosts, cal, live, seconds, chunk, drain, settle, yes, poses=4):
               + ", ".join(f"S{i + 1} ({bt[i] / med:.2f}x)" for i in outliers))
 
     if full:
-        print(f"\nself-disagreement (a sensor against ITSELF, two positions):")
+        print("\nself-disagreement (a sensor against ITSELF, two positions):")
         print(f"  worst {worst_self:.0f} %. A wrong gain cancels in this ratio, so")
-        print(f"  anything here is the FIELD changing as that arm swings --")
-        print(f"  it cannot be the chip.")
+        print("  anything here is the FIELD changing as that arm swings --")
+        print("  it cannot be the chip.")
 
-    print(f"\nwhere the disagreement comes from:")
+    print("\nwhere the disagreement comes from:")
     print(f"  standing still      : median {np.median(static_pair):.3f} uT, "
           f"worst {static_pair.max():.3f} uT")
     print(f"  after a full turn   : median {np.median(back):.3f} uT, "
@@ -455,7 +489,8 @@ def main(argv=None):
     if a.survey:
         print(f"=== location survey: {a.poses} poses x {a.seconds:.0f} s "
               f"at full rate")
-        if not check_rate(hosts):
+        ok, _layouts = check_rate(hosts)
+        if not ok:
             return 2
         return survey(hosts, cal, live, a.seconds, a.chunk, a.drain,
                       a.settle, a.yes, poses=a.poses)
@@ -465,11 +500,14 @@ def main(argv=None):
           + f" x {a.seconds:.0f} s at full rate")
     print(f"ranges from {a.cal}: "
           f"{', '.join(sorted({f'{r:g} mT' for r in cal.ranges_mt}))}")
-    if not check_rate(hosts):
+    ok, layouts = check_rate(hosts)
+    if not ok:
         return 2
-    expected_ut = 81.5 / np.sqrt(200000.0 * a.seconds)
+    fs_hz = min(lay.fs_hz for lay in layouts)
+    expected_ut = NOISE_1_SAMPLE_UT / np.sqrt(fs_hz * a.seconds)
     print(f"expected noise per pose: {expected_ut:.3f} uT per axis "
-          f"({expected_ut / 49.0 * 100:.3f} % of a 49 uT field)")
+          f"({expected_ut / opc.DEFAULT_B_EARTH_UT * 100:.3f} % of a "
+          f"{opc.DEFAULT_B_EARTH_UT:.0f} uT field)")
 
     rows, all_stats = [], []
     n_total = n_poses + (0 if a.no_closure else 1)

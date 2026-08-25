@@ -29,14 +29,26 @@ LOG = os.path.join(HERE, "octobee_launch_error.log")
 
 
 def report(title, body):
-    """Native MessageBox: works even when the failure is Qt itself."""
-    sys.stderr.write(body + "\n")
+    """
+    Native MessageBox: works even when the failure is Qt itself.
+
+    The dialog goes FIRST, and stderr is only attempted afterwards and only if
+    it exists. Under pythonw.exe -- which is the entire reason this file
+    exists -- sys.stderr is None, so writing to it before showing the box
+    raised AttributeError inside an exception handler and the user got no
+    dialog at all: exactly the silent failure this wrapper is here to prevent.
+    """
     try:
         import ctypes
         MB_ICONERROR = 0x10
         ctypes.windll.user32.MessageBoxW(None, body, title, MB_ICONERROR)
     except Exception:
         pass
+    if sys.stderr is not None:
+        try:
+            sys.stderr.write(body + "\n")
+        except Exception:
+            pass
 
 
 def main():
@@ -48,7 +60,7 @@ def main():
     except Exception:
         tb = traceback.format_exc()
         try:
-            with open(LOG, "w") as fh:
+            with open(LOG, "w", encoding="utf-8") as fh:
                 fh.write(tb)
         except Exception:
             pass
@@ -67,7 +79,7 @@ def main():
     except Exception:
         tb = traceback.format_exc()
         try:
-            with open(LOG, "w") as fh:
+            with open(LOG, "w", encoding="utf-8") as fh:
                 fh.write(tb)
         except Exception:
             pass

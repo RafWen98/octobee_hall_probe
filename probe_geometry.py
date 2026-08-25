@@ -42,16 +42,24 @@ Tube frame convention
     +Y  outward normal of face 1
     faces 0,1,2,3 at 0, 90, 180, 270 degrees about the tube axis
 
+World frame (bench mounting, used only for drawing)
+---------------------------------------------------
+The probe is mounted horizontally: the tube axis runs along the rig's Y with
+the tip end forward, and Z stays up. MOUNT_ROT / to_world() carry that, and
+only the 3D view uses them -- see the note beside MOUNT_ROT.
+
 Chip local frame (before chip_rot_deg)
 --------------------------------------
     local +X  along the arm, pointing away from the tube (tangential)
     local +Z  out of the PCB surface, i.e. along the face's outward normal
     local +Y  completes the right-handed set (runs along the tube)
 
-WHICH SENSOR IS ON WHICH FACE IS NOT YET VERIFIED on this hardware, and neither
-is arm_sense -- see the notes in probe_geometry.json.
+WHICH SENSOR IS ON WHICH FACE IS NOT YET VERIFIED on this hardware -- see the
+notes in probe_geometry.json. arm_sense is: the arms reach clockwise off their
+faces seen looking toward the tip, which is arm_sense -1.
 """
 
+import argparse
 import json
 import os
 
@@ -70,7 +78,11 @@ FACE_NORMALS = np.array([[1.0, 0.0, 0.0],
                          [0.0, -1.0, 0.0]])
 FACE_NAMES = ("+X", "+Y", "-X", "-Y")
 
+# The two arrangements this module can GENERATE. A config file may also say
+# "measured", which means the sensors list in the file came off the bench and
+# is the answer -- see _default_sensors.
 MAPPINGS = ("face-major", "ring-major")
+MEASURED = "measured"
 
 # How a board is attached to its face.
 #   tangential  the board lies flat on the face and reaches out sideways past
@@ -80,6 +92,29 @@ MAPPINGS = ("face-major", "ring-major")
 MOUNT_STYLES = ("tangential", "radial")
 
 TUBE_AXIS = np.array([0.0, 0.0, 1.0])
+
+# ---- how the probe is actually mounted -----------------------------------
+# The tube frame above keeps +Z along the tube because every calibration, pose
+# solve and export is written in it, and none of them care which way the rig is
+# bolted together. The bench does: the probe hangs horizontally, its axis along
+# the rig's Y, tip end (slot 3 -- S4, S8, S12, S16) pointing forward, and Z is
+# up. MOUNT_ROT is that mounting and nothing else, so the 3D view can draw the
+# probe the way it lies on the bench without any of the maths changing frame.
+#
+#     tube +Z (toward the tip)  ->  world +Y (forward)
+#     tube +X (face 0 normal)   ->  world +X (right)
+#     tube +Y (face 1 normal)   ->  world -Z (down)
+#
+# It is a proper rotation (det +1), so mesh winding and handedness survive it.
+MOUNT_ROT = np.array([[1.0, 0.0, 0.0],
+                      [0.0, 0.0, 1.0],
+                      [0.0, -1.0, 0.0]])
+
+
+def to_world(v):
+    """(..., 3) tube-frame points or vectors -> the world frame the view draws."""
+    return np.asarray(v, float) @ MOUNT_ROT.T
+
 
 # Eval-kit PCB, from the vendor drawing. Millimetres.
 ARM_LENGTH_MM = 92.0
@@ -94,7 +129,21 @@ PLATE_GAP_MM = 3.0               # gap between adjacent mounting plates
 
 
 def _default_sensors(mapping):
-    """sensor id (1..16) -> (face, slot along the tube)."""
+    """sensor id (1..16) -> (face, slot along the tube), for a GENERATED layout.
+
+    Refuses anything it cannot generate rather than falling back to face-major.
+    A file marked "measured" carries an arrangement established with a magnet;
+    regenerating it would replace a measurement with a guess that looks exactly
+    like one -- which is the failure this whole module is written against.
+    """
+    if mapping not in MAPPINGS:
+        raise ValueError(
+            f"cannot generate the layout {mapping!r}. "
+            + (f"{MEASURED!r} means the sensors list in the file IS the "
+               f"result -- keep it, or re-run the guided magnet calibration "
+               f"to establish it again."
+               if mapping == MEASURED else
+               f"Known layouts: {', '.join(MAPPINGS)}."))
     out = []
     for i in range(N_SENSORS):
         if mapping == "ring-major":
@@ -122,7 +171,7 @@ class Geometry:
                  first_sensor_z_mm=30.0,
                  tube_length_mm=None,
                  mount_style="tangential",
-                 arm_sense=1,
+                 arm_sense=-1,
                  mapping="face-major", sensors=None, notes="",
                  board_plane=None):
         self.notes = notes
@@ -174,18 +223,45 @@ class Geometry:
             json.dump(self.to_dict(), f, indent=2)
         return path
 
+    # Unrecognised keys are ignored rather than fatal, so a hand-added note in
+    # probe_geometry.json cannot drop the whole file back to defaults. Same
+    # reasoning as Calibration._FIELDS: a plausible-looking default geometry is
+    # worse than a loud error.
+    _FIELDS = frozenset((
+        "tube_width_mm", "arm_length_mm", "fsv_from_tip_mm",
+        "fsv_above_board_mm", "board_thickness_mm", "mount_standoff_mm",
+        "mount_inset_mm", "plate_pitch_mm", "first_sensor_z_mm",
+        "tube_length_mm", "mount_style", "arm_sense", "mapping", "sensors",
+        "notes", "board_plane"))
+
     @classmethod
     def load(cls, path=CONFIG_NAME):
         with open(path, encoding="utf-8") as f:
-            return cls(**json.load(f))
+            doc = json.load(f)
+        if not isinstance(doc, dict):
+            raise ValueError(f"{path}: expected a JSON object, got "
+                             f"{type(doc).__name__}")
+        return cls(**{k: v for k, v in doc.items() if k in cls._FIELDS})
 
     @classmethod
-    def load_or_default(cls, path=CONFIG_NAME):
+    def load_or_default(cls, path=CONFIG_NAME, on_error=None):
+        """
+        Load `path`, or fall back to the nominal geometry.
+
+        A file that exists but will not parse is reported through `on_error`.
+        The default geometry is a guess about which chip is on which face, and
+        a wrong one produces a tube-frame export that looks entirely
+        plausible -- so silently substituting it is the worst of the options.
+        """
         if path and os.path.exists(path):
             try:
                 return cls.load(path)
-            except (OSError, ValueError, TypeError):
-                pass
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                if on_error is not None:
+                    on_error(f"{path} exists but could not be read "
+                             f"({type(exc).__name__}: {exc}) -- falling back "
+                             f"to the nominal geometry, whose sensor-to-face "
+                             f"mapping is an assumption.")
         return cls()
 
     # ---- per-sensor frame ------------------------------------------------
@@ -203,7 +279,13 @@ class Geometry:
         return np.array([self.normal(i) for i in range(1, N_SENSORS + 1)])
 
     def sense(self, sensor_id):
-        """Which way round the tube this arm points: +1 or -1."""
+        """Which way round the tube this arm points: +1 or -1.
+
+        -1 on this probe: looking along the tube toward the tip, each board
+        reaches clockwise off the face it is bolted to. It is a sign on one
+        cross product here, but it mirrors the whole head -- and a mirrored
+        head still looks entirely plausible, which is why it is written down.
+        """
         return float(self.sensors[sensor_id - 1].get("arm_sense", self.arm_sense))
 
     def arm_dir(self, sensor_id):
@@ -306,8 +388,17 @@ class Geometry:
 
     def _rot_signature(self):
         """Cheap fingerprint of everything rotations() depends on."""
+        # Per-sensor arm_sense belongs here as much as the global one does:
+        # sense() honours the override, so leaving it out of the fingerprint
+        # meant flipping one arm changed arm_dir() and rotation() but never
+        # invalidated the cache. The correction appeared to do nothing, and the
+        # tube-frame export, the 3D view and identify_faces() all carried on
+        # with the old orientation. arm_sense is one of the three things
+        # probe_geometry.json still marks UNVERIFIED, so it is exactly the
+        # field someone will edit.
         return (self.mount_style, self.arm_sense,
                 tuple((s["face"], s.get("chip_rot_deg", 0.0),
+                       s.get("arm_sense", self.arm_sense),
                        tuple(s.get("axis_signs", (1, 1, 1))))
                       for s in self.sensors))
 
@@ -443,7 +534,6 @@ def chip_mesh(geom, sensor_id, size_mm=CHIP_SIZE_MM):
 
 
 def main():
-    import argparse
     p = argparse.ArgumentParser(description="probe geometry helper")
     p.add_argument("--config", default=CONFIG_NAME)
     p.add_argument("--mapping", choices=MAPPINGS,

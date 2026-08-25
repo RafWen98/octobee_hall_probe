@@ -65,6 +65,11 @@ ADDR_KEY = 0xFE         # EEPROM 0x1FE
 ADDR_CKSUM = 0xFF       # EEPROM 0x1FF
 KEY_VALID = 0xA5
 
+# These duplicate octobee.GAIN_TO_RANGE on the PC side, and they have to:
+# this script runs ON THE CARRIER, where the rest of the codebase is not
+# installed. selftest.py's test_gain_tables() parses both copies and fails if
+# they ever disagree -- the drift these tables can cause is a silent 10x on
+# every field number, which is not something to leave to memory.
 GAIN_SEL = {3000: 0, 1500: 1, 150: 2, 15: 3}          # datasheet Table 22
 SEL_GAIN = {v: k for k, v in GAIN_SEL.items()}
 GAIN_RANGE_MT = {3000: 20, 1500: 40, 150: 400, 15: 4000}
@@ -96,7 +101,7 @@ def open_sensor(pos, verify=False):
             return None
         dx.read_reg_val(reg_address=0x3F)             # cheap liveness probe
         return dx
-    except Exception:                                 # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -123,11 +128,11 @@ def cmd_show(devs):
         key = d.read_EEPROM_key_byte_reg()
         ok = d.verify_EEPROM_data_for_config()
         ex, ez, ey = decode_egain(eg)
-        print(f"{pos:>4} {str(g):>14} {gain:>6} "
+        print(f"{pos:>4} {g!s:>14} {gain:>6} "
               f"{'+/-'+str(GAIN_RANGE_MT.get(gain,'?'))+'mT':>9} "
               f"{GAIN_VPT.get(gain, float('nan')):>7.2f} "
               f"{'0x%02x' % eg:>10} {f'{ex}/{ez}/{ey}':>16} "
-              f"{'0x%02x' % key:>6} {str(ok):>6}")
+              f"{'0x%02x' % key:>6} {ok!s:>6}")
 
 
 def cmd_backup(devs, path):
@@ -206,7 +211,7 @@ def cmd_verify(devs, gain):
         if not good:
             bad.append(pos)
         print(f"{pos:>4} {g:>6} {'0x%02x' % eg:>10} {'0x%02x' % key:>6} "
-              f"{str(ok):>6} {str(dac):>14} {str(sens):>14}  "
+              f"{ok!s:>6} {dac!s:>14} {sens!s:>14}  "
               f"{'OK' if good else 'MISMATCH'}")
     print()
     if bad:

@@ -14,13 +14,16 @@ channels: Phoebus was pointed at one box.
 
 | carrier | IP | ACQ423 s/n | sensors | stream frame |
 |---|---|---|---|---|
-| `acq1001_694` | 192.168.1.82 | E42310297 | S1–S8 | 96 B (24 LW), 1 encoder word |
-| `acq1001_695` | 192.168.1.83 | E42310298 | S9–S16 | 104 B (26 LW), 3 encoder words |
+| `acq1001_694` | 192.168.1.82 | E42310297 | S1–S8 | 96 B (24 LW), 1 site-2 word (**not** an encoder) |
+| `acq1001_695` | 192.168.1.83 | E42310298 | S9–S16 | 104 B (26 LW), 3 encoder words (ENC_X/Y/Z) |
 
 Both: ACQ423ELF, 32 ch, 16-bit packed, ±10 V, 200 kSPS, SPAD = 7 longwords.
 The two boxes have **different frame layouts**, so anything that decodes the raw
 stream has to read the geometry off the box rather than hard-code it. The tools
 here do that.
+
+The asymmetry is not cosmetic: only 695 has quadrature-encoder logic in its
+FPGA, so only 695 can read an encoder at all. See *The encoders* in section 9.
 
 The carriers are **not** synchronised — each free-runs on its own oscillator
 (measured 200001 Hz vs 199999 Hz). The two halves of the probe drift relative to
@@ -99,57 +102,137 @@ stop it automatically. To go back to Phoebus, just press its start button again.
 
 ## 3. What the hardware is telling us right now
 
-From a 2 s capture of both boxes, ambient field, no magnet:
+Re-measured **2026-08-21** against both live carriers: 2 s, ~400 k samples per
+box, ambient field, no magnet, stage motors powered off. Frame alignment was
+verified before trusting any of it -- `sam_cnt` increments by exactly 1 and
+`usec_cnt` by exactly 5 across the whole capture.
 
-**Dead sensor.** `acq1001_695` ch29/30/32 (S16 Bz, By, VCM) are pinned at
-−32768 counts — negative full scale, zero variance. ch31 (Bx) reads normally.
-Three of four lines dead but one alive points at the port-8 ribbon/connector on
-that concentrator, not a dead chip. **Fix this before calibrating.**
-
-**Noise rises steadily along the ribbon.** The VCM channel carries no field, so
-its noise is pure analog-path pickup. Per box it climbs monotonically with port
-number:
+**S16 is alive.** This section used to record ch29/30/32 pinned at -32768 counts
+with a faulty port-8 ribbon. That is repaired:
 
 ```
-694 VCM noise [counts]:  S1 0.52  S2 0.54  S3 0.55  S4 1.26
-                         S5 0.97  S6 2.00  S7 3.33  S8 12.47
-695 worst:               S9 13.26   (S9 field channels: 136–311 counts std)
+S16  ch29 Bz  mean 7240.7  std 20.41       ch31 Bx  mean 7288.5  std 22.37
+     ch30 By  mean 7290.5  std 23.36       ch32 VCM mean 7290.0  std  0.74
 ```
 
-That is a cabling/grounding signature — longer runs and later connector
-positions picking up more. It is not a sensor calibration problem, and no amount
-of gain trimming will fix it. Worth reseating and checking the ribbon
-grounding on the high-numbered ports.
+All four channels read normally with healthy variance and nothing is railed.
+`calibration.json` keeps `dead` empty on purpose and the GUI decides at run
+time, so there is nothing to change there.
 
-**VCM spread.** 2.2324 V (S1) down to 2.1420 V (S8). ~90 mV = ~295 counts =
-about 1.4 mT of *apparent* field at the 20 mT range if you plot raw channels.
-This shifts baselines, not amplitudes — but it will wreck any absolute reading.
+**The ribbon-pickup problem is gone.** VCM carries no field and no amplifier
+gain, so its noise is pure analog-path pickup. It used to climb monotonically
+with port number, reaching 12.47 counts on S8 and 13.26 on S9. It no longer
+does:
+
+```
+694 VCM noise [counts]:  S1 0.51  S2 0.51  S3 0.55  S4 1.03
+                         S5 0.73  S6 0.86  S7 0.70  S8 1.18
+695 VCM noise [counts]:  S9 2.15  S10 0.66  S11 0.54  S12 0.58
+                         S13 0.83  S14 0.52  S15 0.54  S16 0.72
+```
+
+Every channel now sits between 0.5 and 2.2 counts. Whatever the cabling fault
+was, reseating fixed it. **Do not cite the old numbers to justify re-cabling.**
+
+**A dead box looks quiet, not noisy.** When 695's eval kits lost power during
+the 2026-08-21 connector work, all 32 of its channels read ~-0.02 V with std
+~0.7 counts. That is *below* the SENM3Dx's own noise floor of ~13 counts, which
+is the tell: a working Hall sensor cannot be that quiet. Check **VCM** -- it is
+the chip's internally generated virtual ground and reads ~2.2 V whenever the
+chip has power. At 0 V the chips are unpowered, whatever else the channel looks
+like.
+
+**VCM spread.** 2.2360 V (S1) down to 2.1566 V (S4). ~80 mV = ~260 counts =
+about 1.2 mT of *apparent* field at the 20 mT range if you plot raw channels.
+This shifts baselines, not amplitudes -- but it will wreck any absolute reading.
 
 **ASIC temperatures look wrong.** Several read 8–14 °C, below plausible room
 temperature. Either the AMUX channel mapping on the CELF differs from the guide,
 or those inputs are not connected. Treat the temperature column as unverified.
 
-**PWR_GOOD** reads `0xff000fff` (694) and `0xffffff00` (695), not `0xffffffff`.
-Per the guide it only latches at boot, so it may be stale — but it is worth a
-reboot to see whether it agrees with the S16 fault.
+**PWR_GOOD is less useful than it looks.** It is constant within a capture, but
+it changed on 694 between two captures *with no reboot in between*
+(`0x0ff0ffff` -> `0x0f0f0fff`) while that box's sensors were demonstrably
+healthy. Do not read the individual nibbles as a per-sensor health map. The one
+case where it was decisive: with 695's sensor power disconnected it read
+`0x00000000` flat, against a non-zero word on the working box.
 
-**The two boxes' chips are configured differently.** `octobee_cal.py` includes an
-SPI-free check for this. The VCM channel is the control: it leaves the same
-package, travels the same ribbon into the same ADC, but carries no Hall signal
-and no amplifier gain. So `noise(field) / noise(VCM)` isolates the amplifier
-chain with the shared cable pickup divided out. On the sensors whose VCM is
-clean:
+**The 1.9× gain split between the boxes is history.** It was real, it was a
+register difference rather than cabling, and it is what motivated the
+harmonisation below -- all 16 chips have run gain 3000 since 2026-08-19. The
+`noise(field) / noise(VCM)` check in `octobee_cal.py` is still the right tool if
+the two halves ever diverge again.
 
-```
-acq1001_694  S1 14.9   S2 15.2   S3 14.2   S5  9.3        median 14.5
-acq1001_695  S10 20.9  S11 27.2  S12 26.3  S13 38.6  S14 28.4  S15 28.8   median 27.8
-```
+### Telling a bad chip from a bad cable, without unplugging anything
 
-A consistent **1.9×** split between the boxes, with matching VCM noise. That is a
-register difference — amplifier gain (`G_CTRL_X/Z/Y`) and/or low-pass corner
-(`PWM_CTRL` bits 5:4) — not cabling. A chip at higher gain gives a proportionally
-bigger spike for the same field. Sensors whose VCM is already noisy (S4, S6–S9)
-cannot be assessed this way; the report says so rather than guessing.
+VCM is the control channel. It leaves the same package, runs the same 20-way
+ribbon, crosses the same concentrator port and lands in the same ADC group as
+that chip's Bx/By/Bz -- but carries no Hall signal. So:
+
+* noise on the field channels **and** on that chip's VCM -> shared analog path:
+  connector, ribbon, grounding. Re-cabling can fix it.
+* noise on the field channels and **absent from VCM** -> generated after the
+  point where VCM branches off, i.e. inside the chip. Re-cabling cannot.
+
+Second discriminator: compare the same frequency band on *neighbouring* chips. A
+real magnetic disturbance couples into everything nearby; a chip oscillating
+into its own output does not.
+
+This was validated by experiment on 2026-08-21. S15's Bx carried a 2.44 kHz
+square wave -- 81.5 % of its power, std 176 counts -- with a clean VCM (0.57)
+and only 0.34 % of that band on every neighbour, so the method predicted "bad
+chip, not bad cable". The eval kits on 695 **ports 3 and 7 were then physically
+exchanged**:
+
+| 695 port | before the swap | after the swap |
+|---|---|---|
+| port 3 | Bx std 15.02, 2.44 kHz = 0.36 % | Bx std **163.80**, 2.44 kHz = **82.62 %** |
+| port 7 | Bx std **176.61**, 2.44 kHz = **81.53 %** | Bx std 15.06, 2.44 kHz = 0.31 % |
+
+The fault travelled with the chip. The port, ribbon, concentrator channel and
+CELF path were all clean under a different chip. **Method confirmed** -- so the
+remaining faults can be diagnosed from a capture instead of an afternoon with a
+screwdriver.
+
+### The five bad channels
+
+Power in each fault's dominant line, relative to the faulty channel itself:
+
+| chip | axis | dominant line | std [counts] | own VCM | neighbours |
+|---|---|---|---|---|---|
+| ex-S15 (see above) | Bx | 2.44 kHz | 164 | clean | 0.004 |
+| S4 (694) | Bx | 77.5 kHz | 78 | 0.000 | 0.012–0.035 |
+| S9 (695) | Bz | 19.8 kHz | 71 | 0.001 | 0.027–0.072 |
+| S13 (695) | Bx | 98.2 kHz | 65 | 0.000 | 0.017–0.067 |
+| S8 (694) | Bx | 14.3 kHz | 59 | 0.000 | 0.023–0.13 |
+
+Clean channels sit at 13–17 counts for comparison. Every fault is absent from
+its own chip's VCM and 15–60× weaker on the neighbours: **all five are chip
+faults, and no connector work will fix any of them.**
+
+**Four of the five are on Bx**, which is always `ch 4k+3`. Four independent eval
+kits failing on the same axis is a pattern worth raising with the vendor, not
+five coincidences.
+
+**S8's Bz is not S8's fault.** Its dominant 79.4 kHz line is **4.3× stronger at
+S4** than at S8, and is visible right across the box (S5 1.16, S6 0.39, S7 0.40,
+S1–S3 ~0.25). That is a real magnetic field radiating from around S4 which the
+other Hall sensors honestly detect. S4 is therefore the highest-value repair on
+694 -- worst single channel *and* contaminating its neighbours. Expect S5, S6,
+S7 and part of S8 to improve when it is fixed.
+
+**S9's noisy VCM is a red herring.** Its VCM excess sits at 1.03 kHz, and S11,
+S12, S13 and S15 all carry the same 1 kHz comb at 0.71–0.83 of S9's level -- a
+small box-wide common-mode artefact, unrelated to S9's actual fault at 19.8 kHz.
+
+**These numbers move ~20 % run to run.** S7 By measured 30.2 then 36.6 counts in
+two back-to-back identical captures. Do not chase small changes.
+
+> **Probe state, 2026-08-21:** 695 ports 3 and 7 are still **swapped** from the
+> diagnostic above, so the software's sensor index does not match physical tube
+> position. Every `probe_geometry.py` rotation, zero and calibration keyed by
+> index is wrong until they are exchanged back. Swap them back before taking any
+> calibration or field data.
 
 ### SPI audit, acq1001_694 (S1–S8)
 
@@ -367,10 +450,21 @@ field-sensitive volume is at the centre of the QFN28 package, 100 × 100 × 10 �
 
 ### Step 0 — fix the hardware first
 
-Repair the S16 port. Reseat the high-numbered ribbons. Re-run
-`python octobee_cal.py --seconds 5` and confirm all 16 sensors show VCM noise
-below ~1 count before going further. Calibrating over a cabling fault just bakes
-the fault into your coefficients.
+The cabling work is **done**: S16 is repaired and every VCM now reads between
+0.5 and 2.2 counts (section 3). What remains is five chip-level faults that no
+amount of reseating will fix, so this step is now a check rather than a job.
+
+Re-run `python octobee_cal.py --seconds 5` and confirm every sensor still shows
+VCM noise below ~2 counts. If one has crept up, that is a cabling fault and
+calibrating over it bakes it into your coefficients. If instead a *field*
+channel is noisy while its own VCM is clean, that is a chip fault -- see
+*Telling a bad chip from a bad cable* in section 3 -- and it cannot be reseated
+away. Decide whether to exclude that axis rather than holding up calibration
+for it.
+
+**695 ports 3 and 7 are currently swapped** from the diagnostic in section 3.
+Exchange them back first, or every geometry matrix, zero and offset keyed by
+sensor index will be wrong.
 
 ### Step 1 — make the chips identical (this is the likely culprit)
 
@@ -465,7 +559,13 @@ Store them as your offset table. For a proper zero you want either a zero-gauss
 chamber, or the flip method: rotate the probe 180° and average the two readings,
 which cancels the ambient field and leaves the offset.
 
-### Step 5 — cross-calibration
+### Step 5 — cross-calibration (superseded — see Step 5b)
+
+> **Superseded by Step 5b.** In the GUI this now lives behind *Calibration →
+> show the superseded manual routines*, unticked by default. It is kept because
+> a hand pass is still the quickest way to see whether all sixteen channels are
+> alive, but it should not be what sets your gain trim: the correction it needs
+> and the geometry it needs to compute that correction are the same unknown.
 
 With gains harmonised and offsets known, present the *same* magnet to each
 sensor in turn, normal to that sensor's face, at a fixed distance — use a
@@ -480,7 +580,159 @@ ratios are your per-sensor scale factors `k_i = B_ref / |B|_i`. After Step 1 the
 should land inside a few percent; anything still outside ±10 % means that chip's
 EEPROM calibration is suspect or its mounting differs.
 
-### Step 6 — Earth-field roll calibration (the accurate way to match sensors)
+### Step 5b — the guided magnet run (motorised, and geometry-free)
+
+Step 5 as written above has a weakness it cannot escape: presenting the same
+magnet to each sensor *by hand* means a different distance and angle every
+time, and correcting for that needs `expected_response()` — i.e. it needs the
+geometry file to be right, which at Step 5 it is not yet. The correction and
+the thing being corrected are the same unknown.
+
+With the stages, there is a version where the geometry cancels instead of being
+modelled. The tube axis lies along the rig's **y**, so driving the *head* along
+y past a **fixed** magnet carries S1, S2, S3, S4 of one face past it at the
+**same closest approach**, one after another. Turn the head a quarter turn and
+the next face gets its turn on the same terms. After four poses all 16 peaks
+are directly comparable, and
+
+`trim_i = median(peak) / peak_i`
+
+is a pure gain ratio with no 1/r^n anywhere in it. Against a synthetic dipole
+with a known ±8 % gain error injected, the run recovers it to **0.5 %** — the
+residual being the sampling grid, not the method — where a single fixed-magnet
+pass over the same probe spreads the raw peaks by **277×** from geometry alone.
+
+#### Why one sweep is not enough: the arms are not identical
+
+"Same closest approach" above is doing real work, and it is only true if the
+sixteen arms are identical. They are not. Each chip rides at the tip of a 92 mm
+board, so a degree of board rotation about its bolt, or a foot seated proud,
+puts the chip a millimetre from where the file says — and at 1/r³ and a 20 mm
+standoff that is `3 × 1/20` ≈ **15 % of trim per millimetre**, which is larger
+than the gain spread being measured.
+
+Resolved along the three directions of the magnet-to-chip line, the
+misplacement behaves completely differently, and each direction needs its own
+treatment. So each pose is **three passes**, not one:
+
+| pass | what it does | what it fixes |
+|---|---|---|
+| **A** locate | coarse sweep along the tube | finds where the four rings are |
+| **B** cut | fine sweep *across* the face at each ring | each sensor measured at the top of its *own* peak, not at a slice through it |
+| **C** dither | a few points *toward and away from* the magnet at each ring | measures each chip's actual distance |
+
+Pass C is not a sweep for a peak, because along the standoff direction there
+isn't one — `|B|` just keeps rising as the chip gets closer. What that direction
+carries is a slope and a curvature, and those give the distance and the falloff
+exponent outright:
+
+`|B| = C·|d−z|^−n` ⟹ `d = slope / curvature`, `n = slope² / curvature`
+
+both read off the dither with no constant assumed and nothing taken from the
+geometry file. Correcting every sensor to a common, *measured* standoff removes
+the last first-order term. Against a synthetic probe with 1 mm of misplacement
+on all three axes, a bare axial sweep records **9.9 %** of fake gain; all three
+passes bring it to **1.8 %**. On straight arms the extra passes cost nothing —
+the standoff correction shrinks itself toward the identity when the scatter it
+would correct is no bigger than the fit's own noise.
+
+The whole thing costs about 5× the points of a bare axial sweep (~130 per pose
+here), against the ~39 000 a full volume raster would need to learn the same
+thing.
+
+> **B and C are a package — run both, or neither.** Pass C's model is *moving
+> straight toward the magnet*, which is only true once B has put the chip
+> underneath it; off to one side by `a`, the fit returns `h·r²/(h²−a²)` instead
+> of the distance — 51 mm for a chip really 26 mm away, on this rig's geometry.
+> And B on its own moves every chip to its true, *nearer* closest approach,
+> which amplifies whatever first-order error is left: B alone takes that 9.9 %
+> to **12.8 %**. It is only a win once C is there to collect it. The wizard
+> refuses the dither without the cut for this reason.
+
+You do not have to park the magnet accurately. Finding each peak is what pass B
+is for — that is most of the point of it.
+
+**Calibration tab → Guided magnet calibration (motorised, 4 poses).** The
+wizard drives each pass, averages at every point at the full 200 kSPS, and
+stops between poses to ask you to index the tube. Tell it roughly how far the
+magnet is from the chips: nothing is measured with that number, but both B and
+C have to be *sized* from it — the cut wants a half-span of about one standoff,
+because that is the width of the peak it is hunting, and the dither wants a
+quarter of one, because curvature is second order and a ±1 mm dither buries it
+under the slope. When it finishes it **writes
+the trim to `calibration.json`** as well as applying it, and saves the run
+itself beside it — an hour of measurement that lives only in memory until
+somebody remembers to press *Save calibration* is an hour waiting to be lost.
+Untick the box and it applies nothing, and says where the run is so it can be
+applied later without repeating it. Two conditions, which are why
+it is guided rather than a button:
+
+* the magnet must not move between poses, and nothing ferrous may — it is the
+  common reference for all four;
+* the turn must be about the tube's **own axis and nothing else**. A pose that
+  also shifts the head sideways breaks the equal-approach argument quietly, and
+  the numbers still look plausible afterwards. (The self-test injects exactly
+  this mistake and checks that it changes the answer.)
+
+The run also measures what `probe_geometry.json` still assumes: sorting the 16
+peak positions gives the physical order along the tube, and grouping by which
+pose was loudest sorts the sensors onto faces. It **reports** disagreements
+with the file rather than rewriting it. Pass B adds to that — the transverse
+position of each sensor's peak is a direct measurement of where its arm
+actually put the chip, printed in the report as an `x peak` column, and the
+`standoff` column beside it is the same for the radial direction. Read those
+two before the trim: if the standoff column is mostly `--`, pass C could not
+fit and the distances are assumed rather than measured, and the fix is a longer
+average per point.
+
+It does not replace Step 6 — but it takes most of Step 6's job. This fixes the
+scalar per-sensor response, says which sensor is where, and now measures the
+position error that Step 6 existed to sidestep. What the Earth-field roll sweep
+still does alone is pin each chip's **orientation** in three dimensions. Run
+this one first regardless: knowing which sensor is on which face makes the roll
+solve's per-face report readable.
+
+#### The one setup fault that looks exactly like gain
+
+Everything above rests on the head turning about its **own** axis, so all four
+faces meet the magnet at the same distance. If the head is not concentric with
+whatever it is turned about, one face comes closer and the opposite one goes
+further by the same amount — and 1/r³ turns a sub-millimetre error into a ten
+per cent "gain" difference that the trim will happily absorb.
+
+It is separable because it is *anti-symmetric*. The geometric factor multiplies
+one face by k and its opposite by 1/k, so the **product** of two opposite
+faces' mean responses survives it while each face on its own does not. The run
+report therefore prints opposite faces side by side, and says so when they
+disagree by more than 5 %:
+
+```
+opposite faces (equal unless the head is off-centre):
+  +X vs -X:  12.225 vs  12.578 mT  (0.972x, ~0.5% off-centre)
+  +Y vs -Y:  13.599 vs  11.406 mT  (1.192x, ~2.9% off-centre)
+```
+
+That is the real run of 2026-08-24: one pair clean, the other 19 % apart, so
+roughly ±9 % of what that trim calls gain on the ±Y faces is geometry wearing
+gain's clothes. The within-face numbers are unaffected — face 0 spans 1.056×
+across its four sensors — because those four never move relative to each other.
+
+When it fires, either re-centre the head and run again, or accept that the
+face-to-face part of the trim is not purely electrical. The peak-spread line in
+the report stops claiming "this is gain only" when it does.
+
+### Step 6 — Earth-field roll calibration (superseded for gain; still the way to pin orientation)
+
+> **Superseded for gain matching by Step 5b**, which measures the position error
+> this step was invented to dodge, rather than dodging it. In the GUI it now
+> lives behind *Calibration → show the superseded manual routines*, unticked by
+> default.
+>
+> It has not become useless: the roll sweep is still the only thing here that
+> pins each chip's **orientation** in three dimensions and settles
+> `chip_rot_deg` / `axis_signs`. Run 5b first for gain and the sensor-to-face
+> map, then this if you need the orientation solve. The rest of this section is
+> written as it was, when it was the accurate way to match sensors.
 
 Step 5 matches sensors with a magnet, and its accuracy is capped by *geometry*,
 not by noise. `cross_calibrate()` has to divide out the 1/r³ weight from
@@ -680,8 +932,9 @@ and repeats, not angles. Same four positions, total data is what counts:
 90° index each time; a revisited pose also shows you drift directly, since two
 rows that should be identical are sitting in the same file.
 
-In the GUI: *Calibration → 3. Earth-field roll calibration → Record sweep A / B /
-C → Solve → Apply*. Or offline:
+In the GUI: tick *Calibration → show the superseded manual routines*, then
+*Superseded: Earth-field roll calibration → Record sweep A / B / C → Solve →
+Apply*. Or offline:
 
 ```bash
 python octobee_posecal.py captures/rollsweep_A.npz \
@@ -796,13 +1049,21 @@ sensor and amplifier noise shaped by the SENM3Dx's 100 kHz low-pass, not pickup
 and not mains (50 Hz is 0.0 % of the power). §8 covers why 100 kHz is already the
 narrowest corner the part offers.
 
-There is also a code reason to stay bipolar: `Layout.volts_per_count` is
-`span/65536` with **no offset term**. That is correct for ±10 V (0 counts = 0 V),
-but a unipolar 0–5 V range puts 0 V at −32768, so true volts are
-`counts*vpc + 2.5`. Field readings survive — subtracting VCM cancels the missing
-pedestal — but every raw channel would read 2.5 V low, and
-`PLAUSIBLE_V = (-0.5, 5.5)` in `channel_health()` would call all 64 healthy
-channels broken.
+There used to be a code reason to stay bipolar as well, and there is not any
+more. A unipolar 0–5 V range puts 0 V at −32768, so true volts are
+`counts*vpc + 2.5`; `Layout.volts_per_count` carried no such offset term, so
+every raw channel would have read 2.5 V low and `PLAUSIBLE_V = (-0.5, 5.5)` in
+`channel_health()` would have called all 64 healthy channels broken. Field
+readings would have survived — subtracting VCM cancels the pedestal — which is
+what made it dangerous: the diagnostics would scream while the numbers looked
+fine.
+
+`ADC_RANGES` now carries `(span, volts_at_count_zero)` per range and
+`Layout.volt_offset` exposes it; `assemble()` and `channel_health()` take it as
+an argument, and every capture records it so an old file still reads back
+correctly. `probe_uut()` refuses a range it does not have a table entry for
+rather than guessing. So switching the range is now safe — it is still not a
+resolution win, for the reasons above.
 
 What *does* work is averaging: this noise is white, and falls as 1/√N almost
 perfectly (81.5 → 27.4 → 8.8 → 2.8 → 1.1 µT at 1/10/100/1000/10000×). So the
@@ -873,6 +1134,9 @@ but it is not a resolution win and it is not a priority.
 | `octobee_cal.py` | PC | health + calibration report, optional PNG |
 | `octobee_idmap.py` | PC | proves the channel↔sensor map (SPI sweep or magnet pass) |
 | `onbox_sensor_audit.py` | **carrier** | SPI register audit of all 8 chips; `--id-sweep`, `--set-gain` |
+| `onbox_gain_config.py` | **carrier** | reads/sets the amplifier gain **permanently** in EEPROM, with a backup and a restore path — see §3 |
+| `onbox_set_sample_rate.sh` | **carrier** | report or set the ADC rate, with the aliasing cost stated |
+| `fix_carrier_keys.sh` | **carrier** | repair `authorized_keys` and install the workstation key |
 | `octobee_gui.py` | PC | the application: live view, 3D probe head, calibration, exports |
 | `probe_geometry.py` | PC | chip positions and per-chip rotation matrices on the tube |
 | `probe_view3d.py` | PC | the 3D probe-head widget |
@@ -882,9 +1146,12 @@ but it is not a resolution win and it is not a priority.
 | `octobee_record.py` | PC | CSV / raw / report writers |
 | `octobee_stage.py` | PC | Thorlabs LTS300C control over the Kinesis C API — no Kinesis app, no pythonnet |
 | `octobee_scan.py` | PC | motorised field map: move, settle, average at full rate, repeat |
-| `octobee_launch.pyw` | PC | what the desktop icon runs: no console, but startup failures still reported |
+| `octobee_profile.py` | PC | span timing, event-loop lag and GL renderer detection behind `--profile` |
+| `octobee_launch.pyw` | PC | what the desktop icon runs: no console, but startup failures still reported in a native dialog |
 | `octobee.ico` | PC | application icon |
-| `selftest.py` | PC | end-to-end verification, offline or against the hardware |
+| `selftest.py` | PC | end-to-end verification, offline or against the hardware. 245 checks; the quality gate |
+| `pyproject.toml` | PC | packaging and the ruff lint configuration, with a reason beside every rule that is switched off |
+| `.github/workflows/checks.yml` | CI | runs `ruff check` and `selftest.py` on every push |
 
 The command-line tools need only `numpy` and `matplotlib`. The GUI additionally
 needs `PyQt6`, `pyqtgraph` and `PyOpenGL` — `pip install -r requirements.txt`.
@@ -904,6 +1171,58 @@ python octobee_gui.py                       # the two carriers
 python octobee_gui.py --demo                # synthetic probe, no hardware
 python octobee_gui.py --replay captures/ambient_test.npz
 ```
+
+### It connects itself when it opens
+
+The window starts connecting as soon as it is on screen — carriers and stages
+both, the same as pressing Connect. `--no-connect` starts it disconnected, for
+when you only want to read a saved capture or edit a calibration on a bench
+with the hardware switched off.
+
+If the automatic attempt fails it says so in the Log and stops there: no dialog
+to dismiss. Arriving at this program with the carriers off is a normal thing to
+do, and a modal on every launch would only teach you to dismiss modals. Connect
+stays enabled and will try again.
+
+### Connect brings up the whole rig
+
+The probe and the stages are one instrument — the carriers read the field, the
+stages say where it was read — so **Connect** opens both, and **Disconnect**
+closes both. The stages come from the axis map in `stages.json`; if that has no
+map yet, or a stage in it is not on the bus, the probe connects anyway and the
+Log says what was missing. A bench with no stages plugged in behaves exactly as
+it did before.
+
+Anything that can go wrong on the motion side is caught and logged rather than
+raised: a stale USB handle or a missing Kinesis install must not stop the probe
+half of the window from coming up.
+
+### Homing, and why the window asks
+
+An unhomed stage still reports a position, and that number is **whatever was
+left in its counter**. It looks exactly like a real coordinate. So the moment
+the stages come up, and only then, the window asks whether to reference them —
+before anyone has read a number off the screen and believed it.
+
+It asks rather than simply doing it because homing drives each carriage into
+its limit switch across the whole travel, with the probe head and its cabling
+mounted. Only the person in the room can say that is clear. Until an axis is
+homed, absolute moves and field maps are refused; jogging is relative and works
+either way.
+
+### The Help tab
+
+Searchable documentation, indexed from **this README** at startup, plus a
+handful of topics about the window itself (shown in blue). Type a few words —
+`homing`, `roll sweep`, `why is it loud`, `VCM` — and matching sections are
+ranked with heading hits first.
+
+Indexing the README rather than writing separate help text is deliberate: the
+reasoning already lives here, and a second copy in a help pane would be wrong
+within a month because nobody proof-reads help text against a README. The
+consequence is that the help is only as good as this file, which is the right
+incentive — a topic that is hard to find in the window is a heading that needs
+rewriting here.
 
 ### The desktop icon
 
@@ -946,7 +1265,9 @@ whatever tab you are on.
 
 *Live, both carriers, no magnet. S16 is excluded automatically and dropped from
 the legend; the bar chart ranks the rest by peak |B| and reproduces the known
-noise pattern — S9 worst, then S15, S13 and S8.*
+noise pattern — S9 worst, then S15, S13 and S8. Those four are the chip faults
+catalogued in section 3; S16 was still excluded when this was taken and is now
+healthy.*
 
 ### Why a 3D view rather than more plots
 
@@ -961,6 +1282,15 @@ neighbours.
 Colour and arrow length are |B|, which is rotation-invariant and therefore the
 only amplitude that can honestly be compared between chips. Excluded chips are
 drawn dark red with no arrow.
+
+The model is drawn the way the probe is mounted rather than the way the maths
+writes it: the tube lies horizontally along the rig's **Y** with the tip end
+(S4, S8, S12, S16) pointing forward and **Z** up, so an arrow on screen points
+the way the field points on the bench. Only the drawing moves. `MOUNT_ROT` in
+`probe_geometry.py` is applied at the last moment before each mesh and arrow
+goes to the GPU, so the tube frame that every calibration, pose solve and export
+is written in is untouched — remount the probe and it is one matrix to change,
+with nothing to recalibrate.
 
 ![A magnet passing the probe](docs/gui-magnet-pass.png)
 
@@ -1023,6 +1353,18 @@ sustained one could not be.
 Tick **rotate into the common tube frame** to get components that can be
 compared between sensors. Unticked, each chip's Bx/By/Bz are its own and only
 |B| is comparable.
+
+Everything is written under `--out-dir` (default `captures/`).
+
+**Changing the calibration while recording rolls the CSV over.** The header is
+written once, at open, and carries `calibration_id` plus the whole conversion
+state so a file can be matched back to the calibration that produced it. Zero,
+Apply gain, Apply roll, a range change or Load calibration therefore close the
+current file and start a new one, logging both names and stamping `continues:`
+into the new header. One CSV whose rows came from two calibrations, under a
+header naming only the first, would be worse than either file alone — nothing
+about it would look wrong. The raw `.bin` is unaffected: it holds counts, which
+no calibration changes.
 
 ### Diagnostics stay on screen
 
@@ -1103,16 +1445,43 @@ into a **~1600x** difference in what they read from the same magnet. Any
 comparison of spike heights has to divide it out before blaming a register --
 which is what *use geometry weighting* on the Calibration tab does.
 
-### The geometry file is an assumption
+### The geometry file is measured now — and one face was backwards
 
-`probe_geometry.json` holds the tube and arm dimensions and which sensor sits on
-which face, and carries that warning in its own `notes` field. The arm
-dimensions come from the vendor drawing and are solid; the tube width, the
-mounting-plate pitch, the board orientation and above all the sensor-to-face
-mapping are not yet confirmed. **The face assignment has not been verified on this hardware.** Only the
-3D view's arrangement and the tube-frame rotation depend on it — |B|, the health
-diagnostics and the raw exports do not. Fix it with `octobee_idmap.py` and a
-slow magnet pass along one face, then press *Reload geometry*.
+`probe_geometry.json` was an assumption for most of this project's life. As of
+**2026-08-24** the arrangement in it is a measurement, from a guided magnet run
+(`captures/magcal_20260824_153205.npz`), and the file is marked `"mapping":
+"measured"` so it cannot be regenerated back into a guess.
+
+What the run found:
+
+| | |
+|---|---|
+| faces | **as assumed** — S1–S4, S5–S8, S9–S12, S13–S16, four to a face |
+| ring pitch | rings at 39.4, 73.5, 105.0, 136.5 mm → 32.4 mm mean, against the 33 mm the plate spacing predicts |
+| slots | **face 0 was reversed**: S1–S4 run the opposite way along the tube from the other three faces |
+
+So S1 sits at the *tip*, beside S8, S12 and S16 — not at the flange where the
+file had put it. Twelve of the sixteen were already right, which is exactly why
+this was worth measuring rather than eyeballing: a layout that is three-quarters
+correct looks entirely correct in a 3D view.
+
+The direction is not a convention anyone chose. The tube's +Z maps to the rig's
++y, and the head is driven the positive way, so the sensor further along the
+tube reaches a fixed magnet at a *smaller* stage position and passes it first —
+which makes the first ring the tip. `measured_slots()` reads that off
+`MOUNT_ROT` rather than hard-coding it, so remounting the probe reverses the
+rule automatically. It also cross-checks against the one thing about this probe
+established by looking at it: S16 is at the front, and S16 came out in the first
+ring.
+
+Still assumptions: the tube width, the mounting-plate pitch (though the ring
+spacing above now corroborates it to about 2 %), and each chip's `chip_rot_deg`
+and `axis_signs` — the Earth-field roll sweep is what settles those, and the
+magnet run says nothing about them.
+
+One thing the magnet **cannot** decide is which face index a group of four
+carries. Turning the tube in its cradle renames all four, so the run checks the
+*grouping* and leaves the labels alone.
 
 ### When it feels slow: `--profile`
 
@@ -1201,6 +1570,20 @@ It drives the whole pipeline and then reads the written files back to check the
 numbers, rather than checking that files merely exist. The live run also asserts
 that no blocks were dropped and that the carriers are left at the clock they
 were found at.
+
+245 checks, none of which need hardware in the default mode. Everything it
+writes goes to a temporary directory — a test run leaves `captures/` alone, and
+CI fails if the working tree comes back dirty. Run the linter alongside it:
+
+```bash
+pip install -e ".[gui,dev]"
+ruff check .                           # config and reasons in pyproject.toml
+python selftest.py
+```
+
+Both run on every push via `.github/workflows/checks.yml`. `pyproject.toml`
+gives a reason next to every lint rule that is switched off, so the list stays
+a set of decisions rather than a pile of suppressions.
 
 ---
 
@@ -1439,6 +1822,178 @@ chase it.
 That number is whatever was left in the counter. Absolute moves and scans refuse
 to run until the axis is homed; jogging is relative and does not need it.
 
+### Why a bigger jog step is louder, and what to do about it
+
+Kinesis ships the LTS300C at **20 mm/s** with **20 mm/s²** of acceleration. A
+trapezoidal move only reaches the velocity cap if it is long enough to ramp up
+to it, so what a move actually peaks at is
+
+`v_peak = min(v_max, √(a·d))`
+
+At the shipped numbers that is 4.5 mm/s for a 1 mm jog, 10 mm/s at 5 mm, and
+the full 20 mm/s for anything past 20 mm. That is the whole explanation for a
+rig that is quiet on small steps and howls on large ones: the setting never
+changed, the distance did, and above about 5 mm the axis climbs into the
+motor's resonance band. It is not a fault and it is not something to fix by
+jogging in smaller steps — cap the speed instead.
+
+The profile is applied when a stage opens, so every mover — the GUI's jog
+buttons, `moveto`, a field map — gets the same one:
+
+```bash
+python octobee_stage.py speed                        # what each axis is set to
+python octobee_stage.py speed --vel 8 --accel 10 --save
+python octobee_stage.py speed --axis z --vel 5 --save # just the vertical one
+```
+
+`speed` prints peak speed against step size, which is the number that matches
+what you can hear. `--save` writes a `motion` block into `stages.json`; without
+it the change lasts until the controller is power cycled. The Stages tab has
+the same two boxes beside the jog buttons.
+
+The default here is **6 mm/s, 10 mm/s²**, and that number came off the bench
+rather than out of the arithmetic above. The first attempt was 8 mm/s, reasoned
+from a 5 mm jog already peaking at 10 mm/s and sounding fine — and it was still
+audible in use. A jog only touches its peak for an instant; a long absolute
+move sits at the cap for tens of seconds, and it is the sustained tone that is
+objectionable. **Brief peaks are a poor guide to what a traverse will sound
+like.** 6 mm/s is quiet.
+
+It costs time on long moves: a full 300 mm traverse goes from about 16 s at the
+shipped settings to about 51 s. Homing has its own velocity (2 mm/s) and none
+of this touches it.
+
+### The speed ceiling, and why the profile is re-sent before every move
+
+Above that setting is a hard ceiling — `MAX_VEL_MM_S`, **10 mm/s** — that
+nothing in `octobee_stage.py` will exceed. It is enforced at every door into
+the module: the GUI spin box will not go higher, `speed --vel 20` is clamped
+and says so, and a `stages.json` written by hand or by an older version is
+clamped as it is read *and* as it is written.
+
+A velocity setting is not a promise, though. The controller keeps its own
+stored settings, and `ISC_LoadSettings` puts them back **every time anything
+opens the device** — the Kinesis application, a crashed process, a power cycle.
+Set the profile once at connect and an absolute move minutes later can still go
+at the shipped 20 mm/s, which is exactly what a `Go` that "goes crazy" looks
+like.
+
+So `move_to()` and `move_by()` send the profile again immediately before they
+command anything. One extra DLL call against a move that takes seconds, in
+exchange for the speed on screen being the speed that will actually be used.
+
+### Stopping the machine
+
+There are two stop buttons and they answer different questions.
+
+**EMERGENCY STOP** — the red button in the **top right of the toolbar**, on
+every tab, and **Escape** does the same thing. It is enabled whether or not the
+stages are connected.
+
+**Stop moving** — on the Stages tab, beside the jog buttons. Profiled, does not
+latch, nothing needs re-homing. "That is far enough."
+
+The red one does three things, and each is deliberate:
+
+| | |
+|---|---|
+| **immediate, not profiled** | The deceleration ramp is abandoned. At the default 6 mm/s and 10 mm/s² a *profiled* stop still coasts about **1.8 mm** — and if 1.8 mm did not matter, nobody would be pressing the button. |
+| **it latches** | All motion, every axis, every thread, until it is reset. Stopping the axis that happens to be moving does nothing about the raster thread that is a fraction of a second from commanding the next point. |
+| **it distrusts the position** | An immediate stop can lose steps. Afterwards the count no longer matches the carriage — see below. |
+
+Reset is a separate button that only appears once latched. The stop button
+never becomes the start button: someone reaching for a stop in a hurry may
+well hit it twice, and the second press must not release the machine.
+
+#### `homed` is not the same as "knows where it is"
+
+This is the one worth internalising. The controller's homed bit means *a
+homing cycle completed at some point*. It stays set no matter what happens to
+the count afterwards — an immediate stop, a stall, a crash into something that
+is not the limit switch, a driver fault. Every one of those leaves the bit set
+and the number wrong, and an absolute move then computes its distance from a
+position the stage believes and does not have.
+
+So `octobee_stage.py` tracks trust separately from the bit. `Stage.homed` is
+the controller's claim; `Stage.position_trusted` is this module's, granted only
+by a homing cycle it watched complete and withdrawn by anything that could
+have cost steps. Absolute moves require both. The Stages tab shows the
+difference: **NOT HOMED** against **POSITION LOST**.
+
+Resetting the emergency stop clears the latch. It does **not** restore trust —
+those axes still refuse absolute moves until they are homed again, and the
+reset dialog says which.
+
+#### Soft limits
+
+The controller's travel limits describe the leadscrew: 0–300 mm. Everything
+this rig can actually collide with — the fixture, the magnet clamp, the cable
+dress — is *inside* that travel, so travel limits protect nothing that matters.
+
+`limit_mm` in `stages.json`, per axis, in rig millimetres, is the working
+envelope, and it is what every move, every scan range and every wizard pass is
+checked against:
+
+```json
+"frame": { "z": { "invert": true, "limit_mm": [20.0, 250.0] } }
+```
+
+It is a restriction, never a permission — asking for a wider range than the
+stage has is clamped to the travel, not obeyed. **None is set on this rig
+yet**, and the window says so in the Log at every connect. Measure the
+envelope once, with the head that is actually fitted.
+
+#### Homing order
+
+Homing drives the full travel into a hard stop, so if one axis has to retract
+before the others can sweep, that has to *happen first* — not at the same
+time, which is a race decided by whichever axis is slower today. `home_order`
+in `stages.json` declares the sequence and the axes are homed one at a time in
+it. It is set to `["z", "y", "x"]`: z is the reverse-mounted axis, so homing
+it drives the head to the **top** of the working volume, out of the way, before
+anything sweeps horizontally. Axes not named follow, in map order.
+
+#### One axis in trouble stops the machine
+
+The Stages tab polls every axis at 5 Hz for its position anyway. If one reports
+a motion error, or ends a move on a hard limit switch, that trips the same
+latch the button does. On a stacked rig the axis that reports the fault is not
+necessarily the one about to do damage: a commanded move that did not happen
+means any other axis still executing its half of a coordinated move is now
+going somewhere that was only safe while all three agreed.
+
+#### What this is not
+
+It is a software stop, over USB, from this process. It needs this program
+running, the USB link up and the controllers answering — and the failures a
+real emergency stop exists for are precisely the ones where they are not. In
+those the motors keep doing whatever they were last told.
+
+**If this rig can hurt someone or destroy something irreplaceable, the stop
+that matters is a mushroom head in series with the controllers' supply**
+(EN ISO 13850, category 0). Nothing above substitutes for it. What is above is
+worth having because most of what goes wrong on a bench rig is not a runaway —
+it is a raster driving the head into a fixture that moved since the map was set
+up — and for that it is exactly the right instrument.
+
+From another terminal, when the window is not the thing running or is not
+answering:
+
+```
+python octobee_stage.py estop
+```
+
+That stops the axes but cannot latch: the interlock lives in a process and that
+one exits. Stop whatever commanded the move as well.
+
+#### Closing the window while something is moving
+
+`close()` on a stage does not stop it. The move is already in the controller
+and it runs to completion whether or not anything is still listening — so
+closing the window used to leave the head traversing with nothing watching it
+and no stop button anywhere. The window now asks, stops every axis first, and
+waits for the worker threads before releasing the devices.
+
 ### Accuracy: repeatability is not accuracy
 
 | | |
@@ -1466,6 +2021,48 @@ moving one cannot. Stopping also means the stage's USB position readout is good
 enough — a reading with tens of milliseconds of latency is *exact* when the thing
 it describes is not moving.
 
+**The latency is real and it is measured.** `Stage.open()` calls
+`ISC_StartPolling(serial, 100)`, which starts a background thread inside the
+Kinesis DLL that asks the controller for status and position every 100 ms over
+USB. `ISC_GetPosition` does **not** go to the wire -- it returns the DLL's cached
+copy. Timed on the z stage, 2000 calls each:
+
+```
+ISC_GetPosition     median 1.20 us   p95 2.00 us   max 86.10 us
+ISC_GetStatusBits   median 0.40 us   p95 0.50 us   max  6.90 us
+```
+
+A USB full-speed frame alone is 1 ms and an APT request/response is several, so
+those timings can only be memory reads. The number you get is therefore 0–100 ms
+old, ~50 ms on average. While moving that is `v × Δt` of position error:
+
+| scan speed | mean error (50 ms) | worst (100 ms) |
+|---|---|---|
+| 20 mm/s (shipped default) | **1.0 mm** | 2.0 mm |
+| 5 mm/s | 250 µm | 500 µm |
+| 1 mm/s | 50 µm | 100 µm |
+
+Against the ~47 µm uncalibrated accuracy, the default speed makes poll staleness
+~20× larger than every other position error combined. Pushing it merely *down to*
+47 µm needs under 0.94 mm/s; making it negligible needs under 0.1 mm/s, at which
+point a 100 mm row takes 17 minutes and you have reinvented stop-and-average the
+slow way.
+
+**And it is jitter, not offset.** A fixed 50 ms lag could be subtracted. This
+cannot: the poll thread free-runs on Windows, unsynchronised to anything, so each
+reading's true age is random over 0–100 ms. That becomes random position error
+*coherent with scan direction*, which does not average away and looks like real
+field structure. Underneath it sits a second problem -- there is no common
+timebase at all. Field samples are stamped by the carrier's own oscillator (694
+measured 200002 Hz, 695 measured 199999 Hz) while the position number is stamped
+by the Windows host clock whenever Python happened to call. Nothing relates the
+two better than the poll interval, and a ~100 Hz Python loop reads position once
+per 2000 field samples.
+
+All of which collapses to zero the moment the carriage is stationary -- hence
+stop-and-average. The encoder section below is the only thing that fixes it for a
+moving measurement.
+
 **Every row is traversed in the same direction.** A serpentine raster would save
 travel and is the wrong choice: reversing direction costs leadscrew backlash, so
 alternate rows would carry a fixed offset that looks exactly like real field
@@ -1475,37 +2072,147 @@ Set `--settle` from measurement, not hope. The controller reports "stopped" when
 its motion profile ends, which is not when a cantilevered probe stops ringing.
 `octobee_scan.py --settle-scan z` moves the axis and watches the field stop
 changing, which is the number your rig actually needs. A settle time that is too
-short does not look like an error — it looks like a gradient.
+short does not look like an error — it looks like a gradient. Read the result as
+an **upper bound**: each probe is a whole `capture_pose()`, so probes land
+seconds apart and a fast rig always reports "settled at the first probe".
 
-### Would the spare rotary encoders help?
+**A failed point costs that point, not the map.** A scan at the settings above
+runs for hours, and a dropped socket four hours in used to unwind out of
+`run_scan` with every completed point still in a local variable. Now the point
+is logged, recorded in `meta["failures"]`, and skipped; three consecutive
+failures end the scan; and every exit path — including Ctrl-C and a stage
+fault — still writes the `FieldMap`. `n_requested` against `n_captured` in the
+sidecar says whether what you have is the whole grid.
 
-They measure the **leadscrew**, which is the same shaft the controller already
-counts to a part in 400 000. So they add nothing to absolute accuracy — the 47 µm
-is *downstream* of the screw, in the nut's travel, and a rotary encoder on the
-screw is blind to it by construction. They are also blind to backlash, since on a
-reversal the screw turns and the carriage does not.
+### The encoders: measured working, 2026-08-21
 
-What they do buy is the one thing nothing else can: the ACQ400 samples encoder
-words **in the data frame at the ADC clock**, so position and field become
-synchronous. That is required for measuring *while moving*, and useless
-otherwise. Carrier 695 already carries 3 encoder words per frame; 694 carries 1.
+**The z encoder is wired, counting, and accurate to 300 nm over a 20 mm move.**
+It reports on `acq1001_695` site 6 = **ENC_Z = LW 19**, which also confirms the
+site ordering that was previously only inferred: site 2 -> ENC_X, site 5 ->
+ENC_Y, site 6 -> ENC_Z. `QEN:DI4` on site 6 went from `7` (all three inputs
+idling high, nothing driving them) to `2` when the encoder was connected, while
+sites 2 and 5 still read `7`. That knob is the quickest "is anything plugged in"
+check there is.
 
-If you wire them up: they are incremental, so they need a datum — home the stage
-and zero the counter at that instant. The index pulse will not do it on its own,
-because with a 1 mm pitch it fires **once per millimetre**, giving 300 identical
-marks over the travel. Derive counts/mm from CPR × 4 ÷ pitch rather than dividing
-a 300 mm move, which would fold the leadscrew error into the scale factor. Do
-compare encoder counts against the controller's microstep count over a long move
-as a *check*: both watch the same shaft, so any divergence is a slipped coupling
-or lost steps.
+```
+sam_cnt first=1, 4 163 458 samples, no gaps
+ENC_Z  first=0  last=287995  delta=287995
+  motion fully bracketed: 5.81 s stationary head, 4.60 s stationary tail
+  encoder +19.9997 mm | stage +20.0000 mm | disagreement -0.0003 mm
+  per-sample steps: +0:3875458  +1:287997  -1:2
+```
 
-Before committing to continuous scanning, measure what the **motors** do to the
-probe. Three energised steppers commutating a few tens of mm from a sensor you
-are reading to 20 nT is a rotating magnetic dipole with switching drive current,
-and that contamination is coherent with position — it will look like real field
-structure and no averaging removes it. Park the probe, run an axis at scan speed,
-and see. This is a stronger argument for stop-and-capture than the noise
-statistics are.
+**Scale factor: 14400 counts/mm**, which is 3600 PPR x 4 quadrature over the
+1 mm leadscrew pitch, exactly as the part number predicts. That is **69.4 nm per
+count**. Confirmed independently across four consecutive 5 mm steps (71995,
+71999, 72000, 72000 counts) and the 20 mm run above. Derive it this way rather
+than by dividing a long move, which would fold the leadscrew error into the
+scale factor.
+
+The per-sample steps are only 0 and +1, so the quadrature decoder is not
+aliasing, and the count sits **in the same sample as the field, latched by the
+same clock**. Latency and jitter are zero by construction, not merely small.
+That is the whole point, and it is what the USB readout above can never do.
+
+**Speed range: no limit found.** A sweep of 1, 2, 3, 4, 5, 6, 8 and 12 mm/s over
+10 mm each tracked the stage to 0.01-0.02 % in the forward direction, with no
+sign of dropped counts even at 12 mm/s (172 800 counts/s, 1.16 ADC samples per
+count).
+
+**Reverse moves come up ~21 µm short.** Consistently: 0.0210, 0.0210, 0.0209 mm
+across three trials, against ~1 µm for forward moves. That is direction-dependent
+lost motion, almost certainly the controller's own backlash compensation, since
+an encoder on the screw cannot see nut backlash. It is reproducible, so it is
+correctable -- but do not mistake it for encoder error.
+
+#### Two capture-timing traps
+
+**1. Connecting to port 4210 does not start the capture immediately.** There is a
+**~2-3.5 s arming delay**, and everything before the capture actually starts is
+discarded. A 2 s pre-roll put the capture start *in the middle of a move* and
+produced apparent count losses of 8-35 %, which looked convincingly like a
+slipping coupling or a speed-dependent decoder limit. It was neither. Use a
+generous pre-roll and **verify it worked**: the capture must have a stationary
+head *and* a stationary tail around the motion. `enc[0]` should be 0 and the
+first samples should show no movement. If `enc[0]` is already non-zero, the move
+started before your capture did and the delta is truncated.
+
+**2. Starting a capture zeroes the QEN counters.** Verified with the stage
+stationary: `QEN:COUNT` sat at 85132, went to exactly 0 the instant streaming
+began, and stayed there for the rest of the capture. `SamCnt` restarts at 1 by
+the same event. This is sensible -- each capture's encoder words are referenced
+to its own start -- but it means **`QEN:COUNT` read over the command port is not
+a datum that survives a capture start.** Read position from the in-frame ENC
+words, not from the knob. The knob is for diagnostics (is it connected, is it
+counting), not for measurement.
+
+Both of these explain every anomalous number seen while commissioning this: the
+"12287 counts/mm", the "35 % loss at 8 mm/s", the "2.93 mm of slip". All one
+artefact, none of them real.
+
+#### What they still do not buy you
+
+They measure the **leadscrew**, the same shaft the controller already counts to a
+part in 400 000, so they add nothing to absolute accuracy -- the 47 µm is
+*downstream* of the screw, in the nut's travel, where a rotary encoder on the
+screw is blind by construction. They are equally blind to nut backlash, since on
+a reversal the screw turns and the carriage does not. What they buy is
+synchronism, and that is the one thing nothing else can provide.
+
+They are incremental, so they need a datum: home the stage and zero the counter
+at that instant. The index pulse will not do it on its own, because with a 1 mm
+pitch it fires **once per millimetre**, giving 300 identical marks over the
+travel. `QEN:ZC:EN` is currently `OFF` on all three channels, so the index is not
+even enabled yet. Do compare encoder counts against the controller's microstep
+count over a long move as a *check*: both watch the same shaft, so any real
+divergence is a slipped coupling or lost steps — but read the two gotchas above
+before believing a divergence.
+
+#### Carrier 694 cannot do this at all
+
+Sites 2, 5 and 6 on 695 each expose a full quadrature counter (`QEN:COUNT`,
+`QEN:COUNT64`, `QEN:ECOUNT`, `QEN:ZCOUNT`, index-home, programmable triggers)
+with phase A and B enabled. 694's site-2 OCTO reports `NCHAN=0` and has **no
+`QEN:*` knobs at all**. The FPGA images say why:
+
+```
+694:  ACQ1001_TOP_09_74_32B              built 2025/09/01   "NOT in RELEASE at all"
+695:  ACQ1001_TOP_09_74_ff_ff_74_74_32B  built 2026/01/29
+```
+
+695's personality declares OCTO modules at sites 2, 5 and 6
+(`74_ff_ff_74_74`) -- three encoder channels. 694's declares only site 2, with
+no quadrature logic, so **694's single extra longword is not an encoder counter**
+and nothing plugged into that box can ever appear. The encoder was originally
+wired to 694, which is exactly why it read zero. Getting encoder data on 694
+means asking D-TACQ to reflash it with the 695 image.
+
+Wiring, if you add the other two axes: `GHB38-08G3600BML5`, line-driver variant,
+guide 2.3 -- red VCC (4.5-30 V), black GND, green/brown A/-A, white/grey B/-B,
+yellow/orange Z/-Z. Without VCC the line driver is dead and you get exactly the
+constant `DI4 = 7` that the unused channels show. Power the system down before
+touching encoder connectors; the guide requires it twice.
+
+#### Motor contamination: measured, and it is not the problem here
+
+The standing worry was that three energised steppers a few tens of mm from a
+sensor read to 20 nT would be a rotating dipole whose contamination is coherent
+with position. Measured on 2026-08-21 by comparing 694 with the motors energised
+against the same channels with them powered down:
+
+| channel | motors on | motors off |
+|---|---|---|
+| S4 Bx | 67.0 | 86.9 |
+| S8 Bz / By / Bx | 42.1 / 45.8 / 57.3 | 41.5 / 41.1 / 49.7 |
+| S5 Bz | 31.3 | 29.5 |
+| S1 Bz (clean reference) | 13.3 | 13.1 |
+
+Unchanged within run-to-run scatter -- S4 Bx even measured worse with the motors
+off. **The stepper drivers are not a measurable contributor** on this rig, and
+the elevated channels are the chip faults catalogued in section 3. The argument
+for stop-and-capture rests on the noise statistics and the position latency
+above, not on motor pickup -- and with the encoder now working and synchronous,
+continuous scanning is worth revisiting on its merits.
 
 ### Usage
 
@@ -1518,6 +2225,8 @@ python octobee_stage.py status
 python octobee_stage.py home --axis x            # explicit; asks before moving
 python octobee_stage.py moveby --x 5             # relative, works unhomed
 python octobee_stage.py moveto --x 100 --y 50    # absolute, needs homing
+python octobee_stage.py stop                     # profiled; nothing is lost
+python octobee_stage.py estop                    # EMERGENCY: stop now
 
 python octobee_scan.py --settle-scan z           # measure the real settle time
 python octobee_scan.py --x 0:100:5 --y 0:100:5 --seconds 5
@@ -1528,7 +2237,9 @@ wrong guess produces a silently transposed or mirrored coordinate frame, and
 such a field map looks entirely plausible.
 
 In the GUI, all of this is the **Stages** tab — find, assign, home, jog, and run
-a field map with a progress bar and an abort. A scan takes the carriers off the
+a field map with a progress bar and an abort. The **emergency stop** is not on
+that tab: it is the red button in the top right of the window, on every tab,
+and Escape does the same thing. See *Stopping the machine* above. A scan takes the carriers off the
 live stream and puts them back on their own 200 kSPS clock for the duration, so
 the live plot stops; press Connect afterwards to get it back. Output is
 `captures/fieldmap_<time>.npz` plus a `.json` sidecar, holding both the commanded

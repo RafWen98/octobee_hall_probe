@@ -10,14 +10,14 @@
   "first_sensor_z_mm": 30.0,
   "tube_length_mm": 159.0,
   "mount_style": "tangential",
-  "arm_sense": 1,
-  "mapping": "face-major",
-  "notes": "Boards lie FLAT ON the tube faces, coplanar with them, and reach out sideways past the tube edge -- tangentially, not radially (confirmed from the bench, hall_probe_setup_2.png). The four arms on a ring therefore form a pinwheel. Because the board lies flat, its 30 mm foot runs along the tube, which is what sets the 33 mm plate pitch (30 mm plate + ~3 mm gap), 4 to a face. Tube is 1 inch (25.4 mm) outside width. Arm dimensions from the SENIS eval-kit drawing: 92 mm PCB, FSV 3 mm from the tip, 0.55 mm above the board, board 1.2 mm thick -- so each chip sits 1.75 mm off its face and reaches 76.3 mm across it. STILL UNVERIFIED: arm_sense (which way round the tube the arms point), the sensor-to-face mapping below, and each chip_rot_deg / axis_signs. Only the 3D arrangement and the tube-frame rotation depend on those -- |B|, the channel health diagnostics and the raw exports do not. Establish the real order with octobee_idmap.py and a slow magnet pass along one face, correct the entries, then press Reload geometry in the GUI.",
+  "arm_sense": -1,
+  "mapping": "measured",
+  "notes": "MEASURED, not assumed. The sensor-to-face grouping and the slot order along the tube come from a guided single-magnet run on 2026-08-24 (captures/magcal_20260824_153205.npz): the head was driven along its own axis past a fixed magnet, four times, a quarter turn apart, so every sensor was measured at the same closest approach. The four poses put S1-S4, S5-S8, S9-S12 and S13-S16 on four faces exactly as assumed, and the rings came out at 39.4, 73.5, 105.0 and 136.5 mm -- a 32.4 mm mean pitch against the 33 mm the plate spacing predicts, which is the pitch confirming itself. What was WRONG was face 0: S1-S4 run the opposite way along the tube from the other three faces, so S1 sits at the tip beside S8, S12 and S16 rather than at the flange. Twelve of the sixteen were already right. Boards lie FLAT ON the tube faces, coplanar with them, and reach out sideways past the tube edge -- tangentially, not radially (confirmed from the bench, hall_probe_setup_2.png). arm_sense is -1: looking along the tube toward the tip, the arms reach clockwise off their faces, confirmed from the bench 2026-08-21. Tube is 1 inch (25.4 mm) outside width; arm dimensions from the SENIS eval-kit drawing. STILL UNVERIFIED: each chip_rot_deg / axis_signs -- the Earth-field roll sweep is what settles those, and the magnet run says nothing about them. Which face index a group carries is a NAMING choice the magnet cannot make: turning the tube in its cradle renames all four.",
   "sensors": [
     {
       "id": 1,
       "face": 0,
-      "slot": 0,
+      "slot": 3,
       "chip_rot_deg": 0.0,
       "axis_signs": [
         1,
@@ -28,7 +28,7 @@
     {
       "id": 2,
       "face": 0,
-      "slot": 1,
+      "slot": 2,
       "chip_rot_deg": 0.0,
       "axis_signs": [
         1,
@@ -39,7 +39,7 @@
     {
       "id": 3,
       "face": 0,
-      "slot": 2,
+      "slot": 1,
       "chip_rot_deg": 0.0,
       "axis_signs": [
         1,
@@ -50,7 +50,7 @@
     {
       "id": 4,
       "face": 0,
-      "slot": 3,
+      "slot": 0,
       "chip_rot_deg": 0.0,
       "axis_signs": [
         1,

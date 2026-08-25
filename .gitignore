@@ -19,3 +19,4 @@ octobee_launch_error.log
 
 # on-box firmware/config snapshots (contain private keys and password hashes)
 fw_backup_*/
+octobee_crash.log

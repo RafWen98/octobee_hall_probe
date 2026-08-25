@@ -50,6 +50,28 @@ homing drives the carriage into a limit switch at speed, and with a probe head
 and its cable dress mounted that is a collision, not a formality. Homing is
 always an explicit call.
 
+How fast it moves, and why that is audible
+------------------------------------------
+Kinesis ships the LTS300C at 20 mm/s with 20 mm/s^2 of acceleration, and on
+this rig that is loud. A trapezoidal move only reaches the velocity cap if it
+is long enough to get there, so the peak speed of a move of d mm is
+
+    v_peak = min(v_max, sqrt(a * d))
+
+At the shipped numbers that is 10 mm/s for a 5 mm jog but the full 20 mm/s for
+anything past 20 mm -- which is why small steps are quiet and larger ones
+howl. It is the motor's resonance, not a fault, and the cure is to keep the
+peak below where it starts rather than to jog in smaller steps. DEFAULT_VEL_MM_S
+and DEFAULT_ACCEL_MM_S2 below are that cap, `speed` on the CLI changes it, and
+stages.json makes it stick. Homing has its own velocity (2 mm/s here) and is
+not affected by any of it.
+
+Above that setting there is a hard ceiling, MAX_VEL_MM_S, that nothing in this
+module will move faster than -- and because the controller's own stored
+settings come back every time anything opens the device, each stage is given
+its profile again immediately before every move rather than trusting the one
+applied when it was opened.
+
 Which way is up is not the stage's business
 -------------------------------------------
 A stage homes to its own limit switch, calls that 0 and counts up to 300.
@@ -60,6 +82,43 @@ mirrored along z and look entirely plausible. See Stage for the frame that
 fixes it, declared once in stages.json rather than as a minus sign scattered
 over the call sites.
 
+EMERGENCY STOP, and what this one is not
+----------------------------------------
+`StageSet.emergency_stop()` is a CONTROLLED STOP REQUEST, not a safety
+function. It stops the axes immediately, latches every further move off, and
+marks the positions untrustworthy -- and it does all of that over USB, from
+this process, through the Kinesis DLL. Every one of those has to be working.
+The failures a mushroom head exists for are the ones where they are not: the
+PC wedged, the USB dropped, the controller's firmware confused, this process
+killed. In those the motors keep whatever they were last told to do.
+
+    If this rig can hurt someone or destroy something it cannot afford to
+    lose, the E-stop that matters is a hardware one in series with the
+    controllers' supply. EN ISO 13850 category 0. Nothing below replaces it.
+
+What is below is worth having anyway, because most of what goes wrong on a
+bench rig is not a runaway -- it is a raster driving the head into a fixture
+that was moved since the map was set up, and for that a button that stops all
+three axes and refuses to start again is exactly the right instrument. The
+three properties that make it one:
+
+    it latches      stopping the axis that is moving does nothing about the
+                    thread that is about to command the next move
+    it distrusts    an immediate stop abandons the deceleration ramp, so the
+                    count no longer matches the carriage. Absolute moves are
+                    refused until the axis is homed again -- see
+                    position_trusted, which is the single most important thing
+                    in this file
+    it is machine-wide, not per axis
+
+Soft limits
+-----------
+The controller's travel limits describe the leadscrew. Everything this rig can
+actually collide with -- fixture, magnet clamp, cable dress -- is INSIDE that
+travel, so travel limits protect nothing. "limit_mm" in stages.json is the
+working envelope, per axis, in rig millimetres, and it is what every move is
+checked against. Measure it once with the head that is actually fitted.
+
 Usage
 -----
     python octobee_stage.py list                    # what is on the USB bus
@@ -67,6 +126,9 @@ Usage
     python octobee_stage.py home --axis x           # explicit, one axis
     python octobee_stage.py moveto --x 100 --y 50   # absolute, mm
     python octobee_stage.py stop                    # profiled stop, all axes
+    python octobee_stage.py estop                   # EMERGENCY: stop now
+    python octobee_stage.py speed                   # motion profile per axis
+    python octobee_stage.py speed --vel 8 --save    # slow it down, permanently
 
     python octobee_stage.py map --assign x=45502844 --assign z=45502854 \\
                                --assign y=45538374 --invert z
@@ -76,9 +138,11 @@ stages are addressed by serial number and assumed to be mounted forwards.
 """
 
 import argparse
+import contextlib
 import ctypes as C
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -104,6 +168,43 @@ UNIT_ACCELERATION = 2
 # the device: axis max 122880000 du == 300.0 mm.
 DEFAULT_DU_PER_MM = 409600.0
 
+# Motion profile applied when a stage opens, unless stages.json says otherwise.
+# Kinesis's own 20 mm/s / 20 mm/s^2 puts every move longer than about 5 mm into
+# the motor's resonance band -- see the note at the top of this file.
+#
+# 6 mm/s is a BENCH RESULT, not a calculation. The first estimate was 8, on the
+# reasoning that a 5 mm jog already peaked at 10 mm/s and was quiet; that was
+# wrong, and wrong in an instructive way. A jog only touches its peak for an
+# instant, where a long absolute move sits at the cap for tens of seconds, and
+# it is the sustained tone that is objectionable. Brief peaks are a poor guide
+# to what a traverse will sound like. 8 was still audible on this rig, 6 is not.
+#
+# It is not free: a full 300 mm traverse goes from about 16 s at the shipped
+# settings to about 51 s. The acceleration is for the ramps rather than the top
+# speed, and is left where it is -- lowering it further would only make long
+# moves slower without changing the tone they settle at.
+DEFAULT_VEL_MM_S = 6.0
+DEFAULT_ACCEL_MM_S2 = 10.0
+
+# A hard ceiling on every commanded move, whatever a config file, a spin box or
+# a command line asks for. The default above is what the rig normally runs at;
+# this is the line it may not cross even when someone deliberately raises it.
+#
+# It exists because a velocity setting is not a promise. The controller keeps
+# its own stored settings and ISC_LoadSettings puts them back every time a
+# stage is opened -- so anything that opens a device outside this module (the
+# Kinesis application, a crashed process, a power cycle) leaves it at the
+# shipped 20 mm/s, and the next absolute move runs at that. The stages are
+# therefore given their profile again immediately before every move rather
+# than once when they are opened: one extra DLL call against a move that takes
+# seconds, in exchange for "the speed on screen is the speed it will use".
+MAX_VEL_MM_S = 10.0
+
+
+def clamp_velocity(mm_s):
+    """Whatever was asked for, capped at MAX_VEL_MM_S."""
+    return min(float(mm_s), MAX_VEL_MM_S)
+
 # Status word, from the header's GetStatusBits documentation. Only the bits
 # this module acts on or reports are named.
 STATUS_BITS = (
@@ -128,10 +229,69 @@ MOVING_MASK = 0x000002F0    # any of moving/jogging cw+ccw, or homing
 HOMED_BIT = 0x00000400
 MOTION_ERROR_BIT = 0x00004000
 ENABLED_BIT = 0x80000000
+HARD_LIMIT_MASK = 0x00000003    # either physical end-of-travel switch
 
 
 class StageError(RuntimeError):
     """Any failure talking to a stage, including a non-zero API return."""
+
+
+class MotionInterlocked(StageError):
+    """A move was refused because the interlock is latched.
+
+    Its own type so a caller can tell "the machine is stopped and someone has
+    to say so" apart from "that move was out of range". A scan treats the
+    first as fatal and the second as a point it can skip.
+    """
+
+
+class MotionInterlock:
+    """One latch shared by every axis of a machine.
+
+    An emergency stop that only stops the axis that is moving is not an
+    emergency stop. The thing that pressed it does not know what else is in
+    flight -- another worker thread mid-raster, a queued jog, a wizard about
+    to command the next pose -- and each of those will happily start moving
+    again the instant the current move ends, which on this rig is a fraction
+    of a second later. So the stop latches: every axis holds a reference to
+    the same interlock, and while it is tripped every commanded move is
+    refused at the point of command, whoever asks and from whichever thread.
+
+    Clearing it is deliberately a separate, explicit act. That is the whole
+    convention -- the machine does not un-stop itself because the fault
+    cleared, it un-stops when a person says the reason is dealt with.
+    """
+
+    def __init__(self):
+        self._reason = None
+
+    @property
+    def tripped(self):
+        """The reason string if latched, None if clear."""
+        return self._reason
+
+    def trip(self, reason):
+        """Latch. The FIRST reason wins -- it is the one that explains why.
+
+        A stop cascades: the operator hits the button, that trips the axis,
+        the axis error trips the set. Keeping the last reason would replace
+        "z hit the hard limit" with "operator stop", which is the account of
+        what happened that is least use afterwards.
+        """
+        if self._reason is None:
+            self._reason = str(reason)
+        return self._reason
+
+    def reset(self):
+        """Clear the latch. Returns what it was, for the log."""
+        was, self._reason = self._reason, None
+        return was
+
+    def require_clear(self, what):
+        if self._reason is not None:
+            raise MotionInterlocked(
+                f"motion is latched off ({self._reason}) -- {what} refused. "
+                f"Clear the emergency stop before commanding any move.")
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +354,11 @@ def _bind(dll):
         "ISC_Home": ([C.c_char_p], C.c_short),
         "ISC_MoveToPosition": ([C.c_char_p, C.c_int], C.c_short),
         "ISC_MoveRelative": ([C.c_char_p, C.c_int], C.c_short),
+        # Declared, but nothing here calls them -- the GUI's jog buttons are
+        # relative moves. If you ever do use MoveJog, note that it runs off
+        # ISC_SetJogVelParams, a SEPARATE velocity table that SetVelParams does
+        # not touch and that MAX_VEL_MM_S therefore does not cap. Cap it there
+        # too, or a jog will quietly run at the shipped 20 mm/s.
         "ISC_MoveJog": ([C.c_char_p, C.c_int], C.c_short),
         "ISC_SetJogStepSize": ([C.c_char_p, C.c_uint], C.c_short),
         "ISC_SetJogMode": ([C.c_char_p, C.c_int, C.c_int], C.c_short),
@@ -220,10 +385,24 @@ def _bind(dll):
         "ISC_GetCalibrationFile": ([C.c_char_p, C.c_char_p, C.c_short], C.c_bool),
         "ISC_SetCalibrationFile": ([C.c_char_p, C.c_char_p, C.c_bool], None),
     }
+    missing = []
     for name, (argtypes, restype) in sig.items():
-        fn = getattr(dll, name)
+        try:
+            fn = getattr(dll, name)
+        except AttributeError:
+            # An older or differently-built Kinesis is a supportable situation;
+            # a raw AttributeError from deep in a binding helper is not. Name
+            # every entry point that is absent, in one message.
+            missing.append(name)
+            continue
         fn.argtypes = argtypes
         fn.restype = restype
+    if missing:
+        raise StageError(
+            f"{ISC_DLL} in {KINESIS_DIR} does not export "
+            f"{', '.join(missing)}. That is an older or differently-built "
+            f"Kinesis than this module was written against -- update it, or "
+            f"point KINESIS_DIR at the install that has these.")
 
 
 def dll():
@@ -250,6 +429,50 @@ def dll():
     return d
 
 
+def peak_speed_mm_s(distance_mm, vel_mm_s, accel_mm_s2):
+    """How fast a trapezoidal move of `distance_mm` actually gets, mm/s.
+
+    A move short enough to spend all of itself ramping never reaches the
+    velocity cap: it peaks at sqrt(a*d) and turns round. That is the whole
+    explanation for a rig that is quiet at 2 mm and howls at 20 -- the setting
+    did not change, the distance did.
+    """
+    d = abs(float(distance_mm))
+    if accel_mm_s2 <= 0:
+        return float(vel_mm_s)
+    return min(float(vel_mm_s), (accel_mm_s2 * d) ** 0.5)
+
+
+def move_time_s(distance_mm, vel_mm_s, accel_mm_s2):
+    """How long a trapezoidal move of this length actually takes, seconds.
+
+    Triangular if it is too short to reach the cap, trapezoidal if not -- the
+    same split as peak_speed_mm_s, seen from the other side.
+    """
+    d, v, a = abs(float(distance_mm)), float(vel_mm_s), float(accel_mm_s2)
+    if d <= 0 or v <= 0 or a <= 0:
+        return 0.0
+    if d <= v * v / a:                       # never reaches the cap
+        return 2.0 * (d / a) ** 0.5
+    return d / v + v / a
+
+
+def move_timeout_s(distance_mm, vel_mm_s, accel_mm_s2):
+    """A generous deadline for a move of this length, seconds.
+
+    A fixed 180 s was wrong at both ends. At 0.1 mm/s -- which the speed box
+    allows -- a 300 mm traverse takes 50 minutes, so the deadline fired on a
+    move that was proceeding perfectly and stopped it. That mattered more once
+    a timeout started marking the position untrustworthy: a spurious one now
+    costs a re-home, and mid-raster it ends the map.
+
+    Three times the calculated time plus 5 s. Wide enough that only a genuine
+    stall reaches it, narrow enough that a stalled axis is not left grinding
+    for an hour.
+    """
+    return max(30.0, 3.0 * move_time_s(distance_mm, vel_mm_s, accel_mm_s2) + 5.0)
+
+
 def _check(rc, what):
     if rc != 0:
         raise StageError(f"{what} failed (Kinesis error {rc})")
@@ -269,26 +492,42 @@ def list_devices():
     d = dll()
     _check(d.TLI_BuildDeviceList(), "TLI_BuildDeviceList")
     buf = C.create_string_buffer(512)
-    d.TLI_GetDeviceListExt(buf, 512)
+    # Checked, like the call above it. An unchecked failure here hands back an
+    # empty buffer, which reads as "no stages on the bus" -- the same symptom
+    # as the Kinesis-is-running case this module works hard to tell apart.
+    _check(d.TLI_GetDeviceListExt(buf, 512), "TLI_GetDeviceListExt")
     return [s for s in buf.value.decode(errors="replace").split(",") if s]
 
 
 def kinesis_is_running():
-    """True if the Kinesis GUI is up, which makes every stage unopenable."""
+    """True if the Kinesis GUI is up, which makes every stage unopenable.
+
+    Only ever used to make an error message more helpful, so any failure to
+    ask -- no tasklist, not Windows, a timeout -- is answered with "do not
+    know", spelled False.
+    """
     try:
-        import subprocess
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq Thorlabs.MotionControl.Kinesis.exe"],
-            capture_output=True, text=True, timeout=10).stdout
-        return "Thorlabs.MotionControl.Kinesis.exe" in out
-    except Exception:
+            capture_output=True, text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
         return False
+    return "Thorlabs.MotionControl.Kinesis.exe" in out
 
 
 def device_info(serial):
     d = dll()
     info = TLI_DeviceInfo()
-    d.TLI_GetDeviceInfo(serial.encode(), C.byref(info))
+    # This one call inverts the convention the rest of the API uses. From the
+    # shipped header: "<returns> 1 if successful, 0 if not." Everything else
+    # here returns 0 for success, so checking it with _check() reports a
+    # perfectly good call as "Kinesis error 1" -- and on this machine it does
+    # so while having filled the struct correctly (typeID 45, "APT Stepper
+    # Motor Controller"). That took out `octobee_stage.py list` entirely.
+    if d.TLI_GetDeviceInfo(serial.encode(), C.byref(info)) == 0:
+        raise StageError(f"TLI_GetDeviceInfo({serial}) found no such device "
+                         f"-- the device list may be stale; rebuild it with "
+                         f"list_devices()")
     return {
         "serial": serial,
         "type_id": info.typeID,
@@ -334,19 +573,32 @@ class Stage:
     """
 
     def __init__(self, serial, name=None, poll_ms=100, invert=False,
-                 origin_mm=None):
+                 origin_mm=None, vel_mm_s=DEFAULT_VEL_MM_S,
+                 accel_mm_s2=DEFAULT_ACCEL_MM_S2, limit_mm=None,
+                 interlock=None):
         self.serial = str(serial)
         self._sb = self.serial.encode()
         self.name = name or self.serial
         self.poll_ms = poll_ms
         self.is_open = False
         self.model = ""
-        self.travel_mm = (0.0, 0.0)          # rig frame
+        self.travel_mm = (0.0, 0.0)          # rig frame, the whole leadscrew
         self.travel_dev_mm = (0.0, 0.0)      # what the stage itself reports
+        self.limit_mm = (0.0, 0.0)           # rig frame, what we may use
         self.invert = bool(invert)
         # None means "resolve from travel once the stage tells us what it is".
         self._origin_cfg = origin_mm
         self.origin_mm = 0.0 if origin_mm is None else float(origin_mm)
+        self._limit_cfg = None if limit_mm is None else (
+            float(limit_mm[0]), float(limit_mm[1]))
+        self.interlock = interlock if interlock is not None else MotionInterlock()
+        # Position trust is NOT the controller's homed bit -- see position_trusted.
+        self._trusted = False
+        self._distrust_reason = "not homed since this stage was opened"
+        # None for either half means "leave whatever the controller has", which
+        # is the only way to look at a stage without changing how it moves.
+        self._vel_cfg = None if vel_mm_s is None else float(vel_mm_s)
+        self._accel_cfg = None if accel_mm_s2 is None else float(accel_mm_s2)
         self._du_per_mm = DEFAULT_DU_PER_MM
 
     # ---- lifecycle ----
@@ -376,15 +628,48 @@ class Stage:
             # until a poll cycle has actually completed.
             time.sleep(self.poll_ms / 1000.0 * 3)
             self._read_static()
+            # A stage that is still powered from an earlier session keeps both
+            # its homed bit and a count that really does match the carriage,
+            # so opening it does not by itself make the position untrustworthy.
+            # What would is a fault it is sitting in right now.
+            bits = self.status
+            if bits & MOTION_ERROR_BIT:
+                self.distrust("the controller is reporting a motion error")
+            elif bits & HOMED_BIT:
+                self._trusted = True
+            # After LoadSettings, which is what put the shipped 20/20 there.
+            if self._vel_cfg is not None or self._accel_cfg is not None:
+                self.set_vel_params(self._vel_cfg, self._accel_cfg)
         except Exception:
             self.close()
             raise
         return self
 
     def close(self):
+        """Stop the axis if it is moving, then release the device.
+
+        Closing does NOT stop a stage. The move is already in the controller
+        and the controller runs it whether or not anything is still listening
+        -- so a window closed mid-traverse used to leave an axis driving to a
+        target with nobody watching, and the only remaining brake was the
+        limit switch. One profiled stop on the way out costs a fraction of a
+        second and is the difference between "shut down" and "walked away
+        from a moving machine".
+        """
         if not self.is_open:
             return
         d = dll()
+        try:
+            if self.moving:
+                d.ISC_StopProfiled(self._sb)
+                deadline = time.monotonic() + 5.0
+                while self.moving and time.monotonic() < deadline:
+                    time.sleep(0.02)
+        except StageError:
+            # Best effort: a stage that cannot be read cannot be stopped
+            # either, and failing here would skip the close below and leak an
+            # exclusive-open USB device for the lifetime of the process.
+            pass
         try:
             d.ISC_StopPolling(self._sb)
         finally:
@@ -430,6 +715,77 @@ class Stage:
         # numerically identical but reads as a fault in a travel limit.
         ends = sorted((self._dev_to_rig(lo) + 0.0, self._dev_to_rig(hi) + 0.0))
         self.travel_mm = (ends[0], ends[1])
+        self.limit_mm = self._resolve_limit(self.travel_mm, self._limit_cfg)
+
+    @staticmethod
+    def _resolve_limit(travel, cfg):
+        """The working envelope: the configured soft limit, inside the travel.
+
+        The stage's own limits describe the leadscrew and nothing else. What
+        the machine may actually use is smaller, because a probe head, a
+        cantilever bracket and a cable dress occupy some of it -- and the
+        controller has no way to know that. Everything mechanical this rig can
+        hit is inside the travel, so travel limits alone protect nothing.
+
+        Clamped to the travel rather than trusted: a soft limit is a
+        restriction, and a config file that asks for a wider one than the
+        stage has is a typo, not a permission.
+
+        Split out from _resolve_frame so it can be checked without a stage.
+        """
+        lo, hi = travel
+        if cfg is None:
+            return (lo, hi)
+        want_lo, want_hi = sorted(cfg)
+        if hi > lo:
+            want_lo, want_hi = max(want_lo, lo), min(want_hi, hi)
+        if not want_hi > want_lo:
+            raise StageError(
+                f"soft limit {cfg[0]:g}..{cfg[1]:g} mm leaves no travel "
+                f"inside {lo:g}..{hi:g} mm")
+        return (want_lo, want_hi)
+
+    # ---- position trust ----
+
+    @property
+    def position_trusted(self):
+        """True if this axis's counter can be believed as an ABSOLUTE position.
+
+        The controller's homed bit is not this, and treating it as if it were
+        is how a stage drives somewhere confidently wrong. The bit says "a
+        homing cycle completed at some point"; it stays set afterwards no
+        matter what happens to the count. Steps get lost -- an immediate stop
+        abandons the deceleration ramp, a stall, a crash into something that
+        is not the limit switch, a driver fault -- and every one of those
+        leaves the bit set and the number wrong. The stage then reports a
+        position it believes, an absolute move computes a distance from it,
+        and the head goes exactly as far wrong as the count drifted.
+
+        So trust is tracked here as well: set by a homing cycle that this
+        module watched complete, and cleared by anything that could have cost
+        steps. Absolute moves require BOTH.
+
+        Never raises, including on a closed stage. It is read from the stop
+        path and from the dialog that offers to reset one, and a property that
+        throws there would turn "the stage went away" into a traceback in the
+        middle of stopping the machine. A closed stage is simply not trusted.
+        """
+        return bool(self._trusted and self.is_open and self.homed)
+
+    @property
+    def distrust_reason(self):
+        if not self.is_open:
+            return "the stage is not open"
+        if not self._trusted:
+            return self._distrust_reason
+        if not self.homed:
+            return "the controller reports this axis as not homed"
+        return None
+
+    def distrust(self, reason):
+        """Mark the position counter unreliable. Absolute moves stop working."""
+        self._trusted = False
+        self._distrust_reason = str(reason)
 
     def _require_open(self):
         if not self.is_open:
@@ -439,6 +795,22 @@ class Stage:
 
     def _to_du(self, mm):
         return int(round(mm * self._du_per_mm))
+
+    def _du(self, real, unit_type):
+        """Real-world value -> device units, for velocity and acceleration.
+
+        Distance has a clean scale factor; velocity and acceleration do not --
+        they carry the controller's own sample rate in them, so the conversion
+        has to come from the DLL rather than from arithmetic here.
+        """
+        out = C.c_int()
+        rc = dll().ISC_GetDeviceUnitFromRealValue(
+            self._sb, float(real), C.byref(out), unit_type)
+        if rc != 0:
+            raise StageError(
+                f"{self.name}: cannot convert {real:g} to device units "
+                f"(Kinesis error {rc})")
+        return out.value
 
     def _to_mm(self, du):
         return du / self._du_per_mm
@@ -497,11 +869,80 @@ class Stage:
         return bool(self.status & ENABLED_BIT)
 
     @property
-    def velocity_mm_s(self):
+    def vel_params(self):
+        """(max velocity mm/s, acceleration mm/s^2) as the controller has them."""
         self._require_open()
         acc, vel = C.c_int(), C.c_int()
-        dll().ISC_GetVelParams(self._sb, C.byref(acc), C.byref(vel))
-        return self._real(vel.value, UNIT_VELOCITY)
+        _check(dll().ISC_GetVelParams(self._sb, C.byref(acc), C.byref(vel)),
+               f"read motion profile of {self.name}")
+        return (self._real(vel.value, UNIT_VELOCITY),
+                self._real(acc.value, UNIT_ACCELERATION))
+
+    @property
+    def velocity_mm_s(self):
+        return self.vel_params[0]
+
+    @property
+    def accel_mm_s2(self):
+        return self.vel_params[1]
+
+    @staticmethod
+    def resolve_profile(vel_mm_s, accel_mm_s2, current):
+        """(requested, current) -> the (velocity, acceleration) to send.
+
+        Split out from set_vel_params so the rule -- fill in from the
+        controller, then clamp -- can be checked without a stage attached.
+        """
+        cur_v, cur_a = current
+        v = cur_v if vel_mm_s is None else float(vel_mm_s)
+        a = cur_a if accel_mm_s2 is None else float(accel_mm_s2)
+        if not (v > 0 and a > 0):
+            raise StageError(
+                f"velocity and acceleration must both be positive, got "
+                f"{v:g} mm/s and {a:g} mm/s^2")
+        return clamp_velocity(v), a
+
+    def set_vel_params(self, vel_mm_s=None, accel_mm_s2=None):
+        """Cap how fast and how hard this axis moves. Returns what was set.
+
+        Both halves go to the controller in one call, so whichever is left None
+        is read back and re-sent unchanged rather than defaulted to something.
+        The profile lives in the controller and applies to every move it is
+        given, including ones started by the GUI or by a scan.
+        """
+        self._require_open()
+        # Only ask the controller what it has when we need it to fill a gap.
+        # On the before-every-move path both halves are known, and the read
+        # comes out of the DLL's polling cache anyway -- so it would be a
+        # round trip whose answer is discarded.
+        current = ((None, None) if vel_mm_s is not None and accel_mm_s2 is not None
+                   else self.vel_params)
+        try:
+            v, a = self.resolve_profile(vel_mm_s, accel_mm_s2, current)
+        except StageError as exc:
+            raise StageError(f"{self.name}: {exc}") from None
+        _check(dll().ISC_SetVelParams(self._sb, self._du(a, UNIT_ACCELERATION),
+                                      self._du(v, UNIT_VELOCITY)),
+               f"set motion profile on {self.name}")
+        # Remember what this stage is meant to run at, so the re-assert before
+        # each move has something to assert.
+        self._vel_cfg, self._accel_cfg = v, a
+        return (v, a)
+
+    def enforce_profile(self):
+        """Put this stage's profile back on the controller before it moves.
+
+        Cheap and unconditional: sending the value is one call, where checking
+        first would need ISC_RequestVelParams and a poll cycle to come back,
+        and would still race with whatever changed it.
+        """
+        if self._vel_cfg is None and self._accel_cfg is None:
+            return          # opened deliberately without touching how it moves
+        self.set_vel_params(self._vel_cfg, self._accel_cfg)
+
+    def peak_speed_mm_s(self, distance_mm):
+        """How fast a move of this length actually gets on THIS axis, mm/s."""
+        return peak_speed_mm_s(distance_mm, *self.vel_params)
 
     def _real(self, du, unit_type):
         out = C.c_double()
@@ -524,7 +965,12 @@ class Stage:
             "moving": bool(bits & MOVING_MASK),
             "enabled": bool(bits & ENABLED_BIT),
             "error": bool(bits & MOTION_ERROR_BIT),
+            "at_hard_limit": bool(bits & HARD_LIMIT_MASK),
+            "trusted": self.position_trusted,
+            "distrust_reason": self.distrust_reason,
             "travel_mm": self.travel_mm,
+            "limit_mm": self.limit_mm,
+            "interlocked": self.interlock.tripped,
             "status": bits,
             "flags": self.status_flags(bits),
         }
@@ -545,33 +991,80 @@ class Stage:
         homing could establish on its own.
         """
         self._require_open()
+        self.interlock.require_clear(f"homing {self.name}")
+        # A homing cycle deliberately drives into a hard stop, so the count is
+        # meaningless from the moment it starts until the moment it finishes.
+        # Distrust first: if this is interrupted -- stopped, timed out, faulted
+        # -- it must not leave the previous trust standing.
+        self.distrust(f"{self.name} is homing")
         d = dll()
         d.ISC_ClearMessageQueue(self._sb)
         _check(d.ISC_Home(self._sb), f"home {self.name}")
         if wait:
             self.wait(timeout_s=timeout_s, what="homing")
+            self.trust_after_homing()
 
-    def move_to(self, mm, timeout_s=180.0, wait=True):
-        """Absolute move to RIG millimetres, against the axis travel limits."""
+    def trust_after_homing(self):
+        """Believe the counter again, but only if the cycle really finished.
+
+        Split out because home(wait=False) hands the waiting to the caller --
+        StageSet.home_all and the GUI both do -- and the trust has to be
+        granted where the wait completed, not where the move was started.
+        """
+        if self.homed:
+            self._trusted = True
+            self._distrust_reason = ""
+        else:
+            self.distrust(f"{self.name}'s homing cycle did not complete")
+        return self.position_trusted
+
+    def _timeout_for(self, distance_mm, timeout_s):
+        """None means "work it out from how far it has to go".
+
+        Off the cached profile rather than the controller's: enforce_profile()
+        has just sent exactly these numbers, so asking for them back is a DLL
+        round trip whose answer is already known. Falls back to a read only for
+        a stage opened deliberately without a profile.
+        """
+        if timeout_s is not None:
+            return float(timeout_s)
+        vel, acc = self._vel_cfg, self._accel_cfg
+        if vel is None or acc is None:
+            try:
+                vel, acc = self.vel_params
+            except StageError:
+                return 180.0
+        return move_timeout_s(distance_mm, vel, acc)
+
+    def move_to(self, mm, timeout_s=None, wait=True):
+        """Absolute move to RIG millimetres, against the soft limits."""
         self._require_open()
-        lo, hi = self.travel_mm
+        self.interlock.require_clear(f"move {self.name} to {mm:g} mm")
+        lo, hi = self.limit_mm
         if hi > lo and not (lo <= mm <= hi):
+            extra = ("" if self.limit_mm == self.travel_mm else
+                     f" (soft limit, inside the {self.travel_mm[0]:g}.."
+                     f"{self.travel_mm[1]:g} mm travel)")
             raise StageError(
-                f"{self.name}: {mm:g} mm is outside travel {lo:g}..{hi:g} mm")
-        if not self.homed:
+                f"{self.name}: {mm:g} mm is outside "
+                f"{lo:g}..{hi:g} mm{extra}")
+        if not self.position_trusted:
             raise StageError(
-                f"{self.name} has not been homed -- its position counter is "
-                f"unreferenced, so an absolute move would go somewhere "
+                f"{self.name}: {self.distrust_reason} -- its position counter "
+                f"cannot be believed, so an absolute move would go somewhere "
                 f"arbitrary. Home it first.")
         dev = self._rig_to_dev(mm)
         d = dll()
+        self.enforce_profile()
         d.ISC_ClearMessageQueue(self._sb)
+        here = self.position_mm
         _check(d.ISC_MoveToPosition(self._sb, self._to_du(dev)),
                f"move {self.name} to {mm:g} mm")
         if wait:
-            self.wait(timeout_s=timeout_s, what=f"move to {mm:g} mm")
+            self.wait(timeout_s=self._timeout_for(mm - here, timeout_s),
+                      what=f"move to {mm:g} mm")
 
-    def move_by(self, delta_mm, timeout_s=180.0, wait=True):
+    def move_by(self, delta_mm, timeout_s=None, wait=True):
         """Relative move, millimetres.
 
         Deliberately does NOT require homing. A relative move needs no absolute
@@ -585,28 +1078,69 @@ class Stage:
         limit switches remain the real protection.
         """
         self._require_open()
-        lo, hi = self.travel_mm
+        self.interlock.require_clear(f"jog {self.name} by {delta_mm:+g} mm")
+        lo, hi = self.limit_mm
         target = self.position_mm + delta_mm
-        if hi > lo and not (lo <= target <= hi) and self.homed:
+        if hi > lo and not (lo <= target <= hi) and self.position_trusted:
             raise StageError(
-                f"{self.name}: {target:g} mm is outside travel "
+                f"{self.name}: {target:g} mm is outside "
                 f"{lo:g}..{hi:g} mm")
         d = dll()
+        self.enforce_profile()
         d.ISC_ClearMessageQueue(self._sb)
         # delta_mm is a RIG distance; on a reverse-mounted axis the device has
         # to travel the other way to produce it.
         _check(d.ISC_MoveRelative(self._sb, self._to_du(self._sign * delta_mm)),
                f"move {self.name} by {delta_mm:g} mm")
         if wait:
-            self.wait(timeout_s=timeout_s, what=f"move by {delta_mm:g} mm")
+            self.wait(timeout_s=self._timeout_for(delta_mm, timeout_s),
+                      what=f"move by {delta_mm:g} mm")
 
     def stop(self, immediate=False):
-        """Profiled stop by default; immediate loses steps and thus position."""
+        """Profiled stop by default; immediate loses steps and thus position.
+
+        `immediate` abandons the deceleration ramp, which is the point of it
+        and also its cost: the motor is told to stop from full speed, the load
+        keeps going, and the count no longer matches the carriage. So an
+        immediate stop marks the position untrusted -- that is not a side
+        effect to work around, it is the honest state afterwards.
+        """
         self._require_open()
         d = dll()
+        if immediate:
+            self.distrust(f"{self.name} was stopped immediately, which "
+                          f"abandons the deceleration ramp and can lose steps")
         rc = (d.ISC_StopImmediate(self._sb) if immediate
               else d.ISC_StopProfiled(self._sb))
         _check(rc, f"stop {self.name}")
+
+    def emergency_stop(self, reason="emergency stop"):
+        """Stop NOW, latch the interlock, and never raise on the way.
+
+        The three things that separate this from stop(immediate=True):
+
+        1. It latches. Stopping the axis that is moving does nothing about the
+           thread that is about to command the next move, and on this rig that
+           is a fraction of a second away.
+        2. It cannot fail. An exception here would skip the remaining axes,
+           and the whole reason for a machine-wide stop is that the axis that
+           threw is not necessarily the one about to hit something.
+        3. It is immediate, not profiled. At 6 mm/s and 10 mm/s^2 a profiled
+           stop still travels about 1.8 mm; if 1.8 mm did not matter, nobody
+           would be pressing the button.
+
+        Returns "" on success or the error text, for the caller to log.
+        """
+        self.interlock.trip(reason)
+        if not self.is_open:
+            return ""
+        try:
+            self.distrust(f"{self.name} was stopped by an emergency stop "
+                          f"({reason}), which can lose steps")
+            _check(dll().ISC_StopImmediate(self._sb), f"stop {self.name}")
+            return ""
+        except Exception as exc:                     # noqa: BLE001 -- see above
+            return f"{self.name}: {type(exc).__name__}: {exc}"
 
     def wait(self, timeout_s=180.0, what="move", settle_s=0.0):
         """Block until motion stops.
@@ -624,14 +1158,37 @@ class Stage:
         while True:
             bits = self.status
             if bits & MOTION_ERROR_BIT:
+                self.distrust(f"{self.name} reported a motion error during "
+                              f"{what}")
+                self.interlock.trip(f"{self.name}: motion error during {what}")
                 raise StageError(f"{self.name}: motion error during {what}")
             if not bits & MOVING_MASK:
                 break
             if time.monotonic() > deadline:
                 self.stop()
+                self.distrust(f"{self.name} timed out during {what}, so it may "
+                              f"have stalled rather than arrived")
                 raise StageError(
                     f"{self.name}: {what} did not finish within {timeout_s:g} s")
             time.sleep(0.02)
+        # Motion ending is not the same as the move having been carried out.
+        # An emergency stop ends it too, and the caller -- a raster loop, a
+        # homing sequence, a wizard pass -- is otherwise about to read a
+        # position and command the next move as if nothing had happened. This
+        # is the check that turns a stop into a stop.
+        self.interlock.require_clear(f"{self.name}: {what}")
+        if bits & (HARD_LIMIT_MASK):
+            # Not raised: homing ends ON the limit switch, which is the whole
+            # point of homing. But an ordinary move that finishes against a
+            # hard stop did not arrive, it collided, and the count is a guess
+            # from there on.
+            if what != "homing":
+                self.distrust(f"{self.name} ended {what} against a hard limit "
+                              f"switch rather than at its target")
+                raise StageError(
+                    f"{self.name}: {what} ran into a hard limit switch. The "
+                    f"soft limits did not stop it in time -- check "
+                    f"{AXIS_CONFIG} before moving this axis again.")
         if settle_s:
             time.sleep(settle_s)
 
@@ -672,8 +1229,16 @@ class StageSet:
     fewer columns.
     """
 
-    def __init__(self, axes):
+    def __init__(self, axes, interlock=None, home_order=()):
         self.axes = dict(axes)          # name -> Stage
+        # One latch for the whole machine, handed to every axis. A per-axis
+        # interlock would stop the axis that faulted and leave the other two
+        # running, which on a stacked rig is the arrangement most likely to
+        # turn one fault into a collision.
+        self.interlock = interlock if interlock is not None else MotionInterlock()
+        for st in self.axes.values():
+            st.interlock = self.interlock
+        self.home_order = tuple(home_order)
 
     # ---- construction ----
 
@@ -709,14 +1274,18 @@ class StageSet:
                     f"{path} maps axes to stages that are not on the bus: "
                     f"{', '.join(missing)} (present: {', '.join(found)})")
             frames = load_axis_frames(path)
+            motion = load_axis_motion(path, mapping)
             axes = {}
             for name, serial in mapping.items():
                 fr = frames.get(name, {})
+                vel, acc = motion[name]
                 axes[name] = Stage(serial, name=name,
                                    invert=fr.get("invert", False),
-                                   origin_mm=fr.get("origin_mm"))
-        else:
-            axes = {s: Stage(s, name=s) for s in found}
+                                   origin_mm=fr.get("origin_mm"),
+                                   limit_mm=fr.get("limit_mm"),
+                                   vel_mm_s=vel, accel_mm_s2=acc)
+            return cls(axes, home_order=load_home_order(path, mapping))
+        axes = {s: Stage(s, name=s) for s in found}
         return cls(axes)
 
     # ---- lifecycle ----
@@ -764,25 +1333,57 @@ class StageSet:
         return all(st.homed for st in self.axes.values())
 
     @property
+    def trusted(self):
+        """True only if every axis's position counter can be believed."""
+        return all(st.position_trusted for st in self.axes.values())
+
+    def untrusted(self):
+        """[(axis, why)] for every axis whose position cannot be believed."""
+        return [(n, st.distrust_reason) for n, st in self.axes.items()
+                if not st.position_trusted]
+
+    @property
     def moving(self):
         return any(st.moving for st in self.axes.values())
 
     def position(self):
         return {name: st.position_mm for name, st in self.axes.items()}
 
-    def home_all(self, timeout_s=180.0):
-        """Home every axis at once, then wait for all of them.
+    def home_sequence(self):
+        """The axes in the order they should be homed, safest first.
 
-        Started together rather than in sequence because homing is slow and the
-        axes are mechanically independent -- but see the GUI's confirmation
-        step: three axes homing simultaneously is three chances to collide.
+        Order matters on a stacked rig and simultaneity hides that. Homing
+        drives the full travel into a hard stop, so if the head has to be
+        retracted before the other axes can sweep without fouling something,
+        that retraction has to HAPPEN FIRST -- not at the same time, which is
+        a race whose outcome depends on which axis is slower today.
+
+        `home_order` in stages.json declares it. Axes it does not name follow,
+        in map order, so adding a fourth axis cannot silently drop it.
         """
-        for st in self.axes.values():
-            st.home(wait=False)
-        for st in self.axes.values():
-            st.wait(timeout_s=timeout_s, what="homing")
+        named = [n for n in self.home_order if n in self.axes]
+        return named + [n for n in self.axes if n not in named]
 
-    def move_to(self, timeout_s=180.0, settle_s=0.0, **coords):
+    def home_all(self, timeout_s=180.0, progress=None):
+        """Home every axis, one at a time, in home_sequence() order.
+
+        Sequential, where this used to start all three together. Three axes
+        homing at once is three carriages sweeping their whole travel with no
+        ordering between them -- fine on a rig where nothing can foul anything,
+        which is a property of the fixture and the cable dress on the day, not
+        of the software. It costs a minute; the failure it avoids costs a probe
+        head. Declare home_order in stages.json to control the sequence.
+        """
+        self.interlock.require_clear("homing")
+        for name in self.home_sequence():
+            st = self.axes[name]
+            st.home(wait=False)
+            st.wait(timeout_s=timeout_s, what="homing")
+            st.trust_after_homing()
+            if progress:
+                progress(name, st.position_mm)
+
+    def move_to(self, timeout_s=None, settle_s=0.0, **coords):
         """move_to(x=10, y=20) -- start all named axes, then wait for all.
 
         Simultaneous rather than sequential: for a raster this roughly halves
@@ -793,11 +1394,23 @@ class StageSet:
         if unknown:
             raise StageError(f"no such axis: {', '.join(sorted(unknown))}")
         moving = []
-        for name, mm in coords.items():
-            if mm is None:
-                continue
-            self.axes[name].move_to(mm, wait=False)
-            moving.append(self.axes[name])
+        try:
+            for name, mm in coords.items():
+                if mm is None:
+                    continue
+                self.axes[name].move_to(mm, wait=False)
+                moving.append(self.axes[name])
+        except Exception:
+            # Whatever refused the second axis -- out of limits, a latched
+            # interlock, a DLL error -- the first one is already travelling,
+            # and nothing above here is going to wait for it. A raster catches
+            # this exception, records a failed point and commands the NEXT
+            # move, so without this the machine would be part way through a
+            # move nobody is tracking while a new one is issued on top.
+            for st in moving:
+                with contextlib.suppress(Exception):
+                    st.stop()
+            raise
         for st in moving:
             st.wait(timeout_s=timeout_s, what="move")
         if settle_s:
@@ -816,6 +1429,40 @@ class StageSet:
         if errors:
             raise StageError("; ".join(errors))
 
+    # ---- emergency stop ----
+
+    def emergency_stop(self, reason="emergency stop"):
+        """Stop every axis immediately and latch the machine off.
+
+        Never raises. This is called from a button handler, from a status
+        watchdog and from a worker's failure path, and in every one of those
+        an exception part way through the axes would leave the rest running --
+        which is precisely the outcome the call exists to prevent. Errors come
+        back as a list of strings for the caller to log.
+
+        Not a substitute for a hardware emergency stop. This asks the
+        controllers to stop over USB; it depends on this process running, the
+        USB link being up and the controllers being responsive, none of which
+        is true in the failures a real E-stop exists for. A category-0 stop is
+        a mushroom head in series with the motor supply, and nothing in
+        software replaces it -- see EMERGENCY STOP in the module docstring.
+        """
+        errors = [st.emergency_stop(reason) for st in self.axes.values()]
+        # Trip even with no axes open, so the latch is set for whatever opens
+        # next rather than only for what happened to be connected.
+        self.interlock.trip(reason)
+        return [e for e in errors if e]
+
+    def reset_interlock(self):
+        """Clear the latch. Returns (was_tripped_reason, [(axis, why)]).
+
+        The second half is the axes whose position is no longer trustworthy
+        after whatever tripped it -- an immediate stop can lose steps, so
+        clearing the latch does NOT restore absolute moves. Those come back
+        when the axis is homed, and the caller is expected to say so.
+        """
+        return (self.interlock.reset(), self.untrusted())
+
 
 # ---------------------------------------------------------------------------
 # axis map persistence
@@ -824,49 +1471,150 @@ class StageSet:
 def load_axis_map(path=AXIS_CONFIG):
     if not os.path.exists(path):
         return {}
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         doc = json.load(fh)
     return {str(k): str(v) for k, v in doc.get("axes", {}).items()}
 
 
 def load_axis_frames(path=AXIS_CONFIG):
-    """axis -> {"invert": bool, "origin_mm": float|None}.
+    """axis -> {"invert": bool, "origin_mm": float|None, "limit_mm": pair|None}.
 
     Kept beside the axis map rather than derived from it because which way a
     stage runs is a fact about the BRACKET, not about the stage: swap two
-    controllers over and the serials move, the mounting does not.
+    controllers over and the serials move, the mounting does not. "limit_mm"
+    is the same kind of fact -- the working envelope belongs to the fixture,
+    not to the leadscrew.
     """
     if not os.path.exists(path):
         return {}
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         doc = json.load(fh)
     out = {}
-    for name, spec in (doc.get("frame") or {}).items():
-        if isinstance(spec, bool):          # shorthand: {"z": true}
-            spec = {"invert": spec}
+    for name, raw_spec in (doc.get("frame") or {}).items():
+        # shorthand: {"z": true}
+        spec = {"invert": raw_spec} if isinstance(raw_spec, bool) else raw_spec
         origin = spec.get("origin_mm")
+        limit = spec.get("limit_mm")
+        if limit is not None:
+            if len(limit) != 2:
+                raise StageError(
+                    f"{path}: frame.{name}.limit_mm must be [low, high], "
+                    f"got {limit!r}")
+            limit = (float(limit[0]), float(limit[1]))
         out[str(name)] = {
             "invert": bool(spec.get("invert", False)),
             "origin_mm": None if origin is None else float(origin),
+            "limit_mm": limit,
         }
     return out
+
+
+def load_home_order(path=AXIS_CONFIG, axes=()):
+    """The order home_all() should reference the axes in, safest first.
+
+    Declared rather than inferred: which axis has to retract before the others
+    may sweep is a property of the fixture on the bench, and no amount of
+    reading the config can work it out. An axis named here that is not on the
+    machine is ignored rather than an error -- the safe order for a three-axis
+    rig should stay valid when you unplug one to work on it.
+    """
+    if not os.path.exists(path):
+        return ()
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    order = doc.get("home_order") or ()
+    known = set(axes) if axes else None
+    return tuple(str(n) for n in order if known is None or n in known)
+
+
+def load_axis_motion(path=AXIS_CONFIG, axes=()):
+    """axis -> (velocity_mm_s, accel_mm_s2), the profile each axis opens with.
+
+    stages.json carries it as
+
+        "motion": {"velocity_mm_s": 8.0, "accel_mm_s2": 10.0,
+                   "axes": {"z": {"velocity_mm_s": 5.0}}}
+
+    The block applies to every axis, and "axes" overrides one of them -- z
+    lifts the head against gravity and is the one most likely to want its own
+    number. Anything left unsaid falls back to the module defaults, so a rig
+    with no stages.json still opens quiet rather than at Kinesis's 20 mm/s.
+    """
+    doc = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    block = doc.get("motion") or {}
+    per_axis = block.get("axes") or {}
+
+    def _pick(spec, key, fallback):
+        val = spec.get(key)
+        return fallback if val is None else float(val)
+
+    base_v = _pick(block, "velocity_mm_s", DEFAULT_VEL_MM_S)
+    base_a = _pick(block, "accel_mm_s2", DEFAULT_ACCEL_MM_S2)
+    out = {}
+    for name in axes:
+        spec = per_axis.get(name) or {}
+        # Clamped on the way in, so a stages.json written before the ceiling
+        # existed -- or edited by hand -- cannot reintroduce the shipped
+        # 20 mm/s through the back door.
+        out[str(name)] = (clamp_velocity(_pick(spec, "velocity_mm_s", base_v)),
+                          _pick(spec, "accel_mm_s2", base_a))
+    return out
+
+
+def save_axis_motion(path=AXIS_CONFIG, velocity_mm_s=None, accel_mm_s2=None,
+                     axis=None):
+    """Write the motion profile into stages.json, leaving the rest of it alone.
+
+    With no axis this sets the block that applies to everything; with one it
+    writes an override for that axis only.
+    """
+    doc = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    block = doc.setdefault("motion", {})
+    target = block if axis is None else block.setdefault("axes", {}).setdefault(
+        str(axis), {})
+    if velocity_mm_s is not None:
+        target["velocity_mm_s"] = clamp_velocity(velocity_mm_s)
+    if accel_mm_s2 is not None:
+        target["accel_mm_s2"] = float(accel_mm_s2)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write("\n")
+    return path
 
 
 def save_axis_map(mapping, path=AXIS_CONFIG, frames=None):
     doc = {}
     if os.path.exists(path):
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
     doc["axes"] = {str(k): str(v) for k, v in mapping.items()}
     if frames is not None:
+        existing = doc.get("frame") or {}
         out = {}
         for name, spec in frames.items():
-            entry = {"invert": bool(spec.get("invert", False))}
+            # Merged onto what is already there, not written over it. The
+            # caller of this is the GUI's "Save axis map", which knows about
+            # inversion and nothing about soft limits -- and a save that
+            # quietly deleted the working envelope would remove the only thing
+            # keeping the head out of the fixture, at the moment someone was
+            # doing routine housekeeping.
+            prev = existing.get(str(name))
+            entry = dict(prev) if isinstance(prev, dict) else {}
+            entry["invert"] = bool(spec.get("invert", False))
             if spec.get("origin_mm") is not None:
                 entry["origin_mm"] = float(spec["origin_mm"])
+            if spec.get("limit_mm") is not None:
+                entry["limit_mm"] = [float(spec["limit_mm"][0]),
+                                     float(spec["limit_mm"][1])]
             out[str(name)] = entry
         doc["frame"] = out
-    with open(path, "w") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2)
         fh.write("\n")
 
@@ -899,18 +1647,26 @@ def _cmd_list(a):
             # here as it does everywhere else. Listing device coordinates on
             # one screen and rig coordinates on another is how a reversed
             # axis gets "fixed" twice.
+            # vel/accel None: listing must not change how a stage moves.
             with Stage(s, name=axis or s, invert=fr.get("invert", False),
-                       origin_mm=fr.get("origin_mm")) as st:
+                       origin_mm=fr.get("origin_mm"),
+                       vel_mm_s=None, accel_mm_s2=None) as st:
                 snap = st.snapshot()
                 pos = (f"{snap['position_mm']:8.3f} mm" if snap["homed"]
                        else f"{snap['position_mm']:8.3f} mm (NOT HOMED)")
                 print(f"{s}  {st.model:<8}{label}")
                 print(f"    travel {st.travel_mm[0]:g}..{st.travel_mm[1]:g} mm"
                       f"   position {pos}")
+                vel, acc = st.vel_params
                 print(f"    flags: {', '.join(snap['flags']) or 'none'}")
+                print(f"    motion: {vel:g} mm/s, {acc:g} mm/s^2")
                 cal = st.calibration_file()
-                print(f"    calibration file: {cal or 'NONE -- on-axis accuracy '
-                                                     '~47 um instead of <5 um'}")
+                # Built outside the f-string: a line break inside a
+                # replacement field is Python 3.12+ syntax, and this project
+                # supports 3.10.
+                cal_note = cal or ("NONE -- on-axis accuracy ~47 um instead "
+                                   "of <5 um")
+                print(f"    calibration file: {cal_note}")
         except StageError as exc:
             print(f"{s}  {info['description']}{label}\n    {exc}")
     return 0
@@ -924,29 +1680,56 @@ def _cmd_status(a):
                 state += ", NOT HOMED"
             if snap["error"]:
                 state += ", MOTION ERROR"
+            if snap["at_hard_limit"]:
+                state += ", ON A HARD LIMIT"
             frame = ("" if snap["frame"] == "as mounted"
                      else f"  ({snap['frame']}, device "
                           f"{snap['position_dev_mm']:.4f} mm)")
+            vel, acc = ss[name].vel_params
             print(f"{name:>4}  {snap['position_mm']:9.4f} mm  "
                   f"[{snap['serial']} {snap['model']}]  {state}{frame}")
+            print(f"      {vel:g} mm/s, {acc:g} mm/s^2  -- a 5 mm step peaks "
+                  f"at {ss[name].peak_speed_mm_s(5):.1f} mm/s, "
+                  f"20 mm at {ss[name].peak_speed_mm_s(20):.1f}")
+            lo, hi = snap["limit_mm"]
+            envelope = f"      may use {lo:g}..{hi:g} mm"
+            if snap["limit_mm"] != snap["travel_mm"]:
+                envelope += (f"  (soft limit inside a "
+                             f"{snap['travel_mm'][0]:g}.."
+                             f"{snap['travel_mm'][1]:g} mm travel)")
+            else:
+                envelope += ("  -- THE WHOLE TRAVEL: no soft limit is set for "
+                             "this axis, so nothing but the limit switches "
+                             "stops it short of the fixture")
+            print(envelope)
+            if not snap["trusted"]:
+                print(f"      absolute moves REFUSED: {snap['distrust_reason']}")
+        print(f"\nhome order: {' -> '.join(ss.home_sequence())}")
+        if ss.interlock.tripped:
+            print(f"MOTION IS LATCHED OFF: {ss.interlock.tripped}")
     return 0
 
 
 def _cmd_home(a):
     with StageSet.from_config(a.config) as ss:
-        targets = [ss[n] for n in (a.axis or ss.names)]
-        names = ", ".join(st.name for st in targets)
+        wanted = set(a.axis or ss.names)
+        # In the declared safe order even when the caller named a subset, so
+        # `home --axis x --axis z` cannot become the one ordering that fouls.
+        order = [n for n in ss.home_sequence() if n in wanted]
+        names = ", ".join(order)
         if not a.yes:
             print(f"Homing drives {names} into the limit switch at full "
-                  f"homing speed.\nMake sure the probe head and its cabling "
-                  f"are clear of the whole travel.")
+                  f"homing speed, one axis at a time in that order.\nMake "
+                  f"sure the probe head and its cabling are clear of the "
+                  f"whole travel.")
             if input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
                 print("aborted")
                 return 1
-        for st in targets:
+        for name in order:
+            st = ss[name]
             st.home(wait=False)
-        for st in targets:
             st.wait(timeout_s=a.timeout, what="homing")
+            st.trust_after_homing()
             print(f"{st.name}: homed, at {st.position_mm:.4f} mm")
     return 0
 
@@ -998,9 +1781,9 @@ def _cmd_identify(a):
             st.move_by(a.distance)
             st.move_by(-a.distance)
             print(f"  back at {st.position_mm:.4f} mm")
-        if len(targets) > 1 and not a.yes:
-            if input("next stage? [Y/n] ").strip().lower() in ("n", "no"):
-                break
+        if (len(targets) > 1 and not a.yes
+                and input("next stage? [Y/n] ").strip().lower() in ("n", "no")):
+            break
     return 0
 
 
@@ -1008,6 +1791,77 @@ def _cmd_stop(a):
     with StageSet.from_config(a.config) as ss:
         ss.stop_all(immediate=a.immediate)
         print("stopped")
+    return 0
+
+
+def _cmd_estop(a):
+    """Stop everything now, from a second terminal.
+
+    The GUI's button is the one to reach for while the GUI is up. This is for
+    when it is not -- a scan started from the command line, a wedged window,
+    a script that got away. It opens the devices, stops them immediately and
+    exits.
+
+    What it does NOT do is latch: the interlock lives in a process, and this
+    process is about to end. Whatever is still running keeps its own idea of
+    whether it may move, so stop that too. The axes come back untrusted
+    either way and want re-homing before any absolute move.
+    """
+    errors = []
+    try:
+        with StageSet.from_config(a.config) as ss:
+            errors = ss.emergency_stop("emergency stop from the command line")
+            print(f"EMERGENCY STOP: {', '.join(ss.names)} stopped immediately")
+    except StageError as exc:
+        print(f"EMERGENCY STOP FAILED TO REACH THE STAGES: {exc}",
+              file=sys.stderr)
+        print("If anything is moving, cut power to the controllers.",
+              file=sys.stderr)
+        return 2
+    for e in errors:
+        print(f"  {e}", file=sys.stderr)
+    print("Steps may have been lost -- re-home every axis before any "
+          "absolute move.")
+    print("This did not latch anything off: stop whatever commanded the "
+          "move as well.")
+    return 1 if errors else 0
+
+
+def _cmd_speed(a):
+    """Show or change the motion profile -- the cure for a howling axis."""
+    with StageSet.from_config(a.config) as ss:
+        names = a.axis or ss.names
+        unknown = [n for n in names if n not in ss.names]
+        if unknown:
+            print(f"no such axis: {', '.join(unknown)} "
+                  f"(have {', '.join(ss.names)})")
+            return 1
+        changing = a.vel is not None or a.accel is not None
+        if a.vel is not None and a.vel > MAX_VEL_MM_S:
+            print(f"{a.vel:g} mm/s is above the {MAX_VEL_MM_S:g} mm/s ceiling "
+                  f"in this module -- using {MAX_VEL_MM_S:g}")
+            a.vel = MAX_VEL_MM_S
+        for name in names:
+            st = ss[name]
+            if changing:
+                st.set_vel_params(a.vel, a.accel)
+            vel, acc = st.vel_params
+            print(f"{name:>4}  {vel:g} mm/s, {acc:g} mm/s^2")
+            # The table, not the setting, is what answers "why is 10 mm loud".
+            peaks = "  ".join(f"{d:g} mm -> {st.peak_speed_mm_s(d):.1f}"
+                              for d in (1.0, 2.0, 5.0, 10.0, 20.0, 50.0))
+            print(f"      peak speed by step size, mm/s:  {peaks}")
+        if changing and a.save:
+            for name in (names if a.axis else (None,)):
+                save_axis_motion(a.config, a.vel, a.accel, axis=name)
+            where = f"axis {', '.join(names)}" if a.axis else "all axes"
+            print()
+            print(f"wrote {a.config} ({where}) -- this is now what every "
+                  f"session opens with")
+        elif changing:
+            print()
+            print("not saved: this lasts until the controller is power "
+                  "cycled. Add --save to make it the default.")
     return 0
 
 
@@ -1106,6 +1960,25 @@ def main(argv=None):
     ps.add_argument("--immediate", action="store_true",
                     help="abrupt stop; loses steps, so re-home afterwards")
     ps.set_defaults(func=_cmd_stop)
+
+    sub.add_parser(
+        "estop",
+        help="EMERGENCY STOP: stop every axis immediately, from another "
+             "terminal").set_defaults(func=_cmd_estop)
+
+    pv = sub.add_parser("speed", help="show or set the motion profile")
+    pv.add_argument("--vel", type=float, metavar="MM_S",
+                    help=f"maximum velocity, mm/s (default "
+                         f"{DEFAULT_VEL_MM_S:g}, hard ceiling "
+                         f"{MAX_VEL_MM_S:g})")
+    pv.add_argument("--accel", type=float, metavar="MM_S2",
+                    help=f"acceleration, mm/s^2 (default "
+                         f"{DEFAULT_ACCEL_MM_S2:g})")
+    pv.add_argument("--axis", action="append",
+                    help="axis name; repeatable. Default: all")
+    pv.add_argument("--save", action="store_true",
+                    help="write it to the config so every session starts here")
+    pv.set_defaults(func=_cmd_speed)
 
     pp = sub.add_parser("map", help="record which stage is which axis")
     pp.add_argument("--assign", action="append", metavar="AXIS=SERIAL")

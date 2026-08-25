@@ -11,9 +11,16 @@ the tube frame and drawn where the chip physically sits, a magnet passing the
 probe reads immediately -- you can see which face it went past and in which
 direction the field pointed, which no stack of time series shows.
 
+The probe is drawn as it is mounted, not as the maths writes it: the tube lies
+horizontally along the world Y with its tip end forward and Z up, which is the
+bench arrangement. Everything else stays in the tube frame -- probe_geometry's
+MOUNT_ROT is applied here, at the last moment before something is drawn, so a
+remount is one matrix and touches no calibration.
+
 Colour encodes |B| (rotation invariant, so it is comparable between chips);
-arrow direction is the tube-frame field direction; arrow length is |B| against
-a shared scale so chip-to-chip amplitude differences are visible at a glance.
+arrow direction is the field direction as it points on the bench; arrow length
+is |B| against a shared scale, so chip-to-chip amplitude differences are visible
+at a glance.
 Dead or excluded chips are drawn dark red with no arrow.
 """
 
@@ -26,19 +33,20 @@ from PyQt6 import QtGui
 
 import octobee_profile as oprof
 import probe_geometry as pg_geom
+import itertools
 
 # Turbo runs blue -> green -> red with even perceptual steps, so a small change
 # near zero is as visible as one near full scale.
 try:
     import matplotlib.cm as _cm
     _CMAP = _cm.get_cmap("turbo") if hasattr(_cm, "get_cmap") else None
-except Exception:                                   # noqa: BLE001
+except Exception:
     _CMAP = None
 if _CMAP is None:
     try:
         from matplotlib import colormaps as _cmaps
         _CMAP = _cmaps["turbo"]
-    except Exception:                               # noqa: BLE001
+    except Exception:
         _CMAP = None
 
 
@@ -50,11 +58,16 @@ def color_for(frac):
     # linear blue -> cyan -> yellow -> red fallback
     stops = [(0.0, (0.15, 0.25, 0.85)), (0.35, (0.10, 0.75, 0.80)),
              (0.70, (0.95, 0.85, 0.15)), (1.0, (0.90, 0.15, 0.10))]
-    for (a, ca), (b, cb) in zip(stops, stops[1:]):
+    for (a, ca), (b, cb) in itertools.pairwise(stops):
         if f <= b:
             t = (f - a) / (b - a)
-            return tuple(ca[i] + t * (cb[i] - ca[i]) for i in range(3)) + (1.0,)
+            return (*tuple(ca[i] + t * (cb[i] - ca[i]) for i in range(3)), 1.0)
     return stops[-1][1] + (1.0,)
+
+
+def _w(v):
+    """Tube frame -> the world frame this view draws in, as GL wants it."""
+    return pg_geom.to_world(v).astype(np.float32)
 
 
 DEAD_COLOR = (0.45, 0.10, 0.10, 1.0)
@@ -116,18 +129,21 @@ class ProbeView3D(gl.GLViewWidget):
         self._add_tube()
         self._add_axes()
 
+        # The arrow roots never move once the geometry is fixed, so rotate
+        # them once here rather than 16 times a frame.
+        self._pos_w = pg_geom.to_world(g.positions())
         self.pads, self.arrows, self.tips, self.labels = [], [], [], []
         for sid in range(1, n + 1):
             # The arm is structure, not data: draw it once in board colour so
             # the eye can see how far off the tube each chip really sits.
             averts, afaces = pg_geom.arm_mesh(g, sid)
             self._register(gl.GLMeshItem(
-                meshdata=gl.MeshData(vertexes=averts, faces=afaces),
+                meshdata=gl.MeshData(vertexes=_w(averts), faces=afaces),
                 smooth=False, drawEdges=False, color=ARM_COLOR,
                 shader="shaded", glOptions="opaque"))
 
             verts, faces = pg_geom.chip_mesh(g, sid)
-            md = gl.MeshData(vertexes=verts, faces=faces)
+            md = gl.MeshData(vertexes=_w(verts), faces=faces)
             pad = gl.GLMeshItem(meshdata=md, smooth=False, drawEdges=True,
                                 edgeColor=(0.1, 0.1, 0.12, 1.0),
                                 color=color_for(0.0), shader="shaded",
@@ -145,7 +161,7 @@ class ProbeView3D(gl.GLViewWidget):
             self._register(tip)
             self.tips.append(tip)
 
-            p = g.position(sid) + g.arm_dir(sid) * 7.0
+            p = _w(g.position(sid) + g.arm_dir(sid) * 7.0)
             txt = gl.GLTextItem(pos=p, text=f"S{sid}",
                                 color=(210, 215, 225, 255))
             self._register(txt)
@@ -160,7 +176,7 @@ class ProbeView3D(gl.GLViewWidget):
 
     def _add_tube(self):
         verts, faces = pg_geom.tube_mesh(self.geom)
-        md = gl.MeshData(vertexes=verts, faces=faces)
+        md = gl.MeshData(vertexes=_w(verts), faces=faces)
         body = gl.GLMeshItem(meshdata=md, smooth=False, drawEdges=True,
                              edgeColor=(0.55, 0.60, 0.70, 0.9),
                              color=TUBE_COLOR, shader="balloon",
@@ -172,18 +188,28 @@ class ProbeView3D(gl.GLViewWidget):
         """Overall size of the probe: the arms reach far past the tube itself."""
         return max(self.geom.tube_length_mm, 2.0 * self.geom.fsv_radius_mm)
 
+    @property
+    def floor_z_mm(self):
+        """Where to put the grid: clear of the lowest arm, not through it."""
+        return -self.geom.fsv_radius_mm * 1.15
+
     def _add_grid(self):
         span = self.extent_mm * 1.15
         grid = gl.GLGridItem()
         grid.setSize(span, span)
         grid.setSpacing(span / 14.0, span / 14.0)
-        grid.translate(0, 0, -self.geom.fsv_radius_mm * 0.6)
+        # The grid is the bench: horizontal, and under the probe rather than
+        # under the origin, because the tube now runs from y=0 to its far end
+        # instead of standing on it.
+        grid.translate(0, self.geom.tube_length_mm / 2.0, self.floor_z_mm)
         grid.setColor((70, 76, 90, 110))
         self._register(grid)
 
     def _add_axes(self):
+        # Sat on the grid at the flange end, so the Y arrow runs along the tube
+        # and reads as "this is the direction the probe points".
         L = self.geom.fsv_radius_mm * 0.55
-        origin = np.array([0.0, 0.0, -self.geom.fsv_radius_mm * 0.25])
+        origin = np.array([0.0, 0.0, self.floor_z_mm])
         for vec, col, name in ((np.array([L, 0, 0]), (1, .35, .35, 1), "X"),
                                (np.array([0, L, 0]), (.35, 1, .35, 1), "Y"),
                                (np.array([0, 0, L]), (.45, .6, 1, 1), "Z")):
@@ -197,12 +223,19 @@ class ProbeView3D(gl.GLViewWidget):
     def reset_camera(self):
         # Frame the arms, not the tube: with 89 mm arms on a 25 mm tube the
         # probe is wider than it is long, so fitting the tube alone would run
-        # the chips off the edges. Look from above the horizontal rather than
-        # along it, or the four sets of arms overlap into an unreadable cross.
-        centre = pg.Vector(0, 0, self.geom.tube_length_mm / 2.0)
+        # the chips off the edges. Stay well off the tube axis -- roughly 60
+        # degrees round from it and a little above -- or the four sets of arms
+        # line up and overlap into an unreadable cross.
+        half = self.geom.tube_length_mm / 2.0
+        rad = self.geom.fsv_radius_mm
+        # Lying down, the probe is long in Y and wide in both X and Z, so its
+        # bounding sphere -- not its longest single dimension -- is what has to
+        # fit the 60 degree field of view.
+        centre = pg.Vector(0, half, 0)
         self.opts["center"] = centre
-        self.setCameraPosition(pos=centre, distance=self.extent_mm * 1.35,
-                               elevation=26, azimuth=-58)
+        reach = float(np.sqrt(half ** 2 + 2 * rad ** 2))
+        self.setCameraPosition(pos=centre, distance=2.3 * reach,
+                               elevation=22, azimuth=35)
 
     # ---- live update -----------------------------------------------------
     def reset_scale(self):
@@ -225,18 +258,20 @@ class ProbeView3D(gl.GLViewWidget):
         """
         b = np.asarray(b_chip_mt, float).reshape(pg_geom.N_SENSORS, 3)
         b_tube = self.geom.to_tube_frame(b)
+        # |B| is the same either side of a rotation, so it is taken once and
+        # only the drawn direction goes on into the world frame.
         mag = np.linalg.norm(b_tube, axis=1)
+        b_world = pg_geom.to_world(b_tube)
 
         live = np.array([f"S{i+1}" not in self.dead
                          for i in range(pg_geom.N_SENSORS)])
         vis = mag[live] if live.any() else mag
         if self.auto_scale and vis.size:
             self._recent_max.append(float(np.max(vis)))
-            self.full_scale_mt = max(max(self._recent_max), 1e-4)
+            self.full_scale_mt = max(*self._recent_max, 0.0001)
         fs = max(self.full_scale_mt, 1e-9)
 
         for i in range(pg_geom.N_SENSORS):
-            sid = i + 1
             dead = not live[i]
             if dead:
                 self.pads[i].setColor(DEAD_COLOR)
@@ -250,8 +285,8 @@ class ProbeView3D(gl.GLViewWidget):
                 self.arrows[i].setData(pos=np.zeros((2, 3)), color=(0, 0, 0, 0))
                 self.tips[i].setData(pos=np.zeros((1, 3)), color=(0, 0, 0, 0))
                 continue
-            p0 = self.geom.position(sid)
-            direction = b_tube[i] / mag[i]
+            p0 = self._pos_w[i]
+            direction = b_world[i] / mag[i]
             scale = (self.arrow_scale_mm if self.arrow_scale_mm
                      else 0.45 * self.geom.arm_length_mm)
             length = scale * min(frac, 1.0)

@@ -26,11 +26,17 @@ measurement on this bench already:
     the concentrator than the other.
 """
 
+import contextlib
+import faulthandler
 import argparse
 import os
+import queue
 import sys
+import threading
 import time
+import traceback
 from collections import deque
+from typing import ClassVar
 
 import numpy as np
 import pyqtgraph as pg
@@ -38,6 +44,9 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import octobee as ob
 import octobee_calibration as ocal
+import octobee_help as ohelp
+import octobee_magcal as omag
+import octobee_live as olive
 import octobee_profile as oprof
 import octobee_posecal as opc
 import octobee_record as orec
@@ -128,6 +137,9 @@ class SourceBase:
     """Common interface: read() returns per-box (n, 32) count arrays, equal n."""
     hosts = ()
     vpc = ()
+    # Volts at ADC count 0, per box. Zero on every bipolar range; carried so a
+    # unipolar range converts correctly rather than reading half a span low.
+    volt_offset = ()
     fs_hz = 20000.0
     live = False
 
@@ -153,14 +165,14 @@ class LiveSource(SourceBase):
         self.hosts = list(hosts)
         self.layouts = list(layouts)
         self.streamers = list(streamers)
-        self.vpc = [l.volts_per_count for l in layouts]
+        self.vpc = [lay.volts_per_count for lay in layouts]
+        self.volt_offset = [lay.volt_offset for lay in layouts]
         self.fs_hz = float(layouts[0].fs_hz)
         self._pending = {h: deque() for h in self.hosts}
-        self._n = {h: 0 for h in self.hosts}
+        self._n = dict.fromkeys(self.hosts, 0)
         self._temp = {h: np.zeros(8, dtype=np.uint32) for h in self.hosts}
         self.gaps = 0
         self.lost = 0
-        self.bytes0 = 0
         self.error = None
         self._discard_startup_backlog()
         self.t0 = time.time()
@@ -179,7 +191,6 @@ class LiveSource(SourceBase):
         the number that is supposed to mean "the data you are recording has
         holes in it". A warning that is always on is not a warning.
         """
-        import queue
         for st in self.streamers:
             while True:
                 try:
@@ -200,9 +211,9 @@ class LiveSource(SourceBase):
                 self._n[h] += blk["ai"].shape[0]
                 if "temp_raw" in blk:
                     self._temp[h] = blk["temp_raw"]
-                g, l = ob.check_continuity(blk["sam_cnt"])
-                self.gaps += g
-                self.lost += l
+                gaps, lost = ob.check_continuity(blk["sam_cnt"])
+                self.gaps += gaps
+                self.lost += lost
         n = min(self._n.values()) if self._n else 0
         if n <= 0:
             return None
@@ -240,6 +251,7 @@ class ReplaySource(SourceBase):
         self.hosts = cap["hosts"]
         self.ai = cap["ai"]
         self.vpc = cap["vpc"]
+        self.volt_offset = cap.get("volt_offset", [0.0] * len(self.vpc))
         self.fs_hz = float(cap["fs_hz"][0])
         self._temp = cap["temp_raw"]
         self.speed = float(speed)
@@ -287,7 +299,11 @@ class DemoSource(SourceBase):
         self.geom = geom
         self.hosts = ["demo_694", "demo_695"]
         self.fs_hz = float(fs_hz)
-        self.vpc = [ob.ADC_RANGES["+/-10V"] / 65536.0] * 2
+        # Through a real Layout rather than by hand, so the synthetic source
+        # converts counts exactly the way the carriers' own frames do.
+        lay = ob.Layout(ssb=96, fs_hz=self.fs_hz, adc_range="+/-10V")
+        self.vpc = [lay.volts_per_count] * 2
+        self.volt_offset = [lay.volt_offset] * 2
         self.v_per_t = ob.RANGE_TO_VPT[b_range_mt]
         self.t = 0.0
         self.t_last = time.time()
@@ -391,7 +407,6 @@ class ConnectWorker(QtCore.QThread):
         self.block_samples = block_samples
 
     def run(self):
-        import threading
         prev, layouts, streamers, errors = {}, {}, {}, {}
 
         def prepare(h):
@@ -402,7 +417,6 @@ class ConnectWorker(QtCore.QThread):
                 if self.target_fs:
                     self.progress.emit(f"{h}: setting "
                                        f"{self.target_fs/1000:g} kSPS")
-                    import octobee_live as olive
                     prev[h], actual = olive.set_rate(h, self.target_fs)
                     self.progress.emit(f"{h}: running at {actual/1000:g} kSPS")
                 self.progress.emit(f"{h}: reading the frame layout")
@@ -421,7 +435,7 @@ class ConnectWorker(QtCore.QThread):
                 st.start()
                 streamers[h] = st
                 self.progress.emit(f"{h}: waiting for data")
-            except Exception as e:                    # noqa: BLE001
+            except Exception as e:
                 errors[h] = e
 
         threads = [threading.Thread(target=prepare, args=(h,), daemon=True)
@@ -457,7 +471,7 @@ class ConnectWorker(QtCore.QThread):
             source = LiveSource(self.hosts, [layouts[h] for h in self.hosts],
                                 ordered)
             self.done.emit(source, prev, "")
-        except Exception as e:                        # noqa: BLE001
+        except Exception as e:
             for st in streamers.values():
                 st.stop()
             self.done.emit(None, prev, f"{type(e).__name__}: {e}")
@@ -487,7 +501,6 @@ class SnapshotWorker(QtCore.QThread):
         fs = 0.0
         try:
             if self.restore_clkdiv:
-                import octobee_live as olive
                 for h, prev in self.restore_clkdiv.items():
                     olive.restore_rate(h, prev)
                 time.sleep(3.0)                       # let the clock settle
@@ -508,8 +521,46 @@ class SnapshotWorker(QtCore.QThread):
             os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
             np.savez_compressed(self.path, **save)
             self.done.emit(self.path, "", fs)
-        except Exception as e:                        # noqa: BLE001
+        except Exception as e:
             self.done.emit("", f"{type(e).__name__}: {e}", fs)
+
+
+def _stage_set_for(mapping):
+    """Build a StageSet for axis->serial, reading everything stages.json says.
+
+    Not StageSet.from_config: the axis assignment here comes from the table in
+    the Stages tab, which is allowed to differ from what is on disk -- that is
+    how you try an assignment out before saving it. Everything ELSE still has
+    to come from the file, and doing that inline at each call site is how the
+    soft limits and the home order got left out of one of them. One place, so
+    there is one thing to keep complete.
+    """
+    frames = ostage.load_axis_frames()
+    motion = ostage.load_axis_motion(axes=mapping)
+    return ostage.StageSet(
+        {name: ostage.Stage(serial, name=name,
+                            invert=frames.get(name, {}).get("invert", False),
+                            origin_mm=frames.get(name, {}).get("origin_mm"),
+                            limit_mm=frames.get(name, {}).get("limit_mm"),
+                            vel_mm_s=motion[name][0],
+                            accel_mm_s2=motion[name][1])
+         for name, serial in mapping.items()},
+        home_order=ostage.load_home_order(axes=mapping))
+
+
+def _is_running(worker):
+    """True if this worker thread is alive.
+
+    Tolerates None and a C++ object Qt has already deleted underneath us --
+    both are "not running", and this is called from the stop path, which is
+    the last place that should be able to raise.
+    """
+    if worker is None:
+        return False
+    try:
+        return bool(worker.isRunning())
+    except RuntimeError:
+        return False
 
 
 class StageWorker(QtCore.QThread):
@@ -529,12 +580,27 @@ class StageWorker(QtCore.QThread):
         super().__init__()
         self.what = what
         self.fn = fn
+        self._abort = False
+
+    def abort(self):
+        """Ask a multi-step command to stop between steps.
+
+        Homing three axes is three moves, and stopping the one in flight used
+        to leave the loop free to start the next: the operator pressed stop,
+        one carriage halted, and the next set off. Commands that take more
+        than one move check `aborted` between them.
+        """
+        self._abort = True
+
+    @property
+    def aborted(self):
+        return self._abort
 
     def run(self):
         try:
             self.fn(self.progress.emit)
             self.done.emit(self.what, "")
-        except Exception as e:                        # noqa: BLE001
+        except Exception as e:
             self.done.emit(self.what, f"{type(e).__name__}: {e}")
 
 
@@ -579,7 +645,6 @@ class ScanWorker(QtCore.QThread):
         fm = None
         try:
             if self.restore_clkdiv:
-                import octobee_live as olive
                 self.message.emit("restoring the carriers' own clock")
                 for h, prev in self.restore_clkdiv.items():
                     olive.restore_rate(h, prev)
@@ -600,7 +665,7 @@ class ScanWorker(QtCore.QThread):
                 should_abort=lambda: self._abort,
                 log=self.message.emit)
             self.done.emit(fm, "")
-        except Exception as e:                        # noqa: BLE001
+        except Exception as e:
             self.done.emit(fm, f"{type(e).__name__}: {e}")
 
 
@@ -642,6 +707,860 @@ class Rolling:
         return self.buf[self.n - self.filled:]
 
 
+NO_AXIS = "(none)"
+
+# What each pass is doing, for the header while it runs. The names matter more
+# than they look: the three passes take very different lengths of time and an
+# operator who cannot tell which one is running cannot tell a slow dither from
+# a stalled stage.
+PASS_NAMES = {
+    "locate": "pass A, finding the rings",
+    "cut": "pass B, cutting across each ring",
+    "dither": "pass C, measuring the standoff",
+}
+
+
+class MagnetWizard(QtWidgets.QDialog):
+    """Guided single-magnet calibration: four sweeps, one per quarter turn.
+
+    The routine is in octobee_magcal.py; this is the part that has to be a
+    dialog, because between poses the instrument cannot do anything until a
+    person has turned the head and said so. That pause is the whole reason
+    this is guided rather than a button: the run is only valid if the magnet
+    and the cradle stay put across all four poses, and nothing in software can
+    check that.
+
+    Each pose is an ordinary one-axis scan, run through the same ScanWorker as
+    a field map -- move, settle, average at the full 200 kSPS, repeat -- so the
+    per-point noise argument is identical and there is one mover, not two.
+    """
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("Guided magnet calibration")
+        self.setModal(False)
+        self.resize(760, 640)
+        self.run = omag.MagnetRun(axis="y")
+        self._worker = None
+        self._t0 = 0.0
+        self._start_mm = None
+        self._finished = False
+        self._park = {}          # across/normal positions, taken once
+        self._pass = None        # 'locate' | 'cut' | 'dither'
+        self._pending = None     # the PoseSweep the passes are building up
+        self._rings = None       # where pass A found this pose's four rings
+        self._released = False   # have the carriers been taken off live yet
+
+        lay = QtWidgets.QVBoxLayout(self)
+        self.lbl_step = QtWidgets.QLabel()
+        f = self.lbl_step.font()
+        f.setPointSize(f.pointSize() + 3)
+        f.setBold(True)
+        self.lbl_step.setFont(f)
+        lay.addWidget(self.lbl_step)
+
+        self.txt = QtWidgets.QTextBrowser()
+        self.txt.setMaximumHeight(250)
+        lay.addWidget(self.txt)
+
+        names = list(win.stages.names) if win.stages else ["y"]
+
+        self.box_setup = QtWidgets.QGroupBox("Sweep")
+        gl = QtWidgets.QGridLayout(self.box_setup)
+
+        # ---- pass A: the axial locate
+        self.cmb_axis = QtWidgets.QComboBox()
+        self.cmb_axis.addItems(names)
+        if "y" in names:
+            self.cmb_axis.setCurrentText("y")
+        self.cmb_axis.setToolTip(
+            "The axis the tube lies along. The whole argument for this "
+            "routine is that every sensor passes the magnet at the same "
+            "approach, which is only true along the tube axis.")
+        span, step = omag.suggested_sweep(win.geom)
+        self.spin_span = QtWidgets.QDoubleSpinBox()
+        self.spin_span.setRange(10.0, 300.0)
+        self.spin_span.setValue(span)
+        self.spin_span.setSuffix(" mm")
+        self.spin_span.setToolTip(
+            "How far to drive from where the head is parked now. Long enough "
+            "to carry every ring past the magnet and out the other side.")
+        self.spin_step = QtWidgets.QDoubleSpinBox()
+        self.spin_step.setRange(0.1, 50.0)
+        self.spin_step.setValue(step)
+        self.spin_step.setSuffix(" mm")
+        self.spin_step.setToolTip(
+            "Coarse on purpose. This pass only has to find WHERE the four "
+            "rings are; the transverse cut below is what measures them.")
+        self.spin_secs = QtWidgets.QDoubleSpinBox()
+        self.spin_secs.setRange(0.2, 30.0)
+        self.spin_secs.setValue(1.0)
+        self.spin_secs.setSuffix(" s")
+        self.spin_secs.setToolTip(
+            "Averaging time per point. The peak needs little, but the "
+            "standoff dither reads a CURVATURE out of seven points and that "
+            "is where the noise actually costs something -- if the standoff "
+            "column comes back mostly '--', raise this before anything else.")
+        self.spin_settle = QtWidgets.QDoubleSpinBox()
+        self.spin_settle.setRange(0.0, 10.0)
+        self.spin_settle.setValue(oscan.DEFAULT_SETTLE_S)
+        self.spin_settle.setSuffix(" s")
+
+        # ---- the standoff, which sizes both of the other passes
+        self.spin_standoff = QtWidgets.QDoubleSpinBox()
+        self.spin_standoff.setRange(3.0, 200.0)
+        self.spin_standoff.setValue(20.0)
+        self.spin_standoff.setSuffix(" mm")
+        self.spin_standoff.setToolTip(
+            "Roughly how far the magnet is from the chips. Nothing is "
+            "measured with this -- pass C measures the real distance, "
+            "per sensor -- but both of the other passes have to be SIZED "
+            "from it:\n\n"
+            "  - the transverse cut needs a half-span of about one standoff, "
+            "because that is the width of the peak it is looking for. Much "
+            "less and the cut is flat and the peak cannot be placed; much "
+            "more and the extra points buy nothing.\n"
+            "  - the dither needs a quarter of it, for the same reason in "
+            "reverse.\n\n"
+            "Within a factor of two is close enough. Changing it resizes "
+            "both.")
+
+        for col, (lbl, wdg) in enumerate((("tube axis", self.cmb_axis),
+                                          ("standoff ~", self.spin_standoff),
+                                          ("sweep", self.spin_span),
+                                          ("step", self.spin_step),
+                                          ("per point", self.spin_secs),
+                                          ("settle", self.spin_settle))):
+            gl.addWidget(QtWidgets.QLabel(lbl), 0, col)
+            gl.addWidget(wdg, 1, col)
+
+        # ---- pass B: the transverse cut
+        self.cmb_across = QtWidgets.QComboBox()
+        self.cmb_across.addItem(NO_AXIS)
+        self.cmb_across.addItems([n for n in names if n != "y"])
+        if "x" in names:
+            self.cmb_across.setCurrentText("x")
+        self.cmb_across.setToolTip(
+            "The transverse axis -- across the face, the way the arms reach. "
+            "Sweeping it as well as the tube axis is what lets each sensor be "
+            "measured at ITS OWN peak instead of at a slice through it.\n\n"
+            "Set to none and this is the old one-axis routine: still valid, "
+            "but a millimetre of arm placement then costs up to 15% of trim "
+            "if the magnet is not exactly on the chip line.")
+        self.spin_across_half = QtWidgets.QDoubleSpinBox()
+        self.spin_across_half.setRange(1.0, 100.0)
+        self.spin_across_half.setSuffix(" mm")
+        self.spin_across_step = QtWidgets.QDoubleSpinBox()
+        self.spin_across_step.setRange(0.05, 20.0)
+        self.spin_across_step.setSuffix(" mm")
+
+        # ---- pass C: the standoff dither
+        self.cmb_normal = QtWidgets.QComboBox()
+        self.cmb_normal.addItem(NO_AXIS)
+        self.cmb_normal.addItems([n for n in names if n != "y"])
+        if "z" in names:
+            self.cmb_normal.setCurrentText("z")
+        self.cmb_normal.setToolTip(
+            "The standoff axis -- toward the magnet. This one is NOT swept "
+            "for a peak, because |B| has no maximum in that direction; it "
+            "just keeps rising as the chip gets closer. A few points along it "
+            "measure the distance itself, which is the last first-order error "
+            "in the trim and the one the plane cannot touch.\n\n"
+            "Set to none to skip it. The run is still better than a bare "
+            "axial sweep, but each chip's distance stays assumed.")
+        self.spin_dither_half = QtWidgets.QDoubleSpinBox()
+        self.spin_dither_half.setRange(0.2, 50.0)
+        self.spin_dither_half.setSuffix(" mm")
+        self.spin_dither_half.setToolTip(
+            "Half-span of the dither. Bigger than instinct says: the standoff "
+            "comes out of the CURVATURE of the field along this axis, which "
+            "is second order, so a +-1 mm dither at a 20 mm standoff buries "
+            "it 0.4% under the slope and the fit returns noise.\n\n"
+            "The near end of the dither is also the closest the chips get to "
+            "the magnet. At a quarter of the standoff that is 2.4x the peak "
+            "field -- keep the peak under about a third of the range, or the "
+            "dither clips and the fit reads a flat top.")
+        self.spin_dither_pts = QtWidgets.QSpinBox()
+        self.spin_dither_pts.setRange(3, 21)
+        self.spin_dither_pts.setValue(omag.DITHER_POINTS)
+        self.spin_dither_pts.setToolTip(
+            "Three is the minimum that can separate a slope from a curvature, "
+            "and it leaves nothing over to judge the fit by. Seven is where "
+            "the bench stopped improving.")
+
+        for col, (lbl, wdg) in enumerate(
+                (("transverse axis", self.cmb_across),
+                 ("cut half-span", self.spin_across_half),
+                 ("cut step", self.spin_across_step),
+                 ("standoff axis", self.cmb_normal),
+                 ("dither half-span", self.spin_dither_half),
+                 ("dither points", self.spin_dither_pts))):
+            gl.addWidget(QtWidgets.QLabel(lbl), 2, col)
+            gl.addWidget(wdg, 3, col)
+
+        self._resize_passes()
+        self.spin_standoff.valueChanged.connect(self._resize_passes)
+
+        self.lbl_points = QtWidgets.QLabel("")
+        self.lbl_points.setWordWrap(True)
+        gl.addWidget(self.lbl_points, 4, 0, 1, 6)
+        for sp in (self.spin_span, self.spin_step, self.spin_secs,
+                   self.spin_settle, self.spin_across_half,
+                   self.spin_across_step, self.spin_dither_half):
+            sp.valueChanged.connect(self._update_estimate)
+        self.spin_dither_pts.valueChanged.connect(self._update_estimate)
+        for cb in (self.cmb_across, self.cmb_normal):
+            cb.currentTextChanged.connect(self._update_estimate)
+        lay.addWidget(self.box_setup)
+
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setMinimumHeight(22)
+        self.bar.setRange(0, 1)
+        self.bar.setValue(0)
+        self.bar.setFormat("no sweep running")
+        lay.addWidget(self.bar)
+
+        self.report = QtWidgets.QPlainTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setFont(QtGui.QFont("Consolas", 9))
+        self.report.setPlaceholderText(
+            "After the first pose, this fills with each sensor's peak, where "
+            "along the sweep it happened, and the trim it implies.\n\n"
+            "It is rewritten after every pose, so you can see the faces "
+            "arrive one at a time — and stop early if something is obviously "
+            "wrong rather than paying for all four.")
+        lay.addWidget(self.report, 1)
+
+        row = QtWidgets.QHBoxLayout()
+        self.chk_apply = QtWidgets.QCheckBox(
+            "apply the gain trim and save it to calibration.json")
+        self.chk_apply.setChecked(True)
+        self.chk_apply.setToolTip(
+            "Folds the measured per-sensor response into the calibration's "
+            "gain trim -- without any geometry weighting, because every "
+            "sensor was measured at the top of its own peak and scaled to a "
+            "common, measured standoff.\n\nIt SAVES as well as applies. An hour of "
+            "measurement that only exists in memory until someone remembers "
+            "to press Save calibration is an hour waiting to be lost.")
+        row.addWidget(self.chk_apply)
+        row.addStretch(1)
+        self.btn_primary = QtWidgets.QPushButton()
+        self.btn_primary.clicked.connect(self.on_primary)
+        self.btn_close = QtWidgets.QPushButton("Close")
+        self.btn_close.clicked.connect(self.close)
+        row.addWidget(self.btn_primary)
+        row.addWidget(self.btn_close)
+        lay.addLayout(row)
+
+        self._update_estimate()
+        self._refresh()
+
+    # ---- state -----------------------------------------------------------
+    @property
+    def busy(self):
+        return self._worker is not None and self._worker.isRunning()
+
+    def _across_name(self):
+        n = self.cmb_across.currentText()
+        return None if n == NO_AXIS else n
+
+    def _normal_name(self):
+        n = self.cmb_normal.currentText()
+        return None if n == NO_AXIS else n
+
+    def _resize_passes(self):
+        """Re-size the cut and the dither from the nominal standoff.
+
+        Both of them have a natural size set by the distance to the magnet and
+        no natural size otherwise, so leaving the operator to pick millimetres
+        out of the air is how a run comes back with a flat cut and an
+        unfittable dither. They stay editable; this only moves them when the
+        standoff changes.
+        """
+        d = self.spin_standoff.value()
+        half, step = omag.suggested_plane(d)
+        self.spin_across_half.setValue(half)
+        self.spin_across_step.setValue(step)
+        self.spin_dither_half.setValue(float(omag.suggested_dither(d)[-1]))
+
+    def _positions(self):
+        start = self._start_mm
+        if start is None:
+            start = self.win.stages[self.cmb_axis.currentText()].position_mm
+        return oscan.parse_axis_spec(
+            f"{start}:{start + self.spin_span.value()}:{self.spin_step.value()}")
+
+    def _across_offsets(self):
+        half, step = self.spin_across_half.value(), self.spin_across_step.value()
+        return oscan.parse_axis_spec(f"{-half}:{half}:{step}")
+
+    def _dither_offsets(self):
+        half = self.spin_dither_half.value()
+        return np.linspace(-half, half, int(self.spin_dither_pts.value()))
+
+    def _pass_sizes(self):
+        """(locate, cut, dither) point counts for one pose."""
+        rings = pgeom.SENSORS_PER_FACE
+        # Through parse_axis_spec rather than span/step + 1, so the estimate is
+        # the number of points the scan will actually visit: the spec drops a
+        # final point that floating point put past the stop, and an estimate
+        # that is one out every time trains you to distrust it.
+        n_loc = len(oscan.parse_axis_spec(
+            f"0:{self.spin_span.value()}:{self.spin_step.value()}"))
+        n_cut = rings * len(self._across_offsets()) if self._across_name() else 0
+        n_dit = rings * int(self.spin_dither_pts.value()) \
+            if self._normal_name() else 0
+        return n_loc, n_cut, n_dit
+
+    def _update_estimate(self):
+        n_loc, n_cut, n_dit = self._pass_sizes()
+        n = n_loc + n_cut + n_dit
+        per = self.spin_secs.value() + self.spin_settle.value() + 2.0
+        bits = [f"locate {n_loc}"]
+        bits.append(f"cut {n_cut}" if n_cut else "no transverse cut")
+        bits.append(f"dither {n_dit}" if n_dit else "no standoff dither")
+        self.lbl_points.setText(
+            f"{' + '.join(bits)} = {n} points per pose, about "
+            f"{n * per / 60:.1f} min each — {omag.N_POSES * n * per / 60:.0f} "
+            f"min for all {omag.N_POSES} poses")
+
+    def _refresh(self):
+        done = len(self.run)
+        self.box_setup.setEnabled(done == 0 and not self.busy)
+        self.btn_primary.setEnabled(not self.busy)
+        if self.busy:
+            self.lbl_step.setText(
+                f"Pose {done + 1} of {omag.N_POSES} — "
+                f"{PASS_NAMES.get(self._pass, 'sweeping')}")
+            self.btn_primary.setText("Sweeping...")
+            return
+        if done == 0:
+            self.lbl_step.setText("Before you start")
+            self.txt.setMarkdown(SETUP_TEXT)
+            self.btn_primary.setText("Start pose 1")
+        elif done < omag.N_POSES:
+            self.lbl_step.setText(f"Turn the head — pose {done + 1} of "
+                                  f"{omag.N_POSES}")
+            self.txt.setMarkdown(TURN_TEXT.format(n=done + 1))
+            self.btn_primary.setText(f"Start pose {done + 1}")
+        else:
+            self.lbl_step.setText("All four poses recorded")
+            self.txt.setMarkdown(DONE_TEXT)
+            self.btn_primary.setText("Apply and save")
+
+    # ---- running ---------------------------------------------------------
+    def on_primary(self):
+        if self.busy:
+            return
+        if len(self.run) >= omag.N_POSES:
+            self.finish()
+            return
+        self.start_pose()
+
+    def _check_travel(self, name, lo_off, hi_off, park):
+        """True if [park+lo_off, park+hi_off] fits in this axis's envelope."""
+        st = self.win.stages[name]
+        # limit_mm, not travel_mm: this is the check that decides whether a
+        # 40-minute unattended run is about to drive the head somewhere, so it
+        # has to be against what the axis is allowed to use, not against the
+        # length of the leadscrew.
+        lo, hi = st.limit_mm
+        if hi <= lo:
+            return True
+        if park + lo_off < lo or park + hi_off > hi:
+            envelope = ("travel" if st.limit_mm == st.travel_mm
+                        else "allowed range")
+            QtWidgets.QMessageBox.warning(
+                self, "Guided magnet calibration",
+                f"The run needs {name} between {park + lo_off:.1f} and "
+                f"{park + hi_off:.1f} mm, which is outside its "
+                f"{lo:g}..{hi:g} mm {envelope}. Re-park the head, or shorten "
+                f"that pass.")
+            return False
+        return True
+
+    def start_pose(self):
+        win = self.win
+        if win.stages is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Guided magnet calibration",
+                "The stages are not connected. This routine drives the head "
+                "past the magnet; without motion there is nothing to guide.")
+            return
+        axis = self.cmb_axis.currentText()
+        across, normal = self._across_name(), self._normal_name()
+        if normal and not across:
+            # Not a fussy pairing rule -- the dither's model is "move straight
+            # toward the magnet", and the transverse cut is the only thing that
+            # makes that true. Off to one side by a, with the magnet h away
+            # along the dither axis, the fit returns h*r^2/(h^2 - a^2) instead
+            # of the distance: on this rig's geometry, 51 mm for a chip that is
+            # really 26 mm away. Correcting with that number is worse than not
+            # correcting.
+            QtWidgets.QMessageBox.warning(
+                self, "Guided magnet calibration",
+                "The standoff dither needs the transverse cut.\n\n"
+                "The dither measures distance by assuming it is moving "
+                "straight toward the magnet, and the cut is what puts each "
+                "chip under the magnet so that it is. Without it the fit "
+                "returns a number that is not the distance — on this "
+                "geometry it reads 51 mm for a chip 26 mm away — and "
+                "correcting with that is worse than not correcting at all.\n\n"
+                "Either pick a transverse axis as well, or set the standoff "
+                "axis to none and run the plain axial sweep.")
+            return
+        if win._estop_reason is not None:
+            QtWidgets.QMessageBox.warning(
+                self, "Guided magnet calibration",
+                f"The emergency stop is latched: {win._estop_reason}.\n\n"
+                f"Reset it before driving the head.")
+            return
+        for name in (axis, across, normal):
+            if name and not win.stages[name].position_trusted:
+                QtWidgets.QMessageBox.warning(
+                    self, "Guided magnet calibration",
+                    f"Axis {name}: {win.stages[name].distrust_reason}.\n\n"
+                    f"Where it says it is and where it is are unrelated. The "
+                    f"peaks would still line up with each other, but nothing "
+                    f"else could be compared with them afterwards. Home it "
+                    f"first.")
+                return
+
+        # The park is taken once, on the first pose, and reused: the whole
+        # routine rests on all four poses being measured against the same
+        # fixed magnet, so re-reading the stage each time would let a nudged
+        # axis redefine the origin halfway through without saying so.
+        if self._start_mm is None:
+            self._start_mm = win.stages[axis].position_mm
+            self._park = {n: win.stages[n].position_mm
+                          for n in (across, normal) if n}
+        if not self._check_travel(axis, 0.0, self.spin_span.value(),
+                                  self._start_mm):
+            self._start_mm = None
+            return
+        if across and not self._check_travel(
+                across, -self.spin_across_half.value(),
+                self.spin_across_half.value(), self._park[across]):
+            return
+        if normal and not self._check_travel(
+                normal, -self.spin_dither_half.value(),
+                self.spin_dither_half.value(), self._park[normal]):
+            return
+
+        self._pending = None
+        self._rings = None
+        self._run_pass("locate")
+
+    def _grid_for(self, kind):
+        """The ScanGrid for one pass.
+
+        Every pass names the same axes in the same order, even the ones it does
+        not move. That is what lets the passes be concatenated afterwards: a
+        FieldMap only records the columns its grid named, so a locate that
+        named one axis and a cut that named three would come back as two point
+        clouds in different spaces with no way to say where the first one was
+        on the axes it left out.
+        """
+        axis = self.cmb_axis.currentText()
+        across, normal = self._across_name(), self._normal_name()
+        if kind == "locate":
+            along = self._positions()
+        else:
+            along = np.asarray(self._rings, float)
+
+        axes = {axis: along}
+        if across:
+            axes[across] = (self._park[across] + self._across_offsets()
+                            if kind == "cut" else [self._cut_centre()])
+        if normal:
+            axes[normal] = (self._park[normal] + self._dither_offsets()
+                            if kind == "dither" else [self._park[normal]])
+        return oscan.ScanGrid(axes)
+
+    def _cut_centre(self):
+        """Where to park the transverse axis for the dither.
+
+        The mean of the four rings' transverse peaks, not each ring's own. A
+        ring whose arm sits a millimetre off the others is a millimetre off the
+        top of a peak that is flat to second order there, which costs 0.4 % of
+        field at a 20 mm standoff -- far below what the dither can resolve, and
+        worth trading for a dither that is one grid instead of four.
+        """
+        park = self._park.get(self._across_name())
+        if self._pending is None or not self._pending.is_plane:
+            return park
+        across = self._pending.peak_across_mm
+        loud = np.argsort(self._pending.peaks)[-pgeom.SENSORS_PER_FACE:]
+        vals = across[loud]
+        vals = vals[np.isfinite(vals)]
+        return float(np.mean(vals)) if len(vals) else park
+
+    def _run_pass(self, kind):
+        win = self.win
+        self._pass = kind
+        grid = self._grid_for(kind)
+
+        # First pass of the first pose only: the carriers are still on the live
+        # stream, and the worker is what puts them back on their own clock.
+        # Everything after finds them already released, so passing the saved
+        # clkdiv again would restore a rate that is no longer the one in force.
+        first = not self._released
+        if first:
+            self._released = True
+            if win.act_record.isChecked():
+                win.act_record.setChecked(False)
+            if isinstance(win.source, LiveSource):
+                win.source.stop()
+            win.source = None
+            win.lbl_state.setText("guided magnet calibration in progress...")
+        restore = win.prev_clkdiv if first else {}
+        if first:
+            win.prev_clkdiv = {}
+
+        self.bar.setRange(0, len(grid))
+        self.bar.setValue(0)
+        self.bar.setFormat("%v / %m")
+        self._t0 = time.time()
+        self._worker = ScanWorker(win.hosts, win.stages, grid,
+                                  self.spin_secs.value(), win.cal,
+                                  self.spin_settle.value(), restore)
+        self._worker.message.connect(win.log.log)
+        self._worker.progress.connect(self.on_progress)
+        self._worker.done.connect(self.on_pass_done)
+        # Without this the main window's stop button does not know this thread
+        # exists, and stopping the axes mid-pass would leave it to carry on to
+        # the next one -- see MainWindow.register_motion_worker.
+        win.register_motion_worker(self._worker)
+        win.log.log(f"guided magnet calibration: pose {len(self.run) + 1} of "
+                    f"{omag.N_POSES}, {PASS_NAMES[kind]}, {len(grid)} points "
+                    f"-- {grid.describe()}")
+        self._worker.start()
+        self._refresh()
+
+    def on_progress(self, i, n, where, sem_ut):
+        self.bar.setValue(i)
+        elapsed = time.time() - self._t0
+        self.bar.setFormat(f"%v / %m — {elapsed / max(i, 1) * (n - i):.0f} s left")
+
+    def _sweep_from(self, fm, pose):
+        return omag.PoseSweep.from_fieldmap(
+            pose, fm, axis=self.cmb_axis.currentText(),
+            across=self._across_name(), normal=self._normal_name(),
+            note=f"pose {pose + 1}")
+
+    def _dithers_from(self, fm):
+        """Split the dither pass into one Dither per ring.
+
+        Grouped by which ring each row is nearest rather than by counting rows
+        off in blocks: run_scan drops a point that failed and carries on, so
+        the blocks are not guaranteed to be the length the grid implies, and
+        counting would silently slice one ring's dither across two.
+        """
+        axis, normal = self.cmb_axis.currentText(), self._normal_name()
+        pos = np.asarray(fm.pos_mm, float)
+        names = list(fm.axes)
+        if normal is None or normal not in names or not len(pos):
+            return []
+        ai, ni = names.index(axis), names.index(normal)
+        rings = np.asarray(self._rings, float)
+        which = np.argmin(np.abs(pos[:, ai][:, None] - rings[None, :]), axis=1)
+        out = []
+        for k in range(len(rings)):
+            sel = which == k
+            if int(sel.sum()) < 3:
+                continue
+            z = pos[sel, ni]
+            out.append(omag.Dither(z - z.mean(), fm.b_mt[sel],
+                                   at_mm=float(np.mean(pos[sel, ai]))))
+        return out
+
+    def on_pass_done(self, fm, error):
+        worker, self._worker = self._worker, None
+        self.win.retire_motion_worker(worker)
+        self.bar.setFormat("no sweep running")
+        kind, self._pass = self._pass, None
+        self.win._sync_stage_controls()
+        if self.win._estop_reason is not None:
+            # An aborted pass comes back with no error and a partial FieldMap
+            # -- that is deliberate, it is how a scan keeps the points it did
+            # take. But this routine chains: locate starts cut, cut starts
+            # dither. Without this the stop would end one pass and immediately
+            # start the next, which is not what anyone pressing it meant, and
+            # the pose would be built out of half a sweep.
+            self.win.log.log("guided magnet calibration: stopped by the "
+                             "emergency stop — this pose is abandoned")
+            self._pending = None
+            self._rings = None
+            self._refresh()
+            return
+        if error:
+            self.win.log.log(f"guided magnet calibration: {error}")
+            QtWidgets.QMessageBox.warning(self, "Guided magnet calibration",
+                                          error)
+            self._refresh()
+            return
+        if fm is None or not len(fm):
+            self._refresh()
+            return
+        pose = len(self.run)
+
+        if kind == "locate":
+            self._pending = self._sweep_from(fm, pose)
+            self._rings = omag.ring_positions(self._pending)
+            self.win.log.log(
+                "guided magnet calibration: rings at "
+                + ", ".join(f"{v:.1f}" for v in self._rings) + " mm")
+            if self._across_name():
+                self._run_pass("cut")
+                return
+        elif kind == "cut":
+            self._pending.merge(self._sweep_from(fm, pose))
+        elif kind == "dither":
+            self._pending.dithers.extend(self._dithers_from(fm))
+            self._finish_pose()
+            return
+
+        if self._normal_name():
+            self._run_pass("dither")
+            return
+        self._finish_pose()
+
+    def _finish_pose(self):
+        self.run.across = self._across_name()
+        self.run.normal = self._normal_name()
+        self.run.add(self._pending)
+        sw, self._pending = self._pending, None
+        peaks = sw.peaks
+        loud = int(np.argmax(peaks)) + 1
+        extra = ""
+        if sw.dithers:
+            d = sw.standoff_mm[np.argsort(peaks)[-pgeom.SENSORS_PER_FACE:]]
+            d = d[np.isfinite(d)]
+            extra = (f", standoff {np.mean(d):.1f} mm" if len(d)
+                     else ", standoff not fittable -- try a longer average")
+        self.win.log.log(
+            f"guided magnet calibration: pose {len(self.run)} done, loudest "
+            f"S{loud} at {peaks.max():.3f} mT{extra}")
+        self.report.setPlainText(self.run.report(self.win.geom))
+        self._refresh()
+
+    # ---- finishing -------------------------------------------------------
+    def finish(self):
+        win = self.win
+        base = os.path.join(win.out_dir,
+                            time.strftime("magcal_%Y%m%d_%H%M%S"))
+        path = self.run.save(base)
+        win.log.log(f"guided magnet calibration: saved {path}")
+        # Said before the trim is touched, because it decides what the trim
+        # is worth: opposite faces that disagree mean part of it is geometry.
+        balance = self.run.face_balance(win.geom)
+        for note in balance["notes"]:
+            win.log.log(f"guided magnet calibration: {note}")
+
+        if self.chk_apply.isChecked():
+            resp, _best = self.run.response()
+            _corr, skipped = win.cal.cross_calibrate(resp)
+            note = (f"kept their previous trim: {', '.join(skipped)}"
+                    if skipped else "every live sensor trimmed")
+            passes = ["axial"]
+            if any(s.is_plane for s in self.run.sweeps):
+                passes.append("plane")
+            if any(s.dithers for s in self.run.sweeps):
+                passes.append("standoff dither")
+            win.cal.notes = (f"gain trim from the guided magnet run of "
+                             f"{time.strftime('%Y-%m-%d %H:%M')} "
+                             f"({os.path.basename(path)}); passes: "
+                             f"{', '.join(passes)}; no geometry weighting -- "
+                             f"every sensor was measured at its own peak")
+            cal_path = win.cal.save(win.args.calibration)
+            win.log.log(f"gain trim applied from the guided run "
+                        f"(no geometry weighting needed); {note} -> "
+                        f"{cal_path}")
+            win._calibration_changed("the gain trim")
+            win.refresh_cal_report()
+            if balance["notes"]:
+                QtWidgets.QMessageBox.warning(
+                    self, "Gain trim applied, with a caveat",
+                    "The trim is applied and saved, but this run's opposite "
+                    "faces disagree:\n\n  - "
+                    + "\n  - ".join(balance["notes"])
+                    + "\n\nThe within-face numbers are unaffected — those "
+                      "four sensors never moved relative to each other. It is "
+                      "the face-to-face part of the trim that is carrying "
+                      "geometry as well as gain.")
+        else:
+            win.log.log(f"gain trim NOT applied. The run is on disk at {path} "
+                        f"and nothing about it is lost -- it can be applied "
+                        f"later without repeating the measurement.")
+        notes = self.run.check_geometry(win.geom)
+        if notes:
+            self.offer_geometry_update(notes)
+        win.log.log("guided magnet calibration: the carriers are still off "
+                    "the live stream — press Connect to go back to live.")
+        self._finished = True
+        self.btn_primary.setEnabled(False)
+        self.lbl_step.setText("Finished")
+
+    def offer_geometry_update(self, notes):
+        """Report what the run disagrees with, and offer to write it down.
+
+        The offer is deliberately explicit about what changes and what does
+        not. Slots are a measurement: which sensor passed the magnet first is
+        not a matter of opinion. Face NUMBERS are not -- turning the tube in
+        its cradle renames all four -- so the grouping is checked and the
+        labels are left alone.
+        """
+        win = self.win
+        try:
+            slots = self.run.measured_slots()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.information(
+                self, "Geometry",
+                "The run disagrees with probe_geometry.json:\n\n  - "
+                + "\n  - ".join(notes)
+                + f"\n\nIt cannot say what the right answer is, though: "
+                  f"{exc}\n\nNothing has been changed.")
+            return
+        diff = [(sid, win.geom.slot(sid), slot)
+                for sid, slot in sorted(slots.items())
+                if win.geom.slot(sid) != slot]
+        if not diff:
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        box.setWindowTitle("Geometry")
+        box.setText("The run disagrees with probe_geometry.json.")
+        box.setInformativeText(
+            "  - " + "\n  - ".join(notes)
+            + "\n\nThe magnet says these sensors sit elsewhere along the "
+              "tube:\n\n"
+            + "\n".join(f"    S{sid}:  slot {was}  →  slot {now}"
+                         for sid, was, now in diff)
+            + "\n\nOnly the slots change. Which face index a group of four "
+              "carries is a naming choice the magnet cannot make — turning "
+              "the tube renames them all — so the face labels are left as "
+              "they are.")
+        write = box.addButton("Write it to probe_geometry.json",
+                              QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Leave the file alone",
+                      QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not write:
+            win.log.log("guided magnet calibration: geometry left as it was")
+            return
+        changed = self.run.apply_to_geometry(win.geom)
+        path = win.geom.save(win.args.geometry)
+        win.log.log("geometry updated from the magnet run: "
+                    + ", ".join(f"S{sid} slot {was}->{now}"
+                                for sid, was, now in changed)
+                    + f" -> {path}")
+        # Re-read it rather than refreshing by hand: Reload geometry already
+        # knows every place a position reaches -- the 3D view, the plot, the
+        # sensor table, the demo source -- and a second copy of that list here
+        # would be one item short the first time somebody adds a fifth.
+        win.on_reload_geometry()
+
+    def closeEvent(self, event):
+        """Stop cleanly, and let QDialog finish the job.
+
+        The super() call is not decoration. QDialog.closeEvent() is what calls
+        reject() and therefore emits finished(), which is the signal the main
+        window uses to forget this dialog. Accepting the event and returning
+        looks identical on screen and leaves the window holding a reference to
+        a hidden dialog for ever -- after which the menu item that opens this
+        quietly does nothing, because it raises the dead one instead.
+        """
+        if self.busy:
+            reply = QtWidgets.QMessageBox.question(
+                self, "Guided magnet calibration",
+                "A sweep is running. Stop it and close?",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Cancel)
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._worker.abort()
+            self._worker.wait(30000)
+        if self.run.sweeps and not self._finished:
+            # Poses recorded but never applied: closing here throws away the
+            # only copy, since the run is written to disk by finish().
+            reply = QtWidgets.QMessageBox.question(
+                self, "Guided magnet calibration",
+                f"{len(self.run)} pose(s) recorded and not saved.\n\n"
+                f"They are only in this window — closing discards them, and "
+                f"the sweeps would have to be driven again. Close anyway?",
+                QtWidgets.QMessageBox.StandardButton.Discard
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Cancel)
+            if reply != QtWidgets.QMessageBox.StandardButton.Discard:
+                event.ignore()
+                return
+            self.win.log.log(f"guided magnet calibration: {len(self.run)} "
+                             f"unsaved pose(s) discarded")
+        super().closeEvent(event)
+
+
+SETUP_TEXT = """
+**One magnet, clamped once, and the head driven past it four times.**
+
+Before pose 1:
+
+1. **Clamp the magnet** beside the head's travel, level with one face and a few
+   centimetres clear of it. It must not move again until all four poses are
+   done — it is the common reference for every sensor.
+2. **Park the head** so the magnet is just clear of the first ring of sensors,
+   and roughly centred on them on the other two axes. The run starts from
+   wherever the head is now.
+3. Note the rough **standoff** — how far the magnet is from the chips — into the
+   box below. Nothing is measured with it, but it sizes the other two passes.
+4. Nothing ferrous may move nearby during a sweep, including you.
+
+Each pose is three passes, and they do different jobs:
+
+* **A, locate** — a coarse run along the tube. Finds where the four rings are.
+* **B, cut** — a fine sweep *across* the face at each ring. Every sensor gets
+  measured at the top of its own peak instead of at a slice through it, which
+  is what stops a millimetre of arm placement becoming 15 % of fake gain.
+* **C, dither** — a few points *toward and away from* the magnet at each ring.
+  |B| has no maximum in that direction, so there is no peak to find; what it
+  measures is the distance itself, which is the last error the plane can't
+  reach.
+
+You do not have to park perfectly. Finding each peak is what pass B is for —
+that is most of the point of it.
+"""
+
+TURN_TEXT = """
+**Index the tube one quarter turn** in its cradle, to pose {n}.
+
+* About the tube's **own axis and nothing else**. A pose that also shifts the
+  head sideways breaks the equal-approach argument quietly — the numbers still
+  look plausible afterwards.
+* The exact angle does not matter. Four faces getting their turn does.
+* Do not touch the magnet, the cradle position, or the cable dress.
+
+Then start pose {n}.
+"""
+
+DONE_TEXT = """
+All four faces have had their turn at the magnet. The table below is the
+result: each sensor's peak, taken from the pose where its own face was toward
+the magnet, at the top of its own transverse peak, and scaled to a common
+standoff — so the spread is gain and nothing else.
+
+Read the **standoff** column before the trim. If it is mostly `--`, pass C
+could not fit and the distances are assumed rather than measured; raise the
+averaging time and run again. If the spread of standoffs is large, that is the
+arms, and it is exactly what would otherwise have shown up as gain.
+
+**Apply and save** writes the run to the captures folder, folds the trim into
+the calibration if the box is ticked, and reports anything the run disagrees
+with in `probe_geometry.json` — it never rewrites the geometry itself.
+"""
+
+
 class LivePlot(QtWidgets.QWidget):
     """Rolling traces. |B| per sensor by default, since that is comparable."""
 
@@ -680,7 +1599,7 @@ class LivePlot(QtWidgets.QWidget):
             self._thin(c)
             self.mag_curves.append(c)
             row = []
-            for a, style in enumerate((QtCore.Qt.PenStyle.SolidLine,
+            for _a, style in enumerate((QtCore.Qt.PenStyle.SolidLine,
                                        QtCore.Qt.PenStyle.DashLine,
                                        QtCore.Qt.PenStyle.DotLine)):
                 cc = self.plot.plot(pen=pg.mkPen(
@@ -726,6 +1645,25 @@ class LivePlot(QtWidgets.QWidget):
         mag = self.mode == self.MODES[0]
         self.plot.setLabel("left", "|B|" if mag else "B",
                            units=self.unit_name)
+
+    def reset_view(self):
+        """Undo any panning or zooming and go back to following the data.
+
+        pyqtgraph switches auto-ranging OFF the instant you drag or scroll a
+        plot, and nothing on screen says so: the traces simply stop filling the
+        axes, which reads as the signal having changed rather than the view
+        having been moved. A scroll over the axis can also leave the mouse
+        enabled on one axis only, which is even harder to spot.
+
+        Order matters. ViewBox.autoRange() fits once and disables auto-ranging
+        as it goes -- it calls setRange(), which defaults to
+        disableAutoRange=True -- so enabling has to come last or the button
+        would leave the plot frozen at exactly the moment it was pressed.
+        """
+        vb = self.plot.getViewBox()
+        vb.setMouseEnabled(x=True, y=True)
+        vb.enableAutoRange(x=True, y=True)
+        vb.updateAutoRange()
 
     def set_visible_sensors(self, sensors):
         self.visible = set(sensors)
@@ -872,10 +1810,15 @@ class SensorTable(QtWidgets.QTableWidget):
     """Per-sensor state, and where the per-sensor measurement range is set."""
 
     COLS = ("sensor", "face", "state", "|B| mT", "Bx", "By", "Bz",
-            "noise uT", "VCM V", "T degC", "range", "gain trim")
-    STATE_COLORS = {"ok": (40, 120, 60), "noisy": (150, 110, 20),
-                    "fault": (150, 70, 20), "dead": (140, 30, 30),
-                    "unknown": (70, 70, 80)}
+            "noise uT", "VCM V", "T degC*", "range", "gain trim")
+    # The star on T degC: octobee.temp_c is uncalibrated and each chip's TA
+    # output carries its own offset, so the spread between sensors is not a
+    # gradient. Read per chip, over time.
+    COL_TIPS: ClassVar[dict] = {"T degC*": ob.TEMP_UNCALIBRATED_NOTE}
+    STATE_COLORS: ClassVar[dict] = {
+        "ok": (40, 120, 60), "noisy": (150, 110, 20),
+        "fault": (150, 70, 20), "dead": (140, 30, 30),
+        "unknown": (70, 70, 80)}
 
     range_changed = QtCore.pyqtSignal(int, float)
 
@@ -883,6 +1826,8 @@ class SensorTable(QtWidgets.QTableWidget):
         super().__init__(N_SENSORS, len(self.COLS))
         self.geom = geom
         self.setHorizontalHeaderLabels(self.COLS)
+        for name, tip in self.COL_TIPS.items():
+            self.horizontalHeaderItem(self.COLS.index(name)).setToolTip(tip)
         self.verticalHeader().setVisible(False)
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setSelectionBehavior(
@@ -937,7 +1882,7 @@ class SensorTable(QtWidgets.QTableWidget):
                     ("Bz", f"{row['Bz_mT']:.3f}"),
                     ("noise uT", f"{row['noise_uT_rms']:.0f}"),
                     ("VCM V", f"{row['vcm_v']:.4f}"),
-                    ("T degC", "--" if row["temp_c"] is None
+                    ("T degC*", "--" if row["temp_c"] is None
                      else f"{row['temp_c']:.1f}"),
                     ("gain trim", f"{row['gain_trim']:.3f}")]
             for name, txt in vals:
@@ -965,9 +1910,18 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.args = args
         self.hosts = list(args.uut) if args.uut else list(ob.DEFAULT_UUTS)
-        self.geom = pgeom.Geometry.load_or_default(args.geometry)
-        self.cal = ocal.Calibration.load_or_default(args.calibration)
-        self.cal_from_file = os.path.exists(args.calibration)
+        self.out_dir = getattr(args, "out_dir", None) or "captures"
+        # Collected rather than logged: the log pane does not exist yet, and a
+        # config that failed to parse is the first thing the user must be told.
+        self._config_errors = []
+        self.geom = pgeom.Geometry.load_or_default(
+            args.geometry, on_error=self._config_errors.append)
+        self.cal = ocal.Calibration.load_or_default(
+            args.calibration, on_error=self._config_errors.append)
+        # "Present and readable", not merely "present" -- a file that exists
+        # and failed to parse must not be reported as loaded.
+        self.cal_from_file = (os.path.exists(args.calibration)
+                              and not self._config_errors)
         self.source = None
         self.prev_clkdiv = {}
         self.out_rate = 500.0
@@ -980,7 +1934,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.collecting = None          # 'tare' | 'magnet' | 'sweep'
         self.sweeps = {}                # tag -> opc.RollSweep
         self.pose_solution = None
-        self.collect_target = 0
         self.magnet_peaks = None
         self.last_health = None
         self._last_table = None
@@ -996,8 +1949,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stage_combos = {}
         self._stage_pending = None
         self._stage_worker = None
+        self._magnet_wizard = None
+        self._connect_was_automatic = False
+        self._connecting = False
         self._scan_worker = None
         self._scan_t0 = 0.0
+        # Every thread that can command motion, and the latch that overrides
+        # all of them. Set before _build_ui: the toolbar's stop button and the
+        # Esc shortcut are live from the moment the window exists, and both
+        # read these.
+        self._motion_workers = []
+        self._retired_workers = []
+        self._estop_reason = None
+        self._estop_alarms = set()
+        self._state_before_estop = None
 
         self.setWindowTitle("OCTO-BEE Hall probe")
         self.resize(1720, 980)
@@ -1032,13 +1997,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stage_timer.timeout.connect(self.refresh_stage_table)
         self.stage_timer.start(200)
 
+        for msg in self._config_errors:
+            self.log.log(f"WARNING: {msg}")
+
         if args.demo:
             self._set_source(DemoSource(self.geom), "demo")
         elif args.replay:
             self._set_source(ReplaySource(args.replay), f"replay {args.replay}")
-        else:
+        elif getattr(args, "no_connect", False):
             self.log.log("ready -- press Connect to take over the stream from "
                          "Phoebus and start reading both carriers")
+        else:
+            # Deferred rather than called here: connecting wants a running
+            # event loop to report progress into, and __init__ is finishing
+            # inside show(). A few hundred milliseconds also means the window
+            # is painted before the first "connecting..." line arrives, so a
+            # slow carrier looks like a slow connect rather than a slow start.
+            self.log.log("connecting automatically -- run with --no-connect "
+                         "to start disconnected")
+            QtCore.QTimer.singleShot(300, self._auto_connect)
         self._report_calibration_source()
 
     def _report_calibration_source(self):
@@ -1081,6 +2058,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addTab(self._export_tab(), "Data output")
         left.addTab(self._profile_tab(), "Profile")
         left.addTab(self.log, "Log")
+        left.addTab(self._help_tab(), "Help")
         left.setCurrentIndex(0)
         self.tabs = left
 
@@ -1128,8 +2106,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         tb.addWidget(QtWidgets.QLabel(" stream rate "))
         self.cmb_rate = QtWidgets.QComboBox()
-        for k in STREAM_RATES:
-            self.cmb_rate.addItem(k, STREAM_RATES[k])
+        for label, fs in STREAM_RATES.items():
+            self.cmb_rate.addItem(label, fs)
         self.cmb_rate.setToolTip(
             "Each carrier produces 19.2 MB/s at 200 kSPS but its stream path "
             "delivers only ~10-15 MB/s (the Ethernet is 1 Gbps and not the "
@@ -1205,16 +2183,86 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_snapshot.triggered.connect(self.on_snapshot)
         tb.addAction(self.act_snapshot)
 
+        self._build_estop(tb)
+
+    def _build_estop(self, tb):
+        """The stop button, top right, always there and always live.
+
+        Everything about this is deliberate.
+
+        WHERE. Top right of the toolbar, pushed there by an expanding spacer
+        so it stays in the corner at any window width. It is outside the tab
+        stack because the tab stack is exactly the problem: the STOP that used
+        to be the only one lived on the Stages tab, which meant that while the
+        head was traversing and you were watching the live plot -- the normal
+        way to run a scan -- the stop button was on a page you could not see.
+        A stop you have to navigate to is not a stop.
+
+        ALWAYS ENABLED. It is not greyed out when the stages are disconnected,
+        because "the stages are disconnected" is this process's belief, and if
+        that belief were reliable there would be nothing to stop. It also
+        aborts the scan and the wizard, which can be running when `stages` is
+        in any state at all.
+
+        KEY. Escape, application-wide, so it works while the guided-magnet
+        window has focus. Esc is what a person hits, and it costs nothing to
+        honour it. Note the limit: a MODAL dialog eats its own Esc, so while
+        one of the confirmation boxes is up the key goes to the box. Those all
+        appear before motion starts rather than during it, and the button is
+        still there behind them.
+
+        RESET IS SEPARATE. The stop button never becomes the start button.
+        Pressing stop twice must not be a way to release the machine, and a
+        person reaching for a stop button in a hurry may well hit it twice.
+        """
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                             QtWidgets.QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+
+        self.btn_estop = QtWidgets.QPushButton("■  EMERGENCY STOP")
+        self.btn_estop.setStyleSheet(
+            "QPushButton { background:#c1121f; color:#fff; font-weight:bold; "
+            "font-size:13px; padding:6px 18px; border:2px solid #7a0b12; "
+            "border-radius:4px; }"
+            "QPushButton:hover { background:#e01e2a; }"
+            "QPushButton:pressed { background:#7a0b12; }")
+        self.btn_estop.setToolTip(
+            "Stop every axis immediately and refuse all further motion until "
+            "it is reset (Esc).\n\n"
+            "Immediate, not profiled: the deceleration ramp is abandoned, so "
+            "steps can be lost and every axis needs re-homing before it will "
+            "accept an absolute move again. That is the trade — 1.8 mm of "
+            "coasting is what a profiled stop costs at the default profile.\n\n"
+            "This is a software stop over USB. It needs this program, the USB "
+            "link and the controllers all working. It is not a substitute for "
+            "a hardware emergency stop in series with the motor supply.")
+        self.btn_estop.clicked.connect(self.on_estop)
+        tb.addWidget(self.btn_estop)
+
+        self.btn_estop_reset = QtWidgets.QPushButton("Reset")
+        self.btn_estop_reset.setToolTip(
+            "Clear the latch and allow motion again. Deliberately a separate "
+            "button: releasing a machine is an act, not the absence of one.")
+        self.btn_estop_reset.setVisible(False)
+        self.btn_estop_reset.clicked.connect(self.on_estop_reset)
+        tb.addWidget(self.btn_estop_reset)
+
+        self.sc_estop = QtGui.QShortcut(
+            QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), self)
+        self.sc_estop.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        self.sc_estop.activated.connect(self.on_estop)
+
     def _view3d_controls(self):
         w = QtWidgets.QWidget()
-        l = QtWidgets.QHBoxLayout(w)
-        l.setContentsMargins(0, 0, 0, 0)
+        row = QtWidgets.QHBoxLayout(w)
+        row.setContentsMargins(0, 0, 0, 0)
         self.chk_auto = QtWidgets.QCheckBox("auto scale")
         self.chk_auto.setChecked(True)
         self.chk_auto.toggled.connect(
             lambda v: setattr(self.view3d, "auto_scale", v))
-        l.addWidget(self.chk_auto)
-        l.addWidget(QtWidgets.QLabel("full scale"))
+        row.addWidget(self.chk_auto)
+        row.addWidget(QtWidgets.QLabel("full scale"))
         self.spin_fs = QtWidgets.QDoubleSpinBox()
         self.spin_fs.setRange(0.001, 4000.0)
         self.spin_fs.setDecimals(3)
@@ -1222,7 +2270,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_fs.setSuffix(" mT")
         self.spin_fs.valueChanged.connect(
             lambda v: setattr(self.view3d, "full_scale_mt", v))
-        l.addWidget(self.spin_fs)
+        row.addWidget(self.spin_fs)
         self.chk_3d = QtWidgets.QCheckBox("3D")
         self.chk_3d.setChecked(True)
         self.chk_3d.setToolTip(
@@ -1230,19 +2278,19 @@ class MainWindow(QtWidgets.QMainWindow):
             "window -- untick it if the display cannot keep up. Nothing else "
             "changes: acquisition, calibration and recording are unaffected.")
         self.chk_3d.toggled.connect(self.on_3d_toggle)
-        l.addWidget(self.chk_3d)
+        row.addWidget(self.chk_3d)
         chk_arrows = QtWidgets.QCheckBox("arrows")
         chk_arrows.setChecked(True)
         chk_arrows.toggled.connect(self.view3d.set_arrows_visible)
-        l.addWidget(chk_arrows)
+        row.addWidget(chk_arrows)
         chk_lbl = QtWidgets.QCheckBox("labels")
         chk_lbl.setChecked(True)
         chk_lbl.toggled.connect(self.view3d.set_labels_visible)
-        l.addWidget(chk_lbl)
+        row.addWidget(chk_lbl)
         btn = QtWidgets.QPushButton("reset view")
         btn.clicked.connect(self.view3d.reset_camera)
-        l.addWidget(btn)
-        l.addStretch(1)
+        row.addWidget(btn)
+        row.addStretch(1)
         return w
 
     def _live_tab(self):
@@ -1280,6 +2328,14 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(btn_all)
         top.addWidget(btn_none)
         top.addStretch(1)
+        btn_reset = QtWidgets.QPushButton("reset view")
+        btn_reset.setToolTip(
+            "Put the axes back on auto after a drag or a scroll. Zooming a "
+            "pyqtgraph plot silently stops it auto-ranging, so the traces "
+            "stop filling the axes and it looks like the signal changed "
+            "rather than the view.")
+        btn_reset.clicked.connect(self.plot.reset_view)
+        top.addWidget(btn_reset)
         lay.addLayout(top)
         lay.addWidget(self.plot)
         return w
@@ -1306,7 +2362,59 @@ class MainWindow(QtWidgets.QMainWindow):
         f1.addStretch(1)
         lay.addWidget(g1)
 
-        g2 = QtWidgets.QGroupBox("2. Magnet pass — measure and equalise response")
+        g_guided = QtWidgets.QGroupBox(
+            "2. Guided magnet calibration — measure and equalise response")
+        fg = QtWidgets.QVBoxLayout(g_guided)
+        blurb = QtWidgets.QLabel(
+            "Clamp one magnet, then drive the HEAD past it under motor "
+            "control, a quarter turn at a time. Each pose sweeps the plane the "
+            "sensors lie in and dithers the standoff, so every sensor is "
+            "measured at the top of its own peak and at a measured distance — "
+            "no 1/r³ model, and a millimetre of arm placement no longer looks "
+            "like 15 % of gain. The run also reports which sensor is really on "
+            "which face.")
+        blurb.setWordWrap(True)
+        fg.addWidget(blurb)
+        self.btn_guided = QtWidgets.QPushButton(
+            "Guided magnet calibration (motorised, 4 poses)…")
+        self.btn_guided.clicked.connect(self.on_guided_magnet)
+        row_g = QtWidgets.QHBoxLayout()
+        row_g.addWidget(self.btn_guided)
+        b_cleargain2 = QtWidgets.QPushButton("Clear gain trim")
+        b_cleargain2.clicked.connect(self.on_clear_gain)
+        row_g.addWidget(b_cleargain2)
+        row_g.addStretch(1)
+        fg.addLayout(row_g)
+        lay.addWidget(g_guided)
+
+        # ---- superseded routines, built but not shown -----------------------
+        # Both of these are replaced by the guided run above and are hidden by
+        # default. They are still CONSTRUCTED, and that is deliberate: the
+        # calibration report, the export and the collector all reach into these
+        # widgets, so deleting them would mean chasing those references for two
+        # routines that are still occasionally worth a look. Hidden, not
+        # removed -- and the checkbox says why rather than just offering a
+        # toggle.
+        self.chk_superseded = QtWidgets.QCheckBox(
+            "show the superseded manual routines (hand magnet pass, "
+            "Earth-field roll)")
+        self.chk_superseded.setChecked(False)
+        self.chk_superseded.setToolTip(
+            "Both were ways of getting at what the guided run above now "
+            "measures directly.\n\n"
+            "The hand magnet pass holds a magnet near the probe by hand: every "
+            "chip is then at a different distance, so it needs a 1/r^n model "
+            "of the geometry to divide that out -- and the geometry is exactly "
+            "what is not yet established.\n\n"
+            "The Earth-field roll sweep was the way round that: a uniform "
+            "field every sensor must read identically. It still does something "
+            "the magnet run does not -- it pins chip ORIENTATION in three "
+            "dimensions -- but for gain it has been superseded.\n\n"
+            "Nothing recorded with either is lost by leaving this unticked.")
+        self.chk_superseded.toggled.connect(self.on_show_superseded)
+        lay.addWidget(self.chk_superseded)
+
+        g2 = QtWidgets.QGroupBox("Superseded: hand magnet pass")
         f2 = QtWidgets.QGridLayout(g2)
         self.btn_magnet = QtWidgets.QPushButton("Start magnet pass")
         self.btn_magnet.setCheckable(True)
@@ -1348,6 +2456,14 @@ class MainWindow(QtWidgets.QMainWindow):
         pl.addWidget(self.chk_geom)
         pl.addStretch(1)
         f2.addWidget(pos_row, 2, 0, 1, 5)
+        superseded = QtWidgets.QLabel(
+            "Superseded by the guided run above, which needs no 1/r^n model "
+            "because it measures each sensor at its own peak and at a measured "
+            "distance. Kept for comparison — a hand pass is still the quickest "
+            "way to see whether all sixteen channels are alive.")
+        superseded.setWordWrap(True)
+        f2.addWidget(superseded, 4, 0, 1, 5)
+
         self.btn_apply_gain = QtWidgets.QPushButton("Apply gain trim from this pass")
         self.btn_apply_gain.setEnabled(False)
         self.btn_apply_gain.clicked.connect(self.on_apply_gain)
@@ -1359,17 +2475,20 @@ class MainWindow(QtWidgets.QMainWindow):
         bl.addWidget(self.btn_apply_gain)
         bl.addWidget(b_cleargain)
         bl.addStretch(1)
-        f2.addWidget(btn_row, 3, 0, 1, 5)
+        f2.addWidget(btn_row, 6, 0, 1, 5)
         lay.addWidget(g2)
 
 
         g3 = QtWidgets.QGroupBox(
-            "3. Earth-field roll calibration — match the sensors to each other")
+            "Superseded: Earth-field roll calibration")
         f3 = QtWidgets.QGridLayout(g3)
         blurb = QtWidgets.QLabel(
             "The Earth's field is uniform to nanotesla across the whole head, so "
-            "every sensor must read the SAME vector. That removes the 1/r³ "
-            "position error the magnet pass above cannot escape.\n"
+            "every sensor must read the SAME vector. This was the way round the "
+            "1/r³ position error of the hand magnet pass; the guided run now "
+            "measures that position error instead of dodging it. What this "
+            "still does and the magnet run does not is pin chip ORIENTATION in "
+            "three dimensions.\n"
             "Roll the tube steadily in its cradle through ≥2 turns per sweep.  "
             "A: as mounted.  B: lifted out and replaced end-for-end (separates "
             "offset from axial response).  C: cradle turned to another azimuth "
@@ -1437,7 +2556,11 @@ class MainWindow(QtWidgets.QMainWindow):
         f3.addWidget(row, 4, 0, 1, 6)
         lay.addWidget(g3)
 
-        g4 = QtWidgets.QGroupBox("4. Calibration file and geometry")
+        self._superseded_boxes = (g2, g3)
+        for box in self._superseded_boxes:
+            box.setVisible(False)
+
+        g4 = QtWidgets.QGroupBox("3. Calibration file and geometry")
         f4 = QtWidgets.QHBoxLayout(g4)
         for text, slot in (("Save calibration", self.on_save_cal),
                            ("Load calibration", self.on_load_cal),
@@ -1462,6 +2585,102 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(self.cal_report, 1)
         self.refresh_cal_report()
         return w
+
+    def _help_tab(self):
+        """Searchable documentation, indexed from the README at startup.
+
+        Read from disk once, here, rather than at each search: it is 75 kB and
+        the file does not change while the window is open. If it did -- someone
+        editing the README on the bench machine -- Reload picks it up without
+        restarting.
+        """
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+
+        top = QtWidgets.QHBoxLayout()
+        self.help_search = QtWidgets.QLineEdit()
+        self.help_search.setPlaceholderText(
+            "Search the documentation — try 'homing', 'roll sweep', "
+            "'why is it loud', 'VCM'")
+        self.help_search.setClearButtonEnabled(True)
+        self.help_search.textChanged.connect(self._help_filter)
+        btn_reload = QtWidgets.QPushButton("Reload")
+        btn_reload.setToolTip("Re-read README.md, for when it has been edited "
+                              "while this window was open.")
+        btn_reload.clicked.connect(self._help_reload)
+        top.addWidget(self.help_search, 1)
+        top.addWidget(btn_reload)
+        lay.addLayout(top)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.help_list = QtWidgets.QListWidget()
+        self.help_list.currentRowChanged.connect(self._help_show)
+        self.help_view = QtWidgets.QTextBrowser()
+        self.help_view.setOpenExternalLinks(True)
+        self.help_list.setMinimumWidth(300)
+        split.addWidget(self.help_list)
+        split.addWidget(self.help_view)
+        # A truncated heading is a heading you cannot search by eye. These are
+        # long and specific on purpose, so the list gets a real share.
+        split.setSizes([430, 900])
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        lay.addWidget(split, 1)
+
+        self.help_count = QtWidgets.QLabel("")
+        self.help_count.setStyleSheet("color:#9aa3b2;")
+        lay.addWidget(self.help_count)
+
+        self._help_reload()
+        return w
+
+    def _help_reload(self):
+        self.help_topics = ohelp.load_topics()
+        self._help_filter(self.help_search.text()
+                          if hasattr(self, "help_search") else "")
+
+    def _help_filter(self, query):
+        self.help_hits = ohelp.search(self.help_topics, query, limit=200)
+        self.help_list.clear()
+        for t in self.help_hits:
+            item = QtWidgets.QListWidgetItem(
+                ("    " if t.level > 2 else "") + t.title)
+            item.setToolTip(f"{t.title}  —  {t.source}")
+            if t.source == "this window":
+                item.setForeground(QtGui.QColor("#8fc7ff"))
+            self.help_list.addItem(item)
+        n_all = len(self.help_topics)
+        self.help_count.setText(
+            f"{len(self.help_hits)} of {n_all} topics"
+            + (f" matching '{query}'" if query.strip() else
+               " — the README, plus the topics about this window in blue"))
+        if self.help_hits:
+            self.help_list.setCurrentRow(0)
+        else:
+            self.help_view.setMarkdown(
+                f"### Nothing matches '{query}'\n\n"
+                f"Search matches whole words in a heading first, then the "
+                f"text underneath. Try fewer words, or a term the "
+                f"documentation would actually use — 'clkdiv' rather than "
+                f"'sample rate setting'.")
+
+    def _help_show(self, row):
+        if not (0 <= row < len(self.help_hits)):
+            return
+        t = self.help_hits[row]
+        self.help_view.setMarkdown(f"## {t.title}\n\n*from {t.source}*\n\n"
+                                   + t.body)
+        self.help_view.verticalScrollBar().setValue(0)
+
+    def show_help_for(self, query):
+        """Open the Help tab at a search. For 'explain this' buttons."""
+        self.help_search.setText(query)
+        tabs = self.help_search.window().findChild(QtWidgets.QTabWidget)
+        if tabs is not None:
+            for i in range(tabs.count()):
+                if tabs.tabText(i) == "Help":
+                    tabs.setCurrentIndex(i)
+                    break
 
     def _health_tab(self):
         w = QtWidgets.QWidget()
@@ -1526,7 +2745,10 @@ class MainWindow(QtWidgets.QMainWindow):
         f1.addWidget(self.stage_table, 1, 0, 1, 4)
 
         self.btn_stage_scan = QtWidgets.QPushButton("Find stages")
-        self.btn_stage_scan.clicked.connect(self.on_stage_find)
+        # Not inlinable: clicked() would pass its `checked` bool straight into
+        # `quiet`, and a button press must never be the silent variant.
+        self.btn_stage_scan.clicked.connect(
+            lambda: self.on_stage_find())               # noqa: PLW0108
         self.btn_stage_connect = QtWidgets.QPushButton("Connect")
         self.btn_stage_connect.clicked.connect(self.on_stage_connect)
         self.btn_stage_disconnect = QtWidgets.QPushButton("Disconnect")
@@ -1577,17 +2799,74 @@ class MainWindow(QtWidgets.QMainWindow):
             for c, wdg in enumerate((lbl, step, minus, plus, target, go, home)):
                 f2.addWidget(wdg, r, c)
             self.stage_rows[ax] = {"step": step, "target": target,
+                                   "present": False,
                                    "widgets": (lbl, step, minus, plus, target,
                                                go, home)}
 
+        # A jog only reaches full speed if it is long enough to ramp up to it,
+        # so the same setting is quiet at 2 mm and loud at 20. This is where
+        # that ceiling lives, next to the buttons that run into it.
+        f2.addWidget(QtWidgets.QLabel("speed"), 4, 0)
+        self.spin_stage_vel = QtWidgets.QDoubleSpinBox()
+        # The box cannot ask for more than the module will do, so the number on
+        # screen is always the number that will be used.
+        self.spin_stage_vel.setRange(0.1, ostage.MAX_VEL_MM_S)
+        self.spin_stage_vel.setDecimals(2)
+        self.spin_stage_vel.setValue(ostage.DEFAULT_VEL_MM_S)
+        self.spin_stage_vel.setSuffix(" mm/s")
+        self.spin_stage_vel.setToolTip(
+            "Top speed any move is allowed to reach. Kinesis ships these "
+            "stages at 20 mm/s, which puts anything past about a 5 mm step "
+            "into the motor's resonance -- that is the noise. Lower this, not "
+            f"the step size. Hard ceiling {ostage.MAX_VEL_MM_S:g} mm/s: every "
+            "move re-applies this profile first, so nothing that touched the "
+            "controller in between can make a move faster than this.")
+        self.spin_stage_acc = QtWidgets.QDoubleSpinBox()
+        self.spin_stage_acc.setRange(0.1, 50.0)
+        self.spin_stage_acc.setDecimals(2)
+        self.spin_stage_acc.setValue(ostage.DEFAULT_ACCEL_MM_S2)
+        self.spin_stage_acc.setSuffix(" mm/s²")
+        self.spin_stage_acc.setToolTip(
+            "How hard it ramps. Also sets what a SHORT move peaks at: a move "
+            "too brief to reach the speed cap tops out at sqrt(accel × "
+            "distance) instead.")
+        self.btn_stage_speed = QtWidgets.QPushButton("Apply")
+        self.btn_stage_speed.setToolTip(
+            "Send this profile to every connected axis and record it in "
+            "stages.json, so later sessions and the field map use it too. "
+            "Homing has its own speed and is not affected.")
+        self.btn_stage_speed.clicked.connect(self.on_stage_speed)
+        f2.addWidget(self.spin_stage_vel, 4, 1)
+        f2.addWidget(self.spin_stage_acc, 4, 2)
+        f2.addWidget(self.btn_stage_speed, 4, 3)
+        self.lbl_stage_peak = QtWidgets.QLabel("")
+        self.lbl_stage_peak.setStyleSheet("color:#9aa3b2;")
+        f2.addWidget(self.lbl_stage_peak, 4, 4, 1, 3)
+        for sp in (self.spin_stage_vel, self.spin_stage_acc):
+            sp.valueChanged.connect(self._update_peak_label)
+        self._update_peak_label()
+
         self.btn_stage_homeall = QtWidgets.QPushButton("Home all axes")
         self.btn_stage_homeall.clicked.connect(lambda: self.on_stage_home(None))
-        self.btn_stage_stop = QtWidgets.QPushButton("STOP")
+        # Not the emergency stop -- that one is the red button in the top
+        # right of the toolbar, where it is reachable from every tab. This is
+        # the graded version: profiled, so nothing loses steps, and it does
+        # not latch. Two buttons because they answer different questions, and
+        # a person who wants "that is far enough" should not have to re-home
+        # three axes to get it.
+        self.btn_stage_stop = QtWidgets.QPushButton("Stop moving")
         self.btn_stage_stop.setStyleSheet(
             "background:#7a1f1f; color:#fff; font-weight:bold;")
+        self.btn_stage_stop.setToolTip(
+            "End the move in progress and stop any running field map, without "
+            "latching the machine off. Profiled, so positions stay "
+            "trustworthy and nothing needs re-homing.\n\n"
+            "For 'something is wrong', use EMERGENCY STOP in the top right "
+            "(or Esc) — that one is immediate and refuses all further motion "
+            "until it is reset.")
         self.btn_stage_stop.clicked.connect(self.on_stage_stop)
-        f2.addWidget(self.btn_stage_homeall, 4, 0, 1, 3)
-        f2.addWidget(self.btn_stage_stop, 4, 5, 1, 2)
+        f2.addWidget(self.btn_stage_homeall, 5, 0, 1, 3)
+        f2.addWidget(self.btn_stage_stop, 5, 5, 1, 2)
         lay.addWidget(g2)
 
         g3 = QtWidgets.QGroupBox("3. Field map")
@@ -1665,39 +2944,52 @@ class MainWindow(QtWidgets.QMainWindow):
         return w
 
     def _set_stage_controls_enabled(self, on):
+        """Connected or not. Everything finer than that is _sync_stage_controls."""
         for row in self.stage_rows.values():
-            for wdg in row["widgets"]:
-                wdg.setEnabled(on)
-        self.btn_stage_homeall.setEnabled(on)
-        self.btn_stage_stop.setEnabled(on)
-        self.btn_scan_start.setEnabled(on)
+            row["present"] = on and row["present"]
         self.btn_stage_disconnect.setEnabled(on)
         self.btn_stage_connect.setEnabled(not on)
+        self._sync_stage_controls()
 
-    def on_stage_find(self):
+    def on_stage_find(self, quiet=False):
+        """Fill the stage table from the bus. Returns True if any were found.
+
+        `quiet` is for the automatic connect, which must not throw a modal in
+        front of someone who only asked to connect the probe: a rig with no
+        stages plugged in is a normal way to use this window.
+        """
         try:
             serials = ostage.list_devices()
         except ostage.StageError as exc:
             self.log.log(f"stages: {exc}")
-            QtWidgets.QMessageBox.warning(self, "Stages", str(exc))
-            return
+            if not quiet:
+                QtWidgets.QMessageBox.warning(self, "Stages", str(exc))
+            return False
         if not serials:
             msg = ("No stages on the bus. The Kinesis application is running "
                    "and holds all of them — close it and try again."
                    if ostage.kinesis_is_running() else
                    "No stages on the bus. Check power and USB.")
             self.log.log(f"stages: {msg}")
-            QtWidgets.QMessageBox.warning(self, "Stages", msg)
-            return
+            if not quiet:
+                QtWidgets.QMessageBox.warning(self, "Stages", msg)
+            return False
 
         saved = {v: k for k, v in ostage.load_axis_map().items()}
         self.stage_table.setRowCount(len(serials))
         self.stage_combos = {}
         for r, s in enumerate(serials):
-            info = ostage.device_info(s)
+            # The description is decoration. TLI_GetDeviceInfo fails while
+            # another process still has the device open, and letting that kill
+            # the whole listing would mean a stale handle somewhere else on the
+            # machine takes the Stages tab down with it.
+            try:
+                desc = ostage.device_info(s)["description"]
+            except ostage.StageError as exc:
+                desc = "—"
+                self.log.log(f"stages: {s} description unavailable ({exc})")
             self.stage_table.setItem(r, 0, QtWidgets.QTableWidgetItem(s))
-            self.stage_table.setItem(
-                r, 1, QtWidgets.QTableWidgetItem(info["description"]))
+            self.stage_table.setItem(r, 1, QtWidgets.QTableWidgetItem(desc))
             combo = QtWidgets.QComboBox()
             combo.addItems(["—", "x", "y", "z"])
             if s in saved:
@@ -1722,6 +3014,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "direction, and guessing would silently transpose the "
                 "coordinate frame of every map you take. Use the CLI's "
                 "'octobee_stage.py identify' to wiggle each one if unsure.")
+        return True
 
     def _axis_map_from_table(self):
         mapping = {}
@@ -1767,12 +3060,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # bracket runs is not something the axis dropdown can express, and
         # building the stages without it would silently ignore a reversed axis
         # and mirror every map taken from this window.
-        frames = ostage.load_axis_frames()
-        stages = ostage.StageSet(
-            {name: ostage.Stage(serial, name=name,
-                                invert=frames.get(name, {}).get("invert", False),
-                                origin_mm=frames.get(name, {}).get("origin_mm"))
-             for name, serial in mapping.items()})
+        stages = _stage_set_for(mapping)
         self.btn_stage_connect.setEnabled(False)
         self.log.log("stages: opening " + ", ".join(
             f"{k}={v}" for k, v in mapping.items()))
@@ -1810,43 +3098,138 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _stage_action(self, what, fn):
         """Run one blocking stage command in a worker, one at a time."""
-        if self._stage_worker is not None and self._stage_worker.isRunning():
+        if self._estop_reason is not None:
+            self.log.log(f"stages: {what} refused — emergency stop is latched "
+                         f"({self._estop_reason}). Reset it first.")
+            return
+        if self.motion_busy():
             self.log.log("stages: busy — wait for the current move to finish")
             return
         self._stage_worker = StageWorker(what, fn)
         self._stage_worker.progress.connect(self.log.log)
         self._stage_worker.done.connect(self.on_stage_action_done)
+        self.register_motion_worker(self._stage_worker)
         self._stage_worker.start()
+        self._sync_stage_controls()
 
     def on_stage_action_done(self, what, error):
+        self.retire_motion_worker(self._stage_worker)
         if error:
             self.log.log(f"stages: {what} failed — {error}")
             if what == "connect":
                 self._stage_pending = None
                 self.btn_stage_connect.setEnabled(True)
+            self._sync_stage_controls()
+            if self._estop_reason is not None:
+                # The move failed because the machine was stopped, which the
+                # operator already knows -- they pressed the button, and the
+                # status bar is red. A modal on top of that is noise, and with
+                # several axes in flight it is several modals.
+                return
             QtWidgets.QMessageBox.warning(self, "Stages", error)
             return
         if what == "connect":
             self.stages = self._stage_pending
             self._stage_pending = None
-            self._set_stage_controls_enabled(True)
+            if self._estop_reason is not None:
+                # Latched while disconnected, or latched and then reconnected
+                # to clear it. Neither may release the machine: the interlock
+                # belongs to the rig, not to whichever StageSet object happens
+                # to be alive.
+                self.stages.interlock.trip(self._estop_reason)
+                self.log.log("stages: connected, but motion stays latched off "
+                             f"— {self._estop_reason}")
             for ax, row in self.stage_rows.items():
                 have = ax in self.stages.names
-                for wdg in row["widgets"]:
-                    wdg.setEnabled(have)
+                row["present"] = have
                 if have:
-                    lo, hi = self.stages[ax].travel_mm
+                    # The soft limit, not the travel: a spin box that offers a
+                    # number the axis is not allowed to go to is an invitation
+                    # to find that out by pressing Go.
+                    lo, hi = self.stages[ax].limit_mm
                     row["target"].setRange(lo, hi)
+            self._set_stage_controls_enabled(True)
             for ax, row in self.scan_rows.items():
                 have = ax in self.stages.names
                 row["chk"].setEnabled(have)
                 if not have:
                     row["chk"].setChecked(False)
+                else:
+                    lo, hi = self.stages[ax].limit_mm
+                    for sp in row["spins"][:2]:     # start and stop, not step
+                        sp.setRange(lo, hi)
                 for sp in row["spins"]:
                     sp.setEnabled(have)
-            self.log.log("stages: connected")
+            vel, acc = next(iter(self.stages)).vel_params
+            self.spin_stage_vel.setValue(vel)
+            self.spin_stage_acc.setValue(acc)
+            self.log.log(f"stages: connected — {vel:.3g} mm/s, "
+                         f"{acc:.3g} mm/s² profile")
+            self._report_stage_envelope()
+            # Deferred: this opens a modal, and doing that from inside a
+            # worker's completion signal blocks the thread's own teardown.
+            QtCore.QTimer.singleShot(0, self._prompt_home_if_needed)
         else:
             self.log.log(f"stages: {what} done")
+        self._sync_stage_controls()
+
+    def _report_stage_envelope(self):
+        """Say what will actually stop the head, once, at connect.
+
+        An axis with no soft limit is not obviously different from one that
+        has them: both move, both report a position, and the difference only
+        shows up the first time a scan range is set a little too wide. Saying
+        it at connect is the cheapest place to put that.
+        """
+        bare = []
+        for name in self.stages.names:
+            st = self.stages[name]
+            lo, hi = st.limit_mm
+            if st.limit_mm == st.travel_mm:
+                bare.append(name)
+            else:
+                self.log.log(f"stages: {name} may use {lo:g}..{hi:g} mm "
+                             f"(soft limit inside {st.travel_mm[0]:g}.."
+                             f"{st.travel_mm[1]:g} mm of travel)")
+        if bare:
+            self.log.log(
+                f"stages: {', '.join(bare)} have NO soft limit — the whole "
+                f"travel is allowed, and the only thing that will stop the "
+                f"head short of the fixture is the limit switch. Set "
+                f'"limit_mm" per axis in {ostage.AXIS_CONFIG}.')
+        self.log.log("stages: home order "
+                     + " → ".join(self.stages.home_sequence()))
+
+    def _update_peak_label(self):
+        """Say what the current profile means for the step sizes in the boxes.
+
+        The setting is a ceiling, not a speed: what a jog actually reaches
+        depends on how far it goes. Showing both makes the connection between
+        "I raised the step size" and "it got loud" visible before it happens.
+        """
+        vel = self.spin_stage_vel.value()
+        acc = self.spin_stage_acc.value()
+        parts = []
+        for d in (1.0, 5.0, 20.0):
+            parts.append(f"{d:g} mm → "
+                         f"{ostage.peak_speed_mm_s(d, vel, acc):.1f}")
+        self.lbl_stage_peak.setText("peak " + ",  ".join(parts) + " mm/s")
+
+    def on_stage_speed(self):
+        """Apply the profile to every open axis, and remember it."""
+        if self.stages is None:
+            return
+        vel = self.spin_stage_vel.value()
+        acc = self.spin_stage_acc.value()
+
+        def apply(emit):
+            for st in self.stages:
+                st.set_vel_params(vel, acc)
+            ostage.save_axis_motion(velocity_mm_s=vel, accel_mm_s2=acc)
+            emit(f"stages: {vel:g} mm/s, {acc:g} mm/s² on "
+                 f"{', '.join(self.stages.names)} — saved to stages.json")
+
+        self._stage_action("set motion profile", apply)
 
     def on_stage_jog(self, axis, delta):
         if self.stages is None or axis not in self.stages.names:
@@ -1859,13 +3242,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.stages is None or axis not in self.stages.names:
             return
         st = self.stages[axis]
-        if not st.homed:
+        if not st.position_trusted:
             QtWidgets.QMessageBox.warning(
-                self, "Not homed",
-                f"Axis {axis} has not been homed, so its position counter is "
-                f"unreferenced and an absolute move would go somewhere "
-                f"arbitrary. Home it first, or use the jog buttons, which are "
-                f"relative and do not need a reference.")
+                self, "Position cannot be trusted",
+                f"Axis {axis}: {st.distrust_reason}.\n\n"
+                f"Its position counter cannot be believed, so an absolute "
+                f"move would go somewhere arbitrary. Home it first, or use "
+                f"the jog buttons, which are relative and do not need a "
+                f"reference.")
             return
         self._stage_action(f"move {axis} to {mm:g} mm",
                            lambda emit: st.move_to(mm))
@@ -1873,14 +3257,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_stage_home(self, axes):
         if self.stages is None:
             return
-        names = axes or self.stages.names
-        names = [n for n in names if n in self.stages.names]
+        wanted = set(axes or self.stages.names)
+        # Ordered even for a subset: home_sequence() is the order that is safe
+        # on this rig, and "the two axes you happened to tick" is not.
+        names = [n for n in self.stages.home_sequence() if n in wanted]
         if not names:
             return
+        one_at_a_time = ("" if len(names) == 1 else
+                        f"\n\nThey go one at a time, in this order: "
+                        f"{' → '.join(names)}.")
         reply = QtWidgets.QMessageBox.warning(
             self, "Home",
             f"Homing drives {', '.join(names)} into the limit switch at full "
-            f"homing speed, across the whole travel.\n\n"
+            f"homing speed, across the whole travel — past any soft limit, "
+            f"which does not apply to homing.{one_at_a_time}\n\n"
             f"Is the probe head — and its cabling — clear of the entire range "
             f"of movement?",
             QtWidgets.QMessageBox.StandardButton.Yes
@@ -1889,26 +3279,274 @@ class MainWindow(QtWidgets.QMainWindow):
         if reply != QtWidgets.QMessageBox.StandardButton.Yes:
             self.log.log("stages: homing cancelled")
             return
+        self._home_axes(names)
+
+    def _home_axes(self, names):
+        """Home these axes, one at a time.
+
+        The caller has already established it is safe. Sequential, where this
+        used to start all of them together: with three carriages sweeping
+        their full travel at once, whether they foul each other depends on
+        which one happens to be slower, and that is not a property anything
+        here can check. See StageSet.home_all.
+        """
         stages = [self.stages[n] for n in names]
 
         def work(emit):
             for st in stages:
+                # Between axes, not only within one: an emergency stop raises
+                # out of home() on its own, but the plain "Stop moving" does
+                # not latch, so without this it would halt one carriage and
+                # then send the next one off across its whole travel.
+                if self._stage_worker.aborted:
+                    emit(f"homing stopped before {st.name}")
+                    return
                 st.home(wait=False)
-            for st in stages:
                 st.wait(timeout_s=300.0, what="homing")
+                st.trust_after_homing()
                 emit(f"{st.name}: homed, at {st.position_mm:.4f} mm")
 
         self._stage_action(f"home {', '.join(names)}", work)
 
+    def _prompt_home_if_needed(self):
+        """Offer to reference the axes, once, when they first come up.
+
+        An unhomed stage still reports a position, and that number is whatever
+        was left in the counter -- so the one moment this is worth raising is
+        now, before anyone has read a coordinate off the screen and believed
+        it. It stays a question rather than an automatic move because homing
+        drives the carriage into the limit switch across the whole travel,
+        with the probe head and its cable dress mounted; only the person in
+        the room can say that is clear.
+        """
+        if self.stages is None:
+            return
+        unhomed = [n for n in self.stages.names
+                   if not self.stages[n].position_trusted]
+        if not unhomed:
+            self.log.log("stages: every axis is already referenced")
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Stages are not referenced")
+        box.setText(f"Axes {', '.join(unhomed)} have not been homed.")
+        box.setInformativeText(
+            "Until they are, their position readings are whatever was left in "
+            "the counter, absolute moves are refused and a field map has no "
+            "origin. Jogging is relative and works either way.\n\n"
+            "Homing drives each axis into its limit switch across the whole "
+            "travel. Is the probe head — and its cabling — clear of the "
+            "entire range of movement?")
+        yes = box.addButton("Home all axes now",
+                            QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Not yet", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is yes:
+            self._home_axes(self.stages.names)
+        else:
+            self.log.log(f"stages: {', '.join(unhomed)} left unreferenced — "
+                         f"home from the Stages tab before mapping")
+
+    # ---- stopping -------------------------------------------------------
+
+    def register_motion_worker(self, worker):
+        """Track a thread that commands motion, so a stop can reach it.
+
+        The reason this exists rather than a single `self._scan_worker`: the
+        guided-magnet wizard owns a ScanWorker of its own, and the stop button
+        used to know only about the main window's. Pressing it during a guided
+        run stopped the axis mid-move and then the wizard's thread, which had
+        never been told anything, saw motion end, took its reading at the
+        wrong place and commanded the next pose. The button appeared to do
+        nothing except corrupt a point. Anything that moves the machine
+        registers here.
+        """
+        self._motion_workers = [w for w in self._motion_workers
+                                if w is not worker and _is_running(w)]
+        self._motion_workers.append(worker)
+
+    def retire_motion_worker(self, worker):
+        """This worker has finished; stop counting it as busy.
+
+        Called from the done handlers rather than waiting for isRunning() to
+        go false, because a worker emits done() from inside run() -- so at the
+        moment the handler executes the thread can still report itself as
+        running, and the controls it should have re-enabled stay grey until
+        something else happens to refresh them.
+
+        The reference is kept, not dropped. A QThread garbage-collected while
+        its run() is still unwinding takes the process with it.
+        """
+        self._motion_workers = [w for w in self._motion_workers if w is not worker]
+        self._retired_workers.append(worker)
+        del self._retired_workers[:-8]
+
+    def motion_busy(self):
+        """True if any thread is currently allowed to command motion."""
+        self._motion_workers = [w for w in self._motion_workers if _is_running(w)]
+        return bool(self._motion_workers)
+
+    def _abort_motion_workers(self):
+        """Ask every registered worker to stop. Returns how many were running."""
+        n = 0
+        for w in list(self._motion_workers):
+            if _is_running(w):
+                n += 1
+                if hasattr(w, "abort"):
+                    w.abort()
+        return n
+
+    def on_estop(self, _checked=False):
+        """The button, the Esc key and the watchdog all come through here."""
+        self.trigger_estop("operator pressed the emergency stop")
+
+    def trigger_estop(self, reason):
+        """Stop the machine and latch it off. The single stop path.
+
+        Ordered hardware first. Aborting the workers first would spend
+        milliseconds in Python while the carriage is still moving, and the
+        whole value of an immediate stop over a profiled one is measured in
+        exactly those milliseconds. The interlock goes down with the stop, so
+        a worker that wakes up in between is refused at the point of command
+        rather than racing us.
+
+        Never raises. It is wired to a button, a key and a status watchdog,
+        and an exception on any of those paths would leave the machine in
+        whatever half-stopped state it got to.
+        """
+        # Kept on the window as well as on the StageSet: the set is created at
+        # connect, so without this a stop pressed while disconnected would be
+        # forgotten by the time something opened the stages again.
+        already = self._estop_reason is not None
+        if not already:
+            self._estop_reason = reason
+        errors = []
+        if self.stages is not None:
+            try:
+                errors = self.stages.emergency_stop(reason)
+            except Exception as exc:                    # noqa: BLE001
+                errors = [f"{type(exc).__name__}: {exc}"]
+        stopped = self._abort_motion_workers()
+        self._refresh_estop_ui()
+        if already:
+            self.log.log(f"EMERGENCY STOP (again) — already latched: "
+                         f"{self._estop_reason}")
+            return
+        self.log.log(f"*** EMERGENCY STOP — {reason} ***")
+        if self.stages is None:
+            self.log.log("  the stages are not connected here; nothing to "
+                         "stop over USB. If something is moving, cut power "
+                         "to the controllers.")
+        else:
+            self.log.log(f"  {', '.join(self.stages.names)}: immediate stop, "
+                         f"all further motion refused until reset")
+        if stopped:
+            self.log.log(f"  {stopped} running job(s) aborted")
+        for e in errors:
+            self.log.log(f"  STOP FAILED on {e} — CUT POWER TO THE "
+                         f"CONTROLLERS IF ANYTHING IS STILL MOVING")
+        if errors:
+            QtWidgets.QMessageBox.critical(
+                self, "Emergency stop did not reach every axis",
+                "The stop could not be delivered to:\n\n  "
+                + "\n  ".join(errors)
+                + "\n\nIf anything is still moving, cut power to the "
+                  "controllers now. This is what a hardware emergency stop "
+                  "is for; the software one needs the USB link to work.")
+
+    def on_estop_reset(self):
+        """Clear the latch, after saying what is still not true afterwards."""
+        if self._estop_reason is None:
+            return
+        lost = self.stages.untrusted() if self.stages is not None else []
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Reset the emergency stop")
+        box.setText(f"Latched by: {self._estop_reason}")
+        detail = ("Resetting allows motion again. It does not undo anything "
+                  "— check that whatever caused the stop is actually dealt "
+                  "with, and that the head is where you think it is.")
+        if lost:
+            detail += ("\n\nThese axes will still refuse absolute moves until "
+                       "they are homed, because an immediate stop can lose "
+                       "steps:\n\n  "
+                       + "\n  ".join(f"{n}: {why}" for n, why in lost))
+        box.setInformativeText(detail)
+        go = box.addButton("Reset and allow motion",
+                           QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Stay stopped", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not go:
+            return
+        was = self._estop_reason
+        self._estop_reason = None
+        if self.stages is not None:
+            _, lost = self.stages.reset_interlock()
+        self.log.log(f"emergency stop reset (was: {was}) — motion allowed")
+        for name, why in lost:
+            self.log.log(f"  {name}: absolute moves still refused — {why}")
+        self._refresh_estop_ui()
+
+    def _refresh_estop_ui(self):
+        """Make the latched state impossible to miss or to mistake."""
+        latched = self._estop_reason is not None
+        self.btn_estop_reset.setVisible(latched)
+        self.btn_estop.setText("■  STOPPED" if latched
+                               else "■  EMERGENCY STOP")
+        if latched:
+            if self._state_before_estop is None:
+                self._state_before_estop = self.lbl_state.text()
+            self.lbl_state.setText(f"EMERGENCY STOP — {self._estop_reason}")
+            self.lbl_state.setStyleSheet(
+                "color:#fff; background:#c1121f; font-weight:bold; padding:1px 8px;")
+        else:
+            self.lbl_state.setStyleSheet("")
+            # Put back what the status bar said before, rather than leaving
+            # "EMERGENCY STOP" sitting there unstyled -- which reads as a
+            # machine that is still stopped.
+            self.lbl_state.setText(self._state_before_estop or "disconnected")
+            self._state_before_estop = None
+        self._sync_stage_controls()
+
+    def _sync_stage_controls(self):
+        """Motion controls are live only when this window may command motion.
+
+        Two things gate them, and only one of them used to. The interlock is
+        the new one. The other is that something else is already driving: a
+        field map or a guided-magnet run owns the axes for its duration, and
+        the jog, Go and Home buttons stayed enabled behind it -- so a Home
+        during a raster would start a second thread commanding the same axis
+        through the same DLL, the scan's wait() would watch the homing move as
+        if it were its own, and the map would carry on being written with
+        every remaining point taken somewhere other than where it says.
+        """
+        live = (self.stages is not None and self._estop_reason is None
+                and not self.motion_busy())
+        for row in self.stage_rows.values():
+            for wdg in row["widgets"]:
+                wdg.setEnabled(live and row.get("present", True))
+        self.btn_stage_homeall.setEnabled(live)
+        self.btn_stage_speed.setEnabled(live)
+        self.btn_scan_start.setEnabled(live)
+        # Stopping stays available in every state that is not "no stages".
+        self.btn_stage_stop.setEnabled(self.stages is not None)
+
     def on_stage_stop(self):
-        """Stop everything now, including a running scan.
+        """End the move in progress, without latching the machine off.
+
+        The graded one: a profiled stop, so nothing loses steps and the
+        positions stay trustworthy. This is "that is far enough", where the
+        red button is "something is wrong". Both abort the running jobs --
+        a stop that leaves the raster thread free to command the next point
+        is not a stop either.
 
         Not routed through the worker queue: a stop that has to wait behind the
         move it is trying to interrupt is not a stop button.
         """
-        if self._scan_worker is not None and self._scan_worker.isRunning():
-            self._scan_worker.abort()
-            self.log.log("stages: field map will stop after this point")
+        stopped = self._abort_motion_workers()
+        if stopped:
+            self.log.log(f"stages: {stopped} running job(s) will stop after "
+                         f"the point in flight")
         if self.stages is None:
             return
         try:
@@ -1916,6 +3554,47 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log.log("stages: stopped")
         except ostage.StageError as exc:
             self.log.log(f"stages: stop failed — {exc}")
+
+    def _stage_watchdog(self, snap):
+        """One axis in trouble stops the whole machine.
+
+        Runs on the 200 ms stage poll, which is already reading every axis for
+        the table, so this costs nothing extra.
+
+        The convention it implements: on a stacked multi-axis rig the axis
+        that reports the fault is not necessarily the one about to do damage.
+        A motion error means a commanded move did not happen -- stalled,
+        driver fault, obstruction -- and any other axis still executing its
+        half of a coordinated move is now going somewhere that was only safe
+        while all three agreed. Finding a hard limit is the same argument
+        arriving one step later: the soft limits were supposed to stop it and
+        did not.
+
+        Latched through the same path as the button, so the machine ends up in
+        one state with one reason attached, however it got there.
+        """
+        name = snap["name"]
+        if snap["error"]:
+            key = (name, "error")
+            if key not in self._estop_alarms:
+                self._estop_alarms.add(key)
+                self.trigger_estop(f"{name} reported a motion error")
+        elif snap["at_hard_limit"] and not snap["moving"]:
+            key = (name, "limit")
+            if key not in self._estop_alarms:
+                self._estop_alarms.add(key)
+                # Homing ends on the limit switch by design, and so does any
+                # axis parked there afterwards -- so this is a warning, not a
+                # stop, unless it happened while something was driving.
+                if self.motion_busy():
+                    self.trigger_estop(
+                        f"{name} reached a hard limit switch during a move")
+                else:
+                    self.log.log(f"stages: {name} is sitting on a hard limit "
+                                 f"switch")
+        else:
+            self._estop_alarms.discard((name, "error"))
+            self._estop_alarms.discard((name, "limit"))
 
     def refresh_stage_table(self):
         """Position and state per stage, off the DLL's own polling cache."""
@@ -1931,6 +3610,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 snap = st.snapshot()
             except ostage.StageError:
                 continue
+            self._stage_watchdog(snap)
             # Before opening, all the bus can say is "APT Stepper Motor
             # Controller"; the actual model only arrives with the settings.
             if snap["model"] and self.stage_table.item(r, 1).text() != snap["model"]:
@@ -1939,10 +3619,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stage_table.setItem(
                 r, 3, QtWidgets.QTableWidgetItem(f"{snap['position_mm']:.4f} mm"))
             state = "moving" if snap["moving"] else "idle"
-            if not snap["homed"]:
-                state += ", NOT HOMED"
+            if not snap["trusted"]:
+                # "NOT HOMED" was the old wording and it was too narrow: the
+                # counter can be untrustworthy on an axis whose homed bit is
+                # still set, which is the case that actually hurts.
+                state += (", NOT HOMED" if not snap["homed"]
+                          else ", POSITION LOST")
             if snap["error"]:
                 state += ", MOTION ERROR"
+            if snap["at_hard_limit"]:
+                state += ", ON HARD LIMIT"
+            if snap["interlocked"]:
+                state += ", STOPPED"
             if snap["invert"]:
                 # Worth carrying in the always-visible row: the rig number and
                 # the number on the controller's own display disagree on a
@@ -1987,20 +3675,46 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_scan_start(self):
         if self.stages is None:
             return
-        if self._scan_worker is not None and self._scan_worker.isRunning():
+        if self.motion_busy():
+            return
+        if self._estop_reason is not None:
+            QtWidgets.QMessageBox.warning(
+                self, "Field map",
+                f"The emergency stop is latched: {self._estop_reason}.\n\n"
+                f"Reset it before starting a map.")
             return
         try:
             grid = self._scan_grid()
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Field map", str(exc))
             return
-        unhomed = [n for n in grid.names if not self.stages[n].homed]
+        unhomed = [(n, self.stages[n].distrust_reason) for n in grid.names
+                   if not self.stages[n].position_trusted]
         if unhomed:
             QtWidgets.QMessageBox.warning(
                 self, "Field map",
-                f"Axes {', '.join(unhomed)} have not been homed, so their "
-                f"position counters are unreferenced and the map would have no "
-                f"origin. Home them first.")
+                "These axes' position counters cannot be believed, so the map "
+                "would have no origin. Home them first.\n\n  "
+                + "\n  ".join(f"{n}: {why}" for n, why in unhomed))
+            return
+        # Checked here as well as inside every move, because a range that is
+        # out of bounds should be a refusal before a six-hour job starts, not
+        # a point failure two hours in.
+        outside = []
+        for name, pts in grid.axes.items():
+            lo, hi = self.stages[name].limit_mm
+            first, last = float(min(pts)), float(max(pts))
+            if not (lo <= first and last <= hi):
+                outside.append(f"{name}: asks for {first:g}..{last:g} mm, "
+                               f"allowed {lo:g}..{hi:g} mm")
+        if outside:
+            QtWidgets.QMessageBox.warning(
+                self, "Field map",
+                "The scan range goes outside what these axes are allowed to "
+                "use:\n\n  " + "\n  ".join(outside)
+                + f"\n\nEither shorten the range, or change \"limit_mm\" in "
+                  f"{ostage.AXIS_CONFIG} — having measured that the head "
+                  f"really can go there.")
             return
 
         n = len(grid)
@@ -2026,7 +3740,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_state.setText("field map in progress...")
         self.bar_scan.setRange(0, n)
         self.bar_scan.setValue(0)
-        self.btn_scan_start.setEnabled(False)
         self.btn_scan_abort.setEnabled(True)
         self.act_snapshot.setEnabled(False)
 
@@ -2041,7 +3754,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scan_worker.progress.connect(self.on_scan_progress)
         self._scan_worker.done.connect(self.on_scan_done)
         self._scan_t0 = time.time()
+        self.register_motion_worker(self._scan_worker)
         self._scan_worker.start()
+        self._sync_stage_controls()
 
     def on_scan_progress(self, i, n, where, sem_ut):
         self.bar_scan.setValue(i)
@@ -2059,18 +3774,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log.log("field map: stopping after the point in flight")
 
     def on_scan_done(self, fm, error):
-        self.btn_scan_start.setEnabled(self.stages is not None)
+        self.retire_motion_worker(self._scan_worker)
         self.btn_scan_abort.setEnabled(False)
         self.act_snapshot.setEnabled(True)
         self.bar_scan.setFormat("%v / %m")
-        self.lbl_state.setText("disconnected")
+        if self._estop_reason is None:
+            self.lbl_state.setText("disconnected")
+        self._sync_stage_controls()
         if error:
             self.log.log(f"field map failed: {error}")
             QtWidgets.QMessageBox.warning(self, "Field map", error)
         if fm is None or not len(fm):
             return
         path = fm.save(os.path.join(
-            "captures", time.strftime("fieldmap_%Y%m%d_%H%M%S")))
+            self.out_dir, time.strftime("fieldmap_%Y%m%d_%H%M%S")))
         sem = np.array([s.get("sem_ut", np.nan) for s in fm.stats])
         self.log.log(
             f"field map: {len(fm)} of {fm.meta['n_requested']} points, "
@@ -2149,8 +3866,29 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
 
     # ---- connection ------------------------------------------------------
+    def _auto_connect(self):
+        """The connect the window makes for itself when it opens.
+
+        Marked so that a failure logs rather than throwing a modal across the
+        window: the carriers being off is a normal way to arrive at this
+        program -- to look at a saved capture, to edit a calibration -- and a
+        dialog to dismiss on every launch would train you to dismiss dialogs.
+        """
+        if self.source is not None:
+            return
+        self._connect_was_automatic = True
+        self.on_connect()
+
     def on_connect(self):
         if self.source is not None:
+            return
+        # A second attempt while the first is still in flight would start a
+        # second worker against the same carriers -- and the automatic connect
+        # means there is now something in flight that nobody pressed. Tracked
+        # with a flag rather than by asking the thread: isRunning() is false
+        # for the moment between start() and the thread actually running, and
+        # that moment is exactly when a second call arrives.
+        if self._connecting:
             return
         fs = float(self.cmb_rate.currentData())
         self.act_connect.setEnabled(False)
@@ -2160,7 +3898,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_worker = ConnectWorker(self.hosts, fs)
         self._connect_worker.done.connect(self.on_connected)
         self._connect_worker.progress.connect(self.on_connect_progress)
+        self._connecting = True
         self._connect_worker.start()
+        # The rig is one instrument: the probe reads the field, the stages say
+        # where it was read. Connecting one and not the other is a state the
+        # operator has to remember to fix, and forgetting it does not announce
+        # itself -- it just means the field map button is greyed out for no
+        # visible reason. The two run in separate workers, so a bench with no
+        # stages plugged in connects the probe exactly as before.
+        self.connect_stages(quiet=True)
+
+    def connect_stages(self, quiet=False):
+        """Open the stages named in stages.json, without touching the probe.
+
+        Returns False and logs if there is nothing to connect. Never raises
+        into the caller: the probe half of the window has to come up whatever
+        the motion hardware is doing.
+        """
+        try:
+            return self._connect_stages(quiet)
+        except Exception as exc:
+            # Deliberately broad. This runs inside Connect, and the probe half
+            # of the window must come up whatever the motion hardware, the
+            # Kinesis install or a stale USB handle is doing.
+            self.log.log(f"stages: not connected — {type(exc).__name__}: {exc}")
+            self._stage_pending = None
+            self.btn_stage_connect.setEnabled(True)
+            if not quiet:
+                QtWidgets.QMessageBox.warning(self, "Stages", str(exc))
+            return False
+
+    def _connect_stages(self, quiet):
+        if self.stages is not None or self._stage_pending is not None:
+            return False
+        if self._stage_worker is not None and self._stage_worker.isRunning():
+            return False
+        mapping = ostage.load_axis_map()
+        if not mapping:
+            self.log.log(
+                "stages: no axis map in stages.json, so nothing was connected "
+                "automatically. Assign x/y/z on the Stages tab once and every "
+                "later session picks it up.")
+            return False
+        if not self.on_stage_find(quiet=quiet):
+            return False
+        missing = [ser for ser in mapping.values()
+                   if ser not in (self.stage_combos or {})]
+        if missing:
+            self.log.log(f"stages: {', '.join(missing)} is in stages.json but "
+                         f"not on the bus — connect from the Stages tab once "
+                         f"it is back")
+            return False
+        stages = _stage_set_for(mapping)
+        self._stage_pending = stages
+        self.btn_stage_connect.setEnabled(False)
+        self._stage_action("connect", lambda emit: stages.open())
+        return True
 
     def on_connect_progress(self, msg):
         # Connecting involves several seconds of deliberate settling delays.
@@ -2170,21 +3963,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.log(msg)
 
     def on_connected(self, source, prev, error):
+        self._connecting = False
         self.act_connect.setEnabled(True)
+        was_automatic = self._connect_was_automatic
+        self._connect_was_automatic = False
         if error:
             self.lbl_state.setText("disconnected")
             self.log.log(f"connect failed: {error}")
-            QtWidgets.QMessageBox.critical(
-                self, "Connect failed",
-                f"{error}\n\nIf this says the stream closed immediately, "
-                f"something else owns port 4210 -- usually a Phoebus "
-                f"'Streaming Capture' still running on that box.")
+            if was_automatic:
+                self.log.log(
+                    "the automatic connect is the only thing that failed -- "
+                    "everything that does not need the carriers still works, "
+                    "and Connect will try again")
+            else:
+                QtWidgets.QMessageBox.critical(
+                    self, "Connect failed",
+                    f"{error}\n\nIf this says the stream closed immediately, "
+                    f"something else owns port 4210 -- usually a Phoebus "
+                    f"'Streaming Capture' still running on that box.")
             for h, p in (prev or {}).items():
-                try:
-                    import octobee_live as olive
+                with contextlib.suppress(Exception):
                     olive.restore_rate(h, p)
-                except Exception:                    # noqa: BLE001
-                    pass
             return
         self.prev_clkdiv = prev or {}
         self._set_source(source, "live")
@@ -2214,12 +4013,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.source is not None:
             self.source.stop()
             self.source = None
+        # Symmetry with Connect: one button owns the whole rig. Leaving the
+        # stages open would hold the USB devices against the Kinesis app and
+        # against the next run of this window, which looks like a cabling
+        # fault rather than a stale handle.
+        if self.stages is not None:
+            self.on_stage_disconnect()
         for h, p in self.prev_clkdiv.items():
             try:
-                import octobee_live as olive
                 olive.restore_rate(h, p)
                 self.log.log(f"{h}: clkdiv restored to {p}")
-            except Exception as e:                   # noqa: BLE001
+            except Exception as e:
                 self.log.log(f"{h}: could not restore clkdiv: {e}")
         self.prev_clkdiv = {}
         self.act_disconnect.setEnabled(False)
@@ -2243,6 +4047,15 @@ class MainWindow(QtWidgets.QMainWindow):
         plot autoscaling, the peak bars, and -- worst -- the baseline of a
         magnet pass, which would then measure the calibration step rather than
         the magnet.
+
+        A running CSV recording is rolled over to a new file for the same
+        reason, one level up. CsvRecorder stamps calibration_id and the whole
+        conversion state into its header once, at open, so that a file can be
+        matched back to the calibration that produced it. Carrying on writing
+        into that file after the conversion changed would produce one CSV whose
+        rows came from two different calibrations, under a header naming only
+        the first -- which is worse than either file alone, because nothing
+        about it looks wrong.
         """
         self.roll.clear()
         self.view3d.reset_scale()
@@ -2251,6 +4064,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.collecting is not None and self.collecting["what"] == "magnet":
             self.btn_magnet.setChecked(False)
             self.log.log(f"magnet pass abandoned: {what} changed mid-pass")
+        self._roll_over_csv(what)
+
+    def _roll_over_csv(self, what):
+        """Close the CSV in progress and open a fresh one with a new header."""
+        if self.csv_rec is None:
+            return
+        old = self.csv_rec
+        rows = old.n_rows
+        old.close()
+        path = orec.default_name("octobee", "csv", self.out_dir)
+        self.csv_rec = orec.CsvRecorder(
+            path, self.out_rate, self.cal, self.geom,
+            tube_frame=self.chk_tube.isChecked(),
+            meta={"hosts": ",".join(self.source.hosts) if self.source else "",
+                  "stream_rate_hz": self.source.fs_hz if self.source else 0.0,
+                  "continues": os.path.basename(old.path),
+                  "rolled_over_because": f"{what} changed"})
+        self.log.log(
+            f"{what} changed while recording: closed {os.path.basename(old.path)} "
+            f"at {rows} rows and started {os.path.basename(path)}, so each file "
+            f"matches the calibration named in its own header. The raw .bin is "
+            f"unaffected -- it holds counts, which no calibration changes.")
 
     @property
     def decim(self):
@@ -2279,7 +4114,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.raw_rec.write(blocks)
 
             with self.prof.time("  counts -> tesla"):
-                grouped = ocal.assemble(blocks, self.source.vpc)   # (n,16,4) V
+                grouped = ocal.assemble(blocks, self.source.vpc,
+                                        self.source.volt_offset)  # (n,16,4) V
                 b = self.cal.to_mt(grouped)                        # (n,16,3) mT
             with self.prof.time("  decimate + buffer"):
                 bd = ocal.decimate(b, self.decim)
@@ -2415,8 +4251,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if raw is not None:
                 self._last_health_t = now
                 with self.prof.time("  channel health scan"):
-                    rows = ocal.channel_health(raw, self.source.vpc,
-                                               self.source.hosts)
+                    rows = ocal.channel_health(
+                        raw, self.source.vpc, self.source.hosts,
+                        self.source.volt_offset)
                 self.last_health = rows
                 if self.chk_autodead.isChecked():
                     dead = ocal.suggest_dead(rows)
@@ -2470,10 +4307,23 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.collecting = {"what": what, "blocks": [], "n": 0,
                            "need": int(seconds * self.source.fs_hz),
-                           "peak": None}
+                           "peak": None, "baseline": None, "tag": None,
+                           "decim": self.decim}
         self.log.log(f"collecting {seconds:g} s for {what}...")
 
     def _collect_block(self, b, grouped=None):
+        """
+        Accumulate one acquisition block into whatever collection is running.
+
+        b        (n,16,3) fully calibrated mT -- offset, gain and matrix applied
+        grouped  (n,16,4) volts straight off assemble(), nothing applied
+
+        Which of the two a mode wants is not a detail: anything that MEASURES a
+        correction has to work from `grouped`, or it fits on top of the
+        correction already loaded and the answer depends on where you started.
+        Only the magnet pass, which reports a field rather than deriving a
+        calibration, legitimately uses `b`.
+        """
         c = self.collecting
         if c["what"] == "magnet":
             # Deviation from the field that was there when the pass STARTED.
@@ -2484,37 +4334,45 @@ class MainWindow(QtWidgets.QMainWindow):
             c["peak"] = best if c["peak"] is None else np.maximum(c["peak"], best)
             c["n"] += b.shape[0]
             return
-        if c["what"] == "sweep":
-            # A sweep has to be solved from UNCORRECTED field, or the solver
-            # would be fitting on top of whatever trim happens to be loaded and
-            # the answer would depend on where you started. Decimate hard while
-            # we are at it: the information is in the shape of the ellipse, and
-            # a couple of hundred hertz resolves a hand roll a thousand times
-            # over.
-            if grouped is None:
-                return
-            raw = self.cal.to_mt(grouped, apply_zero=False, apply_gain=False,
-                                 apply_matrix=False)
-            c["blocks"].append(ocal.decimate(raw, max(1, c["decim"])))
-            c["n"] += b.shape[0]
-            if c["n"] >= c["need"]:
-                data = np.concatenate(c["blocks"], axis=0)
-                tag = c["tag"]
-                self.collecting = None
-                self._finish_sweep(data, tag)
+
+        # Both remaining modes measure a calibration, so both take the
+        # uncorrected field. Decimate hard while we are at it: for a sweep the
+        # information is in the shape of the ellipse, and a couple of hundred
+        # hertz resolves a hand roll a thousand times over.
+        if grouped is None:
+            return
+        raw = self.cal.to_mt(grouped, apply_zero=False, apply_gain=False,
+                             apply_matrix=False)
+        c["blocks"].append(ocal.decimate(raw, max(1, c["decim"])))
+        c["n"] += b.shape[0]
+        if c["n"] < c["need"]:
             return
 
-        c["blocks"].append(ocal.decimate(b, max(1, self.decim)))
-        c["n"] += b.shape[0]
-        if c["n"] >= c["need"]:
-            data = np.concatenate(c["blocks"], axis=0)
-            self.collecting = None
+        data = np.concatenate(c["blocks"], axis=0)
+        what, tag = c["what"], c["tag"]
+        self.collecting = None
+        if what == "sweep":
+            self._finish_sweep(data, tag)
+        else:
             self._finish_tare(data)
 
     def _finish_tare(self, data):
-        # tare must be computed on data with the old zero removed, so add it back
-        raw = data + self.cal.zero_mt[None, :, :]
-        z = self.cal.tare(raw)
+        """
+        Set the zero from an UNCORRECTED capture.
+
+        `data` is what to_mt(apply_zero=False, apply_gain=False,
+        apply_matrix=False) produced, which is what zero_mt is defined against:
+        Calibration applies offset, then gain, then matrix, so the zero is a
+        pre-gain quantity.
+
+        This used to reconstruct it instead, as `data + zero_mt`, from the
+        fully corrected buffer. That inverts the chain only when the gain trim
+        is 1.0 and the matrix is the identity -- so after a magnet-pass trim or
+        an applied roll calibration the stored zero came out scaled by the
+        trim, silently. Collecting the uncorrected field in the first place
+        means there is nothing to invert.
+        """
+        z = self.cal.tare(data)
         self.log.log(f"zeroed on {data.shape[0]} points; "
                      f"largest offset removed {np.abs(z).max():.4f} mT "
                      f"(S{int(np.argmax(np.abs(z).max(axis=1)))+1})")
@@ -2531,6 +4389,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fs = self.source.fs_hz
         self.collecting = {"what": "sweep", "tag": tag, "blocks": [], "n": 0,
                            "need": int(seconds * fs), "peak": None,
+                           "baseline": None,
                            # aim for a few hundred Hz, whatever the ADC is at
                            "decim": max(1, int(fs / 200))}
         self.log.log(f"rolling sweep {tag}: roll the tube steadily through at "
@@ -2642,7 +4501,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.sweeps:
             return
         d = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Save roll sweeps into", "captures")
+            self, "Save roll sweeps into", self.out_dir)
         if not d:
             return
         for tag, sw in sorted(self.sweeps.items()):
@@ -2651,7 +4510,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_load_sweeps(self):
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Load roll sweeps", "captures", "Roll sweeps (*.npz)")
+            self, "Load roll sweeps", self.out_dir, "Roll sweeps (*.npz)")
         for f in files:
             try:
                 sw = opc.RollSweep.load(f)
@@ -2680,7 +4539,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             base = np.median(recent, axis=0).astype(np.float64)
             self.collecting = {"what": "magnet", "blocks": [], "n": 0,
-                               "need": 0, "peak": None, "baseline": base}
+                               "need": 0, "peak": None, "baseline": base,
+                               "tag": None, "decim": self.decim}
             self.btn_magnet.setText("Stop magnet pass")
             self.lbl_magnet.setText("recording -- pass the magnet along the probe, "
                                     "then press stop")
@@ -2700,7 +4560,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{n} sensors responded, peak spread "
                 f"{spread:.2f}x" if spread else f"{n} sensors responded")
             self.btn_apply_gain.setEnabled(True)
-            self.log.log(f"magnet pass: peak |B| per sensor = "
+            self.log.log("magnet pass: peak |B| per sensor = "
                          + ", ".join(f"S{i+1}={v:.3f}"
                                      for i, v in enumerate(self.magnet_peaks)))
             self.refresh_cal_report()
@@ -2712,7 +4572,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.chk_geom.isChecked():
             pt = (self.spin_mx.value(), self.spin_my.value(), self.spin_mz.value())
             w = self.geom.expected_response(pt, self.spin_exp.value())
-        corr, skipped = self.cal.cross_calibrate(self.magnet_peaks, weights=w)
+        _corr, skipped = self.cal.cross_calibrate(self.magnet_peaks, weights=w)
         note = (f"kept their previous trim (no usable response): "
                 f"{', '.join(skipped)}") if skipped else "every live sensor trimmed"
         self.log.log(f"gain trim applied using "
@@ -2721,6 +4581,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_magnet.setText(f"gain trim applied -- {note}")
         self._calibration_changed("the gain trim")
         self.refresh_cal_report()
+
+    def on_guided_magnet(self):
+        """Open the guided routine, or explain what it needs first."""
+        if self.stages is None:
+            QtWidgets.QMessageBox.information(
+                self, "Guided magnet calibration",
+                "This routine drives the head past a fixed magnet, so it "
+                "needs the stages. Press Connect — it brings up the carriers "
+                "and the stages together — or connect them from the Stages "
+                "tab.\n\nWithout motion, the hand magnet pass above is the "
+                "alternative; it needs geometry weighting to be fair, which "
+                "this one does not.")
+            return
+        # Visibility, not the reference, decides whether one is already open.
+        # Belt and braces against the failure above: any future path that
+        # hides this dialog without finishing it would otherwise wedge the
+        # button, and the symptom -- a button that does nothing at all -- is
+        # about as hard to diagnose from a bug report as it gets.
+        if self._magnet_wizard is not None:
+            if self._magnet_wizard.isVisible():
+                self._magnet_wizard.raise_()
+                self._magnet_wizard.activateWindow()
+                return
+            self._magnet_wizard.deleteLater()
+            self._magnet_wizard = None
+        self._magnet_wizard = MagnetWizard(self)
+        self._magnet_wizard.finished.connect(
+            lambda _: setattr(self, "_magnet_wizard", None))
+        self._magnet_wizard.show()
+
+    def on_show_superseded(self, on):
+        for box in self._superseded_boxes:
+            box.setVisible(bool(on))
 
     def on_clear_gain(self):
         self.cal.clear_gain()
@@ -2791,13 +4684,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_load_cal(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Load calibration", ".", "JSON (*.json)")
-        if path:
-            self.cal = ocal.Calibration.load(path)
-            self.table.set_ranges(self.cal.ranges_mt)
-            self.chk_vcm.setChecked(self.cal.subtract_vcm)
-            self._calibration_changed("the whole calibration")
-            self.refresh_cal_report()
-            self.log.log(f"calibration loaded from {path}")
+        if not path:
+            return
+        try:
+            cal = ocal.Calibration.load(path)
+        except (OSError, ValueError, TypeError) as exc:
+            # Deliberately not load_or_default: an explicit Load that quietly
+            # substituted +/-20 mT defaults would be the worst outcome here.
+            # Keep the calibration already in force and say what went wrong.
+            self.log.log(f"could not load {path}: {type(exc).__name__}: {exc}")
+            QtWidgets.QMessageBox.warning(
+                self, "Load calibration",
+                f"{path} could not be read:\n\n{type(exc).__name__}: {exc}\n\n"
+                f"The calibration already loaded is unchanged.")
+            return
+        self.cal = cal
+        self.table.set_ranges(self.cal.ranges_mt)
+        self.chk_vcm.setChecked(self.cal.subtract_vcm)
+        self._calibration_changed("the whole calibration")
+        self.refresh_cal_report()
+        self.log.log(f"calibration loaded from {path}")
 
     def on_edit_geometry(self):
         path = self.args.geometry
@@ -2826,7 +4732,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if raw is None:
             self.health_text.setPlainText("no data -- connect first")
             return
-        rows = ocal.channel_health(raw, self.source.vpc, self.source.hosts)
+        rows = ocal.channel_health(raw, self.source.vpc, self.source.hosts,
+                                   self.source.volt_offset)
         self.last_health = rows
         verdict = ocal.health_verdict(rows)
         n = raw[0].shape[0]
@@ -2871,7 +4778,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.on_health()
         if not self.last_health:
             return
-        path = orec.default_name("channel_health", "csv")
+        path = orec.default_name("channel_health", "csv", self.out_dir)
         orec.write_health_csv(path, self.last_health)
         self._exported(path)
 
@@ -2881,9 +4788,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.source is None:
                 self.act_record.setChecked(False)
                 return
-            stamp = time.strftime("%Y%m%d_%H%M%S")
             if self.chk_csv.isChecked():
-                p = os.path.join("captures", f"octobee_{stamp}.csv")
+                p = orec.default_name("octobee", "csv", self.out_dir)
                 self.csv_rec = orec.CsvRecorder(
                     p, self.out_rate, self.cal, self.geom,
                     tube_frame=self.chk_tube.isChecked(),
@@ -2891,7 +4797,7 @@ class MainWindow(QtWidgets.QMainWindow):
                           "stream_rate_hz": self.source.fs_hz})
                 self.log.log(f"recording CSV to {p} at {self.out_rate:g} Hz")
             if self.chk_raw.isChecked():
-                p = os.path.join("captures", f"octobee_{stamp}.bin")
+                p = orec.default_name("octobee", "bin", self.out_dir)
                 self.raw_rec = orec.RawRecorder(
                     p, self.source.hosts, self.source.vpc,
                     [self.source.fs_hz] * len(self.source.hosts),
@@ -2931,7 +4837,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
         secs = self.spin_snap_s.value()
-        path = orec.default_name("snapshot", "npz")
+        path = orec.default_name("snapshot", "npz", self.out_dir)
         self.log.log(f"snapshot: stopping the stream, restoring the carriers' "
                      f"own clock, and capturing {secs:g} s losslessly")
         self.source.stop()
@@ -2964,7 +4870,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not table:
             self.log.log("no sensor data yet")
             return
-        path = orec.default_name("sensor_summary", "csv")
+        path = orec.default_name("sensor_summary", "csv", self.out_dir)
         orec.write_sensor_csv(path, table)
         self._exported(path)
 
@@ -2995,7 +4901,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 payload["magnet_pass"]["magnet_point_mm"] = pt
                 payload["magnet_pass"]["geometry_corrected"] = ocal.spread_report(
                     self.magnet_peaks, self.geom, pt, self.spin_exp.value(), live)
-        path = orec.default_name("octobee_report", "json")
+        path = orec.default_name("octobee_report", "json", self.out_dir)
         orec.write_report_json(path, payload)
         self._exported(path)
 
@@ -3169,17 +5075,134 @@ class MainWindow(QtWidgets.QMainWindow):
                   f"worst {self.lag.max_ms:.0f} ms -- {self.lag.verdict()}")
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
-        if self._scan_worker is not None and self._scan_worker.isRunning():
-            self._scan_worker.abort()
-            self._scan_worker.wait(30000)
+        if self.motion_busy():
+            # Ask before walking away from a moving machine. Closing used to
+            # go straight through to stages.close(), which does not stop
+            # anything -- the move is already in the controller and it runs to
+            # completion whether or not this window still exists. So the
+            # window would vanish and the head would carry on traversing with
+            # nothing watching it and no stop button anywhere.
+            reply = QtWidgets.QMessageBox.warning(
+                self, "Something is still moving",
+                "A stage job is still running.\n\n"
+                "Closing stops every axis first — the move in progress is "
+                "abandoned where it is, so re-home before trusting a "
+                "position afterwards.\n\nClose and stop?",
+                QtWidgets.QMessageBox.StandardButton.Close
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Cancel)
+            if reply != QtWidgets.QMessageBox.StandardButton.Close:
+                ev.ignore()
+                return
+            self.trigger_estop("the window was closed while a job was running")
+        for w in list(self._motion_workers) + [self._stage_worker]:
+            if _is_running(w):
+                # Bounded: a worker wedged inside a DLL call must not stop the
+                # window closing, or the only way out is Task Manager -- which
+                # is the one exit that leaves the stages held and moving.
+                w.wait(30000)
         self.stage_timer.stop()
         if self.stages is not None:
             # These are exclusive-open USB devices: leaving them held means the
             # Kinesis application will not start until this process dies.
+            # close() stops each axis on the way out; see Stage.close.
             self.stages.close()
             self.stages = None
         self.on_disconnect()
         super().closeEvent(ev)
+
+
+CRASH_LOG = "octobee_crash.log"
+
+
+class CrashHandler:
+    """Write unhandled exceptions down, because otherwise nobody ever sees one.
+
+    Bare PyQt aborts the process when an exception escapes a slot -- but this
+    program imports pyqtgraph, which replaces sys.excepthook with its own
+    override precisely to stop that. Measured here: the same raising slot exits
+    127 without pyqtgraph and 0 with it. So exceptions in slots are already
+    survivable; what they are not is VISIBLE. pyqtgraph prints the traceback to
+    stderr, and the desktop icon runs pythonw.exe, where stderr goes nowhere at
+    all. The program carries on in a state nobody knows about.
+
+    So this is a recorder, not a rescue: the traceback goes to a file, the Log
+    tab gets a line, and one dialog says the window may now be inconsistent.
+    The previous hook is still called, so pyqtgraph keeps doing whatever it
+    does.
+
+    It does NOT catch a native crash -- an access violation, or Qt calling
+    qFatal(). Those never reach Python. faulthandler, enabled beside this in
+    main(), is what leaves a record of those.
+    """
+
+    def __init__(self, path=None, window=None):
+        self.path = path or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), CRASH_LOG)
+        self.window = window
+        self.count = 0
+        self.previous = None
+
+    def install(self):
+        self.previous = sys.excepthook
+        sys.excepthook = self
+        return self
+
+    def __call__(self, exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        self.count += 1
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        # The file first, and in its own try: everything after this can fail
+        # (there may be no window, Qt may be half torn down) and the whole
+        # point is that the traceback survives regardless.
+        try:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n===== {stamp} =====\n{text}")
+        except OSError:
+            pass
+        with contextlib.suppress(Exception):
+            if self.window is not None:
+                self.window.log.log(
+                    f"INTERNAL ERROR ({exc_type.__name__}: {exc}) -- written "
+                    f"to {os.path.basename(self.path)}. The program is still "
+                    f"running but whatever was in progress did not finish.")
+        # One dialog, not one per occurrence: a fault inside a repainting
+        # timer fires several times a second, and a queue of identical boxes is
+        # indistinguishable from the freeze this is meant to replace.
+        #
+        # NON-modal, and show() rather than QMessageBox.critical(). The
+        # convenience call is the blocking one: it spins a nested event loop
+        # and does not return until somebody clicks. Doing that from inside an
+        # excepthook stops the program dead in the middle of whatever was
+        # interrupted -- measured here, with no window to parent it to, the
+        # call simply never returned. A reporter that freezes the application
+        # is worse than no reporter at all.
+        if self.count == 1 and self.window is not None:
+            with contextlib.suppress(Exception):
+                box = QtWidgets.QMessageBox(
+                    QtWidgets.QMessageBox.Icon.Critical, "Internal error",
+                    f"{exc_type.__name__}: {exc}\n\n"
+                    f"The full traceback is in {self.path}\n\n"
+                    f"The program is still running, but whatever it was doing "
+                    f"when this happened did not finish \u2014 save anything "
+                    f"you care about and restart. Further errors will be "
+                    f"logged without another dialog.",
+                    parent=self.window)
+                box.setModal(False)
+                box.setAttribute(
+                    QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                # Held on self: a box with nothing referencing it is collected
+                # before it is ever painted.
+                self._box = box
+                box.show()
+        # Whatever was installed before us -- pyqtgraph's override, normally --
+        # still gets its turn, so nothing it relies on is quietly removed.
+        if self.previous is not None and self.previous is not self:
+            with contextlib.suppress(Exception):
+                self.previous(exc_type, exc, tb)
 
 
 ICON_NAME = "octobee.ico"
@@ -3198,10 +5221,10 @@ def _apply_app_icon(app):
         return
     if sys.platform == "win32":
         try:
-            import ctypes
+            import ctypes  # noqa: PLC0415  (Windows-only, cosmetic)
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
                 "harrer.octobee.hallprobe.1")
-        except Exception:                             # noqa: BLE001
+        except Exception:
             pass                                      # cosmetic only
     app.setWindowIcon(QtGui.QIcon(path))
 
@@ -3218,6 +5241,12 @@ def main():
     p.add_argument("--replay", help="play back a saved .npz capture")
     p.add_argument("--geometry", default=pgeom.CONFIG_NAME)
     p.add_argument("--calibration", default=ocal.CONFIG_NAME)
+    p.add_argument("--out-dir", default="captures",
+                   help="where recordings, snapshots and exports are written "
+                        "(default: captures)")
+    p.add_argument("--no-connect", action="store_true",
+                   help="start disconnected. Without this the window connects "
+                        "to the carriers and the stages as soon as it opens")
     p.add_argument("--profile", action="store_true",
                    help="start with the Profile tab measuring where the time "
                         "goes, and print a summary on exit")
@@ -3230,9 +5259,24 @@ def main():
     a = p.parse_args()
 
     app = QtWidgets.QApplication(sys.argv)
+    crash = CrashHandler().install()
+    # The other half of the same job. A Qt fatal error or an access violation
+    # never becomes a Python exception -- the process simply dies, and all the
+    # Windows event log records is "Qt6Core.dll, 0xc0000409", which names no
+    # Python at all. faulthandler catches the abort signal itself and dumps the
+    # Python stack of every thread as it goes, which is the difference between
+    # a crash report that says where to look and one that says nothing.
+    # Line-buffered and never closed on purpose: it has to be usable from
+    # inside a signal handler, at a moment when the process is already dying.
+    with contextlib.suppress(OSError):
+        _fault_log = open(crash.path, "a", buffering=1, encoding="utf-8")
+        _fault_log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                         f"session started =====\n")
+        faulthandler.enable(file=_fault_log)
     _apply_app_icon(app)
     app.setApplicationName("OCTO-BEE Hall probe")
     win = MainWindow(a)
+    crash.window = win
     win.show()
 
     if a.screenshot:
