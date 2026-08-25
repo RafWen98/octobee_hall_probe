@@ -1139,7 +1139,9 @@ class Stage:
                           f"({reason}), which can lose steps")
             _check(dll().ISC_StopImmediate(self._sb), f"stop {self.name}")
             return ""
-        except Exception as exc:                     # noqa: BLE001 -- see above
+        except Exception as exc:
+            # Deliberately broad -- see point 2 above. Whatever went wrong
+            # here, the remaining axes still have to be told to stop.
             return f"{self.name}: {type(exc).__name__}: {exc}"
 
     def wait(self, timeout_s=180.0, what="move", settle_s=0.0):
@@ -1177,18 +1179,17 @@ class Stage:
         # position and command the next move as if nothing had happened. This
         # is the check that turns a stop into a stop.
         self.interlock.require_clear(f"{self.name}: {what}")
-        if bits & (HARD_LIMIT_MASK):
-            # Not raised: homing ends ON the limit switch, which is the whole
-            # point of homing. But an ordinary move that finishes against a
-            # hard stop did not arrive, it collided, and the count is a guess
-            # from there on.
-            if what != "homing":
-                self.distrust(f"{self.name} ended {what} against a hard limit "
-                              f"switch rather than at its target")
-                raise StageError(
-                    f"{self.name}: {what} ran into a hard limit switch. The "
-                    f"soft limits did not stop it in time -- check "
-                    f"{AXIS_CONFIG} before moving this axis again.")
+        # Homing is excluded because homing ends ON the limit switch, which
+        # is the whole point of it. But an ordinary move that finishes against
+        # a hard stop did not arrive, it collided, and the count is a guess
+        # from there on.
+        if bits & HARD_LIMIT_MASK and what != "homing":
+            self.distrust(f"{self.name} ended {what} against a hard limit "
+                          f"switch rather than at its target")
+            raise StageError(
+                f"{self.name}: {what} ran into a hard limit switch. The "
+                f"soft limits did not stop it in time -- check "
+                f"{AXIS_CONFIG} before moving this axis again.")
         if settle_s:
             time.sleep(settle_s)
 

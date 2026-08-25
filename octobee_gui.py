@@ -709,6 +709,41 @@ class Rolling:
 
 NO_AXIS = "(none)"
 
+METHOD_FULL = "Full — plane sweep and standoff dither  (recommended)"
+METHOD_AXIAL = "Axial only — one sweep per pose  (quick)"
+METHOD_CUSTOM = "Custom — set the axes by hand"
+
+# What each method is for, in the words someone choosing between them needs.
+# Deliberately includes what each one CANNOT do: the axial run is not a
+# degraded version of the full one, it is the right answer when there is only
+# one stage, and the numbers are what make that judgeable rather than a matter
+# of picking the option with "recommended" after it.
+METHOD_NOTES = {
+    "full": (
+        "Three passes per pose: find the rings, cut across each one, then "
+        "dither the standoff. Every sensor is measured at the top of its own "
+        "peak and at a measured distance, so a millimetre of arm placement "
+        "stops looking like 15 % of gain. On a synthetic probe misplaced by "
+        "1 mm on all three axes this recovers gain to 1.8 %, against 9.9 % "
+        "for the axial run. Needs three stages, and about five times the "
+        "points."),
+    "axial": (
+        "One sweep along the tube per pose — the original routine. Every "
+        "sensor still passes the same fixed magnet, so the trim still needs "
+        "no 1/r³ model, but each chip is measured wherever its arm happens to "
+        "have put it: 1 mm of misplacement is up to 15 % of trim at a 20 mm "
+        "standoff. The right choice when only the tube axis is motorised, or "
+        "for a quick check."),
+    "custom": (
+        "The axis boxes below are yours. One combination is not offered above "
+        "and is worth knowing about: a transverse cut with NO standoff dither "
+        "is worse than doing neither, because peaking over the plane moves "
+        "every chip to its true, nearer approach and amplifies whatever error "
+        "is left. The run will refuse a dither without a cut for the "
+        "matching reason — the dither's model is only true once the cut has "
+        "put the chip under the magnet."),
+}
+
 # What each pass is doing, for the header while it runs. The names matter more
 # than they look: the three passes take very different lengths of time and an
 # operator who cannot tell which one is running cannot tell a slow dither from
@@ -747,6 +782,7 @@ class MagnetWizard(QtWidgets.QDialog):
         self._start_mm = None
         self._finished = False
         self._park = {}          # across/normal positions, taken once
+        self._setting_method = False   # guards the method -> axis-box writes
         self._pass = None        # 'locate' | 'cut' | 'dither'
         self._pending = None     # the PoseSweep the passes are building up
         self._rings = None       # where pass A found this pose's four rings
@@ -765,6 +801,25 @@ class MagnetWizard(QtWidgets.QDialog):
         lay.addWidget(self.txt)
 
         names = list(win.stages.names) if win.stages else ["y"]
+
+        # ---- which run this is ---------------------------------------------
+        # A named choice rather than "set these two axis boxes and hope",
+        # because the passes are not independent options: plane-without-dither
+        # is measurably worse than doing neither, and it was previously
+        # reachable by setting one combo and not the other. The methods here
+        # are the combinations that are actually worth running.
+        self.box_method = QtWidgets.QGroupBox("Which run")
+        ml = QtWidgets.QVBoxLayout(self.box_method)
+        self.cmb_method = QtWidgets.QComboBox()
+        for label, tag in ((METHOD_FULL, "full"),
+                           (METHOD_AXIAL, "axial"),
+                           (METHOD_CUSTOM, "custom")):
+            self.cmb_method.addItem(label, tag)
+        self.lbl_method = QtWidgets.QLabel()
+        self.lbl_method.setWordWrap(True)
+        ml.addWidget(self.cmb_method)
+        ml.addWidget(self.lbl_method)
+        lay.addWidget(self.box_method)
 
         self.box_setup = QtWidgets.QGroupBox("Sweep")
         gl = QtWidgets.QGridLayout(self.box_setup)
@@ -910,9 +965,20 @@ class MagnetWizard(QtWidgets.QDialog):
                    self.spin_across_step, self.spin_dither_half):
             sp.valueChanged.connect(self._update_estimate)
         self.spin_dither_pts.valueChanged.connect(self._update_estimate)
-        for cb in (self.cmb_across, self.cmb_normal):
-            cb.currentTextChanged.connect(self._update_estimate)
         lay.addWidget(self.box_setup)
+
+        # Wired after the axis combos exist, and in this order: the method sets
+        # the combos, and the combos falling back to Custom is how a hand edit
+        # is noticed. Connecting the second one first would make _apply_method's
+        # own writes look like hand edits and knock it straight to Custom.
+        self.cmb_method.currentIndexChanged.connect(self._apply_method)
+        # The tube axis feeds into which axes the method may use, so changing
+        # it has to re-derive them -- otherwise picking x as the tube axis
+        # leaves the transverse cut still pointed at x.
+        self.cmb_axis.currentTextChanged.connect(self._apply_method)
+        for cb in (self.cmb_across, self.cmb_normal):
+            cb.currentTextChanged.connect(self._method_edited)
+        self._method_default(names)
 
         self.bar = QtWidgets.QProgressBar()
         self.bar.setMinimumHeight(22)
@@ -960,6 +1026,98 @@ class MagnetWizard(QtWidgets.QDialog):
     @property
     def busy(self):
         return self._worker is not None and self._worker.isRunning()
+
+    # ---- which run ------------------------------------------------------
+    def _method(self):
+        return self.cmb_method.currentData()
+
+    def _method_default(self, names):
+        """Pick the best method this rig can actually run, and say so.
+
+        Full needs three axes. Offering it on a one-stage rig and then
+        refusing at Start is the failure this combo exists to remove, so an
+        unrunnable method is disabled in the list rather than left as a trap.
+        """
+        # One rule for "can this rig run the full method", shared with
+        # _apply_method: two axes free of the tube axis. Counting stages
+        # separately here would let the two disagree the moment the tube axis
+        # moved, and the one that decides what actually gets scanned is the
+        # other one.
+        can_full = self._full_axes() is not None
+        item = self.cmb_method.model().item(0)
+        item.setEnabled(can_full)
+        if not can_full:
+            self.cmb_method.setItemText(
+                0, METHOD_FULL.replace("(recommended)",
+                                       "(needs three stages)"))
+        self.cmb_method.setCurrentIndex(0 if can_full else 1)
+        self._apply_method()
+
+    def _full_axes(self):
+        """(transverse, standoff) for the full run, or None if it cannot run.
+
+        Picked against the tube axis rather than hardcoded, because the tube
+        axis is a combo the operator can change. Sweeping x and cutting across
+        x is the same axis twice: the grid is keyed by axis name, so the two
+        collapse into one and the run silently becomes something other than
+        what the panel says -- which is the failure mode this whole routine is
+        built to avoid, arriving through the door marked convenience.
+        """
+        sweep = self.cmb_axis.currentText()
+        free = [self.cmb_across.itemText(i)
+                for i in range(self.cmb_across.count())]
+        free = [n for n in free if n not in (NO_AXIS, sweep)]
+        if len(free) < 2:
+            return None
+        # This rig's convention when it is available -- x across the face, z
+        # toward the magnet -- and otherwise just two distinct axes.
+        across = "x" if "x" in free else free[0]
+        rest = [n for n in free if n != across]
+        return (across, "z" if "z" in rest else rest[0])
+
+    def _apply_method(self):
+        """Drive the axis boxes from the method, and lock them unless Custom."""
+        method = self._method()
+        full = self._full_axes()
+        # The tube axis can change under a chosen method and leave it with
+        # nowhere to put the other two passes. Say so by disabling it, the
+        # same way a rig with too few stages does, rather than by quietly
+        # running a different scan.
+        self.cmb_method.model().item(0).setEnabled(full is not None)
+        if method == "full" and full is None:
+            self.cmb_method.setCurrentIndex(1)      # falls back to axial
+            return
+        self.lbl_method.setText(METHOD_NOTES.get(method, ""))
+        custom = method == "custom"
+        for w in (self.cmb_across, self.cmb_normal):
+            w.setEnabled(custom)
+        if not custom:
+            want = {"full": full, "axial": (NO_AXIS, NO_AXIS)}[method]
+            self._setting_method = True
+            try:
+                for cb, name in zip((self.cmb_across, self.cmb_normal), want):
+                    if cb.findText(name) >= 0:
+                        cb.setCurrentText(name)
+            finally:
+                self._setting_method = False
+        # Sizing only matters to the passes that exist; hiding it would move
+        # the layout about, so it greys out instead.
+        for w in (self.spin_across_half, self.spin_across_step):
+            w.setEnabled(self._across_name() is not None)
+        for w in (self.spin_dither_half, self.spin_dither_pts,
+                  self.spin_standoff):
+            w.setEnabled(self._normal_name() is not None
+                         or self._across_name() is not None)
+        self._update_estimate()
+
+    def _method_edited(self):
+        """A hand edit to an axis box means this is no longer a named method."""
+        if getattr(self, "_setting_method", False):
+            return
+        if self._method() != "custom":
+            self.cmb_method.setCurrentIndex(self.cmb_method.count() - 1)
+        else:
+            self._apply_method()
 
     def _across_name(self):
         n = self.cmb_across.currentText()
@@ -1027,6 +1185,10 @@ class MagnetWizard(QtWidgets.QDialog):
 
     def _refresh(self):
         done = len(self.run)
+        # Both boxes, not just the sweep one: changing the method between poses
+        # would make pose 3 a different measurement from poses 1 and 2, and the
+        # run has no way to say so afterwards.
+        self.box_method.setEnabled(done == 0 and not self.busy)
         self.box_setup.setEnabled(done == 0 and not self.busy)
         self.btn_primary.setEnabled(not self.busy)
         if self.busy:
@@ -1090,6 +1252,21 @@ class MagnetWizard(QtWidgets.QDialog):
             return
         axis = self.cmb_axis.currentText()
         across, normal = self._across_name(), self._normal_name()
+        named = [n for n in (axis, across, normal) if n]
+        if len(set(named)) != len(named):
+            # The grid is a dict keyed by axis name, so naming one axis twice
+            # does not fail -- the second silently replaces the first and the
+            # run becomes a different scan from the one on the panel, with a
+            # pass missing and nothing in the output to say so. Custom is the
+            # way in: the named methods derive their axes and cannot collide.
+            QtWidgets.QMessageBox.warning(
+                self, "Guided magnet calibration",
+                f"The same axis is named twice: tube {axis}, transverse "
+                f"{across or 'none'}, standoff {normal or 'none'}.\n\n"
+                f"Each pass has to move a different axis. One axis doing two "
+                f"jobs does not fail — it quietly drops a pass and returns a "
+                f"result that looks like a complete run.")
+            return
         if normal and not across:
             # Not a fussy pairing rule -- the dither's model is "move straight
             # toward the magnet", and the transverse cut is the only thing that
@@ -1517,7 +1694,8 @@ Before pose 1:
    box below. Nothing is measured with it, but it sizes the other two passes.
 4. Nothing ferrous may move nearby during a sweep, including you.
 
-Each pose is three passes, and they do different jobs:
+Pick the run at the top. **Full** is three passes per pose, and they do
+different jobs:
 
 * **A, locate** — a coarse run along the tube. Finds where the four rings are.
 * **B, cut** — a fine sweep *across* the face at each ring. Every sensor gets
@@ -1527,6 +1705,9 @@ Each pose is three passes, and they do different jobs:
   |B| has no maximum in that direction, so there is no peak to find; what it
   measures is the distance itself, which is the last error the plane can't
   reach.
+
+**Axial only** runs pass A alone — the original routine, and the right choice
+when only the tube axis is motorised.
 
 You do not have to park perfectly. Finding each peak is what pass B is for —
 that is most of the point of it.
@@ -3424,7 +3605,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.stages is not None:
             try:
                 errors = self.stages.emergency_stop(reason)
-            except Exception as exc:                    # noqa: BLE001
+            except Exception as exc:
                 errors = [f"{type(exc).__name__}: {exc}"]
         stopped = self._abort_motion_workers()
         self._refresh_estop_ui()
@@ -5095,7 +5276,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ev.ignore()
                 return
             self.trigger_estop("the window was closed while a job was running")
-        for w in list(self._motion_workers) + [self._stage_worker]:
+        for w in [*self._motion_workers, self._stage_worker]:
             if _is_running(w):
                 # Bounded: a worker wedged inside a DLL call must not stop the
                 # window closing, or the only way out is Task Manager -- which
