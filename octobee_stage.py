@@ -745,6 +745,19 @@ class Stage:
                 f"inside {lo:g}..{hi:g} mm")
         return (want_lo, want_hi)
 
+    @property
+    def limit_declared(self):
+        """True if stages.json states this axis's envelope, whatever it says.
+
+        Distinct from "the envelope is smaller than the travel", and the
+        difference is the whole point. An axis with no limit_mm has never been
+        considered; an axis whose limit_mm is the full travel has been measured
+        and found unobstructed. Both allow exactly the same movement, and only
+        one of them is a decision -- so only one of them should still be
+        nagging the operator at every connect.
+        """
+        return self._limit_cfg is not None
+
     # ---- position trust ----
 
     @property
@@ -970,6 +983,7 @@ class Stage:
             "distrust_reason": self.distrust_reason,
             "travel_mm": self.travel_mm,
             "limit_mm": self.limit_mm,
+            "limit_declared": self.limit_declared,
             "interlocked": self.interlock.tripped,
             "status": bits,
             "flags": self.status_flags(bits),
@@ -1698,10 +1712,13 @@ def _cmd_status(a):
                 envelope += (f"  (soft limit inside a "
                              f"{snap['travel_mm'][0]:g}.."
                              f"{snap['travel_mm'][1]:g} mm travel)")
+            elif snap["limit_declared"]:
+                envelope += ("  -- the whole travel, declared: this axis has "
+                             "been checked and has nothing in its way")
             else:
-                envelope += ("  -- THE WHOLE TRAVEL: no soft limit is set for "
-                             "this axis, so nothing but the limit switches "
-                             "stops it short of the fixture")
+                envelope += ("  -- THE WHOLE TRAVEL, and no envelope has been "
+                             "declared for this axis, so nothing but the limit "
+                             "switches stops it short of the fixture")
             print(envelope)
             if not snap["trusted"]:
                 print(f"      absolute moves REFUSED: {snap['distrust_reason']}")

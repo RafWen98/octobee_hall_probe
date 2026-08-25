@@ -259,7 +259,7 @@ def measure_settle(stages, axis, distance_mm, hosts, cal, probe_s=0.25,
 
 def run_scan(hosts, stages, grid, seconds, cal, settle_s=DEFAULT_SETTLE_S,
              chunk_s=None, drain_s=0.0, progress=None, should_abort=None,
-             log=print):
+             extra_meta=None, log=print):
     """Visit every point in `grid`, averaging `seconds` at each.
 
     hosts        the carriers, as octobee uses them
@@ -268,6 +268,11 @@ def run_scan(hosts, stages, grid, seconds, cal, settle_s=DEFAULT_SETTLE_S,
     cal          octobee_cal.Calibration, for the V/T scaling
     progress     callback(i, n, point, row, stats) after each point
     should_abort callback() -> bool, polled before each move and each capture
+    extra_meta   merged into the map's sidecar, for whatever the caller knows
+                 about the world that this module does not -- which coils were
+                 energised, where the probe was bolted into the machine. It
+                 cannot overwrite anything measured here: the keys this
+                 function sets win.
 
     The live stream must already be released and the carriers back on their own
     clock before calling this -- capture_pose takes over the stream itself, and
@@ -404,6 +409,9 @@ def run_scan(hosts, stages, grid, seconds, cal, settle_s=DEFAULT_SETTLE_S,
         "uncorrected": ("VCM subtracted and scaled by nominal V/T only -- no "
                         "tare, no gain trim, no matrix"),
     }
+    # Under, not over: a caller passing a key this function also sets must not
+    # be able to relabel the measurement itself.
+    meta = {**dict(extra_meta or {}), **meta}
     if not rows:
         return FieldMap(np.zeros((0, len(grid.names))),
                         np.zeros((0, len(grid.names))),

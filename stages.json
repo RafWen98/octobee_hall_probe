@@ -6,13 +6,16 @@
   },
   "frame": {
     "x": {
-      "invert": false
+      "invert": false,
+      "limit_mm": [0.0, 300.0]
     },
     "z": {
-      "invert": true
+      "invert": true,
+      "limit_mm": [0.0, 300.0]
     },
     "y": {
-      "invert": false
+      "invert": false,
+      "limit_mm": [0.0, 300.0]
     }
   },
   "home_order": [

@@ -38,6 +38,7 @@ import octobee_record as orec
 import octobee_scan as oscan
 import octobee_stage as ostage
 import octobee_help as ohelp
+import octobee_machine as omach
 import octobee_magcal as omag
 import probe_geometry as pgeom
 import itertools
@@ -714,6 +715,394 @@ def test_posecap():
 
 
 # --------------------------------------------------------------------------
+# the coil set the probe measures inside
+# --------------------------------------------------------------------------
+
+def _simsopt_file(path, radius=1.0, shift=0.25):
+    """A SIMSON file with two coils and two current configurations.
+
+    Written by hand rather than by simsopt, which is the point: the reader in
+    octobee_machine parses this format itself, so the test has to be able to
+    state exactly what is in the file. Two circles of known radius, one of them
+    reached through a RotatedCurve, and the SAME two curves used by both
+    BiotSavart objects with different currents -- which is the arrangement that
+    would turn two physical coils into four if the de-duplication broke.
+    """
+    def circle(name, r, z):
+        # A circle of radius r at height z: x = r cos(2 pi t), y = r sin(2 pi t)
+        return {"@module": "simsopt.geo.curvexyzfourier",
+                "@class": "CurveXYZFourier", "@name": name,
+                "quadpoints": {"@module": "numpy", "@class": "array",
+                               "dtype": "float64",
+                               "data": list(np.linspace(0, 1, 32, endpoint=False))},
+                "order": 1, "dofs": {"$type": "ref", "value": f"dofs_{name}"}}, {
+            "@module": "simsopt._core.optimizable", "@class": "DOFs",
+            "@name": f"dofs_{name}",
+            "x": {"@module": "numpy", "@class": "array", "dtype": "float64",
+                  "data": [0.0, 0.0, r,        # xc(0), xs(1), xc(1)
+                           0.0, r, 0.0,        # yc(0), ys(1), yc(1)
+                           z, 0.0, 0.0]},      # zc(0), zs(1), zc(1)
+            "names": ["xc(0)", "xs(1)", "xc(1)",
+                      "yc(0)", "ys(1)", "yc(1)",
+                      "zc(0)", "zs(1)", "zc(1)"],
+            "free": {"@module": "numpy", "@class": "array", "dtype": "bool",
+                     "data": [True] * 9},
+            "lower_bounds": {"@module": "numpy", "@class": "array",
+                             "dtype": "float64", "data": [-1e30] * 9},
+            "upper_bounds": {"@module": "numpy", "@class": "array",
+                             "dtype": "float64", "data": [1e30] * 9}}
+
+    objs = {}
+    for name, r, z in (("CurveXYZFourier1", radius, 0.0),
+                       ("CurveXYZFourier2", radius, shift)):
+        curve, dofs = circle(name, r, z)
+        objs[name] = curve
+        objs[f"dofs_{name}"] = dofs
+    # The second coil is reached through a rotation, as a real file does it.
+    objs["RotatedCurve1"] = {"@module": "simsopt.geo.curve",
+                             "@class": "RotatedCurve", "@name": "RotatedCurve1",
+                             "curve": {"$type": "ref",
+                                       "value": "CurveXYZFourier2"},
+                             "phi": 0.0, "flip": False}
+    for i, amps in enumerate((100.0, 250.0, 7.0, -3.0), start=1):
+        objs[f"Current{i}"] = {
+            "@module": "simsopt.field.coil", "@class": "Current",
+            "@name": f"Current{i}", "current": amps,
+            "dofs": {"$type": "ref", "value": f"dofs_Current{i}"}}
+        objs[f"dofs_Current{i}"] = {
+            "@module": "simsopt._core.optimizable", "@class": "DOFs",
+            "@name": f"dofs_Current{i}",
+            "x": {"@module": "numpy", "@class": "array", "dtype": "float64",
+                  "data": [amps]},
+            "names": ["x0"],
+            "free": {"@module": "numpy", "@class": "array", "dtype": "bool",
+                     "data": [True]}}
+    # One of them is scaled, because most real files scale every current.
+    objs["ScaledCurrent1"] = {"@module": "simsopt.field.coil",
+                              "@class": "ScaledCurrent",
+                              "@name": "ScaledCurrent1",
+                              "current_to_scale": {"$type": "ref",
+                                                   "value": "Current1"},
+                              "scale": 10.0}
+    curves = ["CurveXYZFourier1", "RotatedCurve1"]
+    currents = ["ScaledCurrent1", "Current2", "Current3", "Current4"]
+    for i in range(4):
+        objs[f"Coil{i + 1}"] = {"@module": "simsopt.field.coil",
+                                "@class": "Coil", "@name": f"Coil{i + 1}",
+                                "curve": {"$type": "ref",
+                                          "value": curves[i % 2]},
+                                "current": {"$type": "ref",
+                                            "value": currents[i]}}
+    for i, coils in enumerate((["Coil1", "Coil2"], ["Coil3", "Coil4"]), start=1):
+        objs[f"BiotSavart{i}"] = {
+            "@module": "simsopt.field.biotsavart", "@class": "BiotSavart",
+            "@name": f"BiotSavart{i}",
+            "coils": [{"$type": "ref", "value": c} for c in coils]}
+    doc = {"@module": "simsopt._core.json", "@class": "SIMSON",
+           "@version": "1.8.4.test", "graph": [], "simsopt_objs": objs}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    return path
+
+
+def test_machine_coils(workdir):
+    """Reading a coil set, and the volume it takes up."""
+    print("\ncoil set")
+    path = _simsopt_file(os.path.join(workdir, "coils.json"))
+    coils = omach.CoilSet.load(path)
+
+    check("two BiotSavart objects over the same curves are two coils, "
+          "not four", len(coils) == 2, f"{len(coils)} coils")
+    check("both current configurations are offered",
+          coils.configurations == ["BiotSavart1", "BiotSavart2"],
+          str(coils.configurations))
+    # 100 A through a x10 ScaledCurrent.
+    check("a scaled current is resolved through the scale",
+          abs(coils["C1"].currents["BiotSavart1"] - 1000.0) < 1e-9,
+          f"{coils['C1'].currents['BiotSavart1']} A")
+    check("the same coil carries a different current in the other "
+          "configuration",
+          abs(coils["C1"].currents["BiotSavart2"] - 7.0) < 1e-9,
+          f"{coils['C1'].currents['BiotSavart2']} A")
+
+    # The file is in metres and everything downstream is in millimetres. A
+    # factor of a thousand here would put the probe a millimetre from a coil
+    # that is really a metre away, and the drawing would look plausible.
+    r = np.hypot(coils["C1"].points_mm[:, 0], coils["C1"].points_mm[:, 1])
+    check("metres become millimetres at the boundary",
+          np.allclose(r, 1000.0, atol=1e-6), f"radius {r.mean():.3f} mm")
+    check("the centreline comes back closed",
+          np.allclose(coils["C1"].points_mm[0], coils["C1"].points_mm[-1]))
+    check("a circle's length is 2 pi r",
+          abs(coils["C1"].length_mm - 2 * np.pi * 1000.0) < 1.0,
+          f"{coils['C1'].length_mm:.1f} mm")
+    check("the second coil is where the rotation put it",
+          abs(coils["C2"].centroid_mm[2] - 250.0) < 1e-6,
+          f"z {coils['C2'].centroid_mm[2]:.1f} mm")
+
+    verts, faces = omach.tube_mesh(coils["C1"].points_mm, 20.0, sides=8)
+    n = len(coils["C1"].points_mm) - 1
+    d = np.linalg.norm(verts.reshape(n, 8, 3)
+                       - coils["C1"].points_mm[:-1][:, None, :], axis=2)
+    check("the swept cross-section really is the radius asked for",
+          np.allclose(d, 20.0, atol=1e-3), f"{d.min():.4f}..{d.max():.4f} mm")
+    edges = {}
+    for tri in faces:
+        for i in range(3):
+            a, b = int(tri[i]), int(tri[(i + 1) % 3])
+            key = (min(a, b), max(a, b))
+            edges[key] = edges.get(key, 0) + 1
+    check("the tube closes on itself, with no seam and no cap",
+          set(edges.values()) == {2},
+          f"edge counts {sorted(set(edges.values()))}")
+
+    # ---- clearance, against an answer worked out by hand ----
+    # A point on the axis of a circle of radius R, at height h, is
+    # sqrt(R^2 + h^2) from the wire.
+    probe = np.array([[0.0, 0.0, 300.0]])
+    gap = omach.clearance(probe, coils, 20.0, labels=["C1"])
+    want = np.hypot(1000.0, 300.0) - 20.0
+    # The coil is a polygon through points on the curve, so it lies just
+    # inside it: a 256-sided ring of radius 1 m cuts the corner by 75 um. The
+    # answer must be short by that and no more -- the module claims a chord
+    # error well under a tenth of a millimetre, and this is the claim.
+    sag = 1000.0 * (1.0 - np.cos(np.pi / omach.CURVE_POINTS))
+    check("clearance is measured to the winding surface, not the centreline",
+          -sag <= gap.gap_mm - want <= 0.0,
+          f"{gap.gap_mm:.4f} vs {want:.4f} mm, chord error {sag * 1000:.0f} um")
+    check("and it names the coil it measured to", gap.coil == "C1", gap.coil)
+    check("the closest point it reports is on that coil",
+          abs(np.hypot(*gap.coil_point[:2]) - 1000.0) <= sag + 1e-9
+          and abs(gap.coil_point[2]) < 1e-9, str(gap.coil_point))
+
+    inside = np.array([[1000.0, 0.0, 5.0]])
+    gap = omach.clearance(inside, coils, 20.0)
+    check("a point inside a winding is reported as a collision",
+          gap.collides and abs(gap.gap_mm + 15.0) < 1e-6, gap.text())
+
+    # A coil that is switched off is still in the way: clearance takes no
+    # notice of which ones are energised.
+    both = omach.clearance(np.array([[0.0, 0.0, 249.0]]), coils, 20.0)
+    check("clearance considers coils that are switched off",
+          both.coil == "C2", both.text())
+
+    # The two-pass narrowing inside clearance() is an optimisation, and an
+    # optimisation that changes the answer is a bug. Check it against the
+    # definition on a cloud of random points.
+    rng = np.random.default_rng(4)
+    cloud = rng.uniform(-1400, 1400, size=(400, 3))
+    fast = omach.clearance(cloud, coils, 20.0)
+    slow = np.inf
+    for coil in coils:
+        a, b = coil.points_mm[:-1], coil.points_mm[1:]
+        ab = b - a
+        for q in cloud:
+            ap = q - a
+            t = np.clip((ap * ab).sum(1) / (ab * ab).sum(1), 0.0, 1.0)
+            slow = min(slow, np.linalg.norm(ap - t[:, None] * ab,
+                                            axis=1).min())
+    check("narrowing the search does not change the answer",
+          abs(fast.gap_mm - (slow - 20.0)) < 1e-9,
+          f"{fast.gap_mm:.9f} vs {slow - 20.0:.9f} mm")
+
+    # ---- the probe body ----
+    geom = pgeom.Geometry()
+    cloud = omach.probe_cloud(geom)
+    reach = np.linalg.norm(cloud, axis=1).max()
+    check("the probe cloud covers the whole body, arms included",
+          reach > geom.fsv_radius_mm, f"reaches {reach:.1f} mm")
+    # Corners alone would miss a coil brushing the middle of the tube.
+    along = np.unique(np.round(cloud[:, 1], 3))
+    check("and it samples along the tube rather than only its ends",
+          len(along) > 20, f"{len(along)} distinct stations along the tube")
+
+
+def test_machine_placement(workdir):
+    """The transform that says where the probe is, and what it remembers."""
+    print("\nprobe placement")
+    pose = omach.Placement(x_mm=100.0, y_mm=200.0, z_mm=-50.0)
+    check("with no rotation the flange is where it was put",
+          np.allclose(pose.origin_mm(), [100.0, 200.0, -50.0]))
+
+    # The stages move the probe along the RIG's axes. Turn the assembly a
+    # quarter turn about the machine's Z and driving rig x must move it along
+    # machine y -- if it moved along machine x regardless, the drawing would
+    # be wrong in exactly the way nobody would notice until the head hit
+    # something.
+    pose = omach.Placement(yaw_deg=90.0)
+    moved = pose.origin_mm({"x": 10.0, "y": 0.0, "z": 0.0})
+    check("a stage move is applied in the rig's frame, not the machine's",
+          np.allclose(moved, [0.0, 10.0, 0.0], atol=1e-9), str(moved))
+
+    pose = omach.Placement(x_mm=5.0, stage_zero_mm={"x": 100.0})
+    check("the stage zero is where the pose says the probe is",
+          np.allclose(pose.origin_mm({"x": 100.0}), [5.0, 0.0, 0.0]))
+    check("and moving off it moves the probe by the difference",
+          np.allclose(pose.origin_mm({"x": 130.0}), [35.0, 0.0, 0.0]))
+
+    # Yaw is applied last, so whatever pitch and roll have already done to the
+    # assembly, changing yaw turns THAT about the machine's Z. Stated as the
+    # identity it has to satisfy rather than as one vector's image, because
+    # the vector could come out right for a rotation composed the other way.
+    tilted = omach.Placement(pitch_deg=20.0, roll_deg=90.0).rotation()
+    turned = omach.Placement(yaw_deg=35.0, pitch_deg=20.0,
+                             roll_deg=90.0).rotation()
+    rz = omach.rotation_matrix(35.0, 0.0, 0.0)
+    check("yaw turns the assembly about the machine's Z, whatever it is doing",
+          np.allclose(turned, rz @ tilted, atol=1e-12),
+          f"largest disagreement {np.abs(turned - rz @ tilted).max():.2e}")
+
+    corners = omach.Placement(travel_mm={"x": (0.0, 300.0),
+                                         "y": (0.0, 100.0),
+                                         "z": (0.0, 50.0)}).reach_corners_mm()
+    span = corners.max(axis=0) - corners.min(axis=0)
+    check("the stage envelope is the travel of each axis",
+          np.allclose(span, [300.0, 100.0, 50.0]), str(span))
+
+    # ---- persistence ----
+    path = os.path.join(workdir, "machine_cfg.json")
+    coil_path = _simsopt_file(os.path.join(workdir, "coils2.json"))
+    cfg = omach.MachineConfig(coil_file=coil_path, coil_radius_mm=12.5,
+                              configuration="BiotSavart2", current_scale=0.01,
+                              energised=["C2"], track_stage=False)
+    cfg.pose = omach.Placement(x_mm=1.5, yaw_deg=30.0,
+                               stage_zero_mm={"y": 12.0})
+    cfg.save(path)
+    back = omach.MachineConfig.load(path)
+    check("the placement survives a save and a load",
+          (back.coil_radius_mm == 12.5 and back.configuration == "BiotSavart2"
+           and back.energised == ["C2"] and back.track_stage is False
+           and abs(back.pose.yaw_deg - 30.0) < 1e-9
+           and abs(back.pose.stage_zero_mm["y"] - 12.0) < 1e-9),
+          json.dumps(back.to_dict())[:120])
+
+    coils = omach.CoilSet.load(coil_path)
+    check("the saved scale is applied to the file's currents",
+          abs(back.current(coils["C2"]) - (-3.0 * 0.01)) < 1e-12,
+          f"{back.current(coils['C2'])} A")
+
+    # A file naming coils or a configuration this coil set does not have is
+    # the case that must not silently produce a switch for nothing.
+    stale = omach.MachineConfig(coil_file=coil_path,
+                                configuration="BiotSavart9",
+                                energised=["C1", "C9"])
+    lost = stale.adopt(coils)
+    check("a configuration that is not in the file is dropped, and said so",
+          stale.configuration == "BiotSavart1" and len(lost) == 2, str(lost))
+    check("so is a coil that is not in the file",
+          stale.energised == ["C1"], str(stale.energised))
+
+    fresh = omach.MachineConfig(coil_file=coil_path)
+    fresh.adopt(coils)
+    check("a placement that has never chosen starts with every coil on",
+          fresh.energised == ["C1", "C2"], str(fresh.energised))
+
+    # ---- what a field map carries away with it ----
+    meta = back.to_scan_meta(coils, {"x": 10.0, "y": 0.0, "z": 0.0})
+    check("a map records which coils were on and at what current",
+          meta["coils"]["C2"]["on"] is True
+          and meta["coils"]["C1"]["on"] is False
+          and abs(meta["coils"]["C2"]["amp_turns"] + 0.03) < 1e-12,
+          json.dumps(meta["coils"]))
+    check("and where the probe was, in machine coordinates",
+          "probe_origin_mm" in meta and meta["pose"]["yaw_deg"] == 30.0,
+          str(meta.get("probe_origin_mm")))
+    check("and which file the coils came from",
+          os.path.samefile(meta["coil_file"], coil_path), meta["coil_file"])
+
+    # The route this metadata takes into a saved map. A rename here would
+    # leave the GUI passing a keyword nothing reads, and the map would come
+    # back with no machine in it and no complaint from anything.
+    params = inspect.signature(oscan.run_scan).parameters
+    check("run_scan still takes the metadata a map is annotated with",
+          "extra_meta" in params, ", ".join(params))
+
+    missing = omach.MachineConfig.load_or_default(
+        os.path.join(workdir, "not_here.json"))
+    check("a missing placement file is not an error",
+          missing.coil_file == "" and missing.energised is None)
+    problems = []
+    with open(os.path.join(workdir, "broken.json"), "w",
+              encoding="utf-8") as f:
+        f.write("{not json")
+    omach.MachineConfig.load_or_default(
+        os.path.join(workdir, "broken.json"), on_error=problems.append)
+    check("a placement file that will not parse is reported, not swallowed",
+          len(problems) == 1, str(problems))
+    check("and a coil file that will not parse is too",
+          omach.CoilSet.load_or_none(os.path.join(workdir, "broken.json"),
+                                     on_error=problems.append) is None
+          and len(problems) == 2, str(problems[-1:]))
+
+
+def test_machine_tab(app, workdir):
+    """The Machine tab, driven the way a person drives it."""
+    print("\nmachine tab")
+    coil_path = _simsopt_file(os.path.join(workdir, "tab_coils.json"))
+    cfg_path = os.path.join(workdir, "tab_machine.json")
+    omach.MachineConfig(coil_file=coil_path, coil_radius_mm=20.0,
+                        energised=["C1", "C2"]).save(cfg_path)
+
+    ns = argparse.Namespace(
+        uut=None, demo=True, replay=None, no_connect=True,
+        geometry=os.path.join(workdir, "tab_geom.json"),
+        calibration=os.path.join(workdir, "tab_cal.json"),
+        machine=cfg_path,
+        out_dir=os.path.join(workdir, "tabcaps"),
+        screenshot=None, screenshot_tab=0, screenshot_warmup=0)
+    win = gui.MainWindow(ns)
+    try:
+        titles = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+        check("the window has a Machine tab", "Machine" in titles, str(titles))
+        check("the coil file named in the placement is loaded on startup",
+              win.coils is not None and len(win.coils) == 2,
+              "nothing loaded" if win.coils is None else win.coils.note)
+        check("every coil is listed", win.tbl_coils.rowCount() == 2,
+              f"{win.tbl_coils.rowCount()} rows")
+
+        # Switch a coil off through the table, as a click does.
+        item = win.tbl_coils.item(0, 0)
+        item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        check("unticking a coil switches it off",
+              win.machine.energised == ["C2"], str(win.machine.energised))
+        check("and the view is told",
+              win.machine_view.energised == {"C2"},
+              str(win.machine_view.energised))
+
+        # A coil that is off is still solid: putting the probe on top of the
+        # coil that was just switched off must still report a collision.
+        on_coil = win.coils["C1"].points_mm[0]
+        for attr, value in zip(("x_mm", "y_mm", "z_mm"), on_coil):
+            win.machine_pose_spins[attr].setValue(float(value))
+        win.refresh_machine(force=True)
+        check("driving the probe onto a switched-off coil still collides",
+              "INSIDE" in win.lbl_clearance.text(), win.lbl_clearance.text())
+
+        win.machine_pose_spins["x_mm"].setValue(float(on_coil[0]) + 4000.0)
+        win.refresh_machine(force=True)
+        check("and moving it away again clears",
+              "clear of" in win.lbl_clearance.text(),
+              win.lbl_clearance.text())
+
+        # The pose the tab is showing is the pose that gets written down.
+        win.on_machine_save()
+        saved = omach.MachineConfig.load(cfg_path)
+        check("Save writes the pose that is on screen",
+              abs(saved.pose.x_mm - (on_coil[0] + 4000.0)) < 1e-6
+              and saved.energised == ["C2"],
+              f"{saved.pose.x_mm:.1f} mm, {saved.energised}")
+
+        # What a field map would carry, built the way on_scan_start builds it.
+        meta = win.machine.to_scan_meta(win.coils, None)
+        check("a map started now would record the machine around it",
+              meta["summary"].startswith("1/2 coils energised"),
+              meta["summary"])
+    finally:
+        win.close()
+        app.processEvents()
+
+
+# --------------------------------------------------------------------------
 # stages and motorised field maps -- no hardware required
 # --------------------------------------------------------------------------
 
@@ -1025,6 +1414,18 @@ def test_stage_safety():
     check("the envelope survives the reversed-axis frame",
           lim.limit_mm == (30.0, 200.0) and lim.travel_mm == (0.0, 300.0),
           f"limit {lim.limit_mm}, travel {lim.travel_mm}")
+
+    # "Declared as the whole travel" and "never configured" allow exactly the
+    # same movement and are not the same thing: one is a measurement, the
+    # other is a gap. Only the gap should still be warning about itself.
+    bare = _framed("x", False)
+    check("an axis with no limit_mm says so", not bare.limit_declared)
+    told = _framed("x", False)
+    told._limit_cfg = (0.0, 300.0)
+    told._resolve_frame()
+    check("an axis declared as its whole travel is still declared",
+          told.limit_declared and told.limit_mm == told.travel_mm,
+          f"limit {told.limit_mm}, travel {told.travel_mm}")
 
 
 def test_stage_home_order(workdir):
@@ -1703,6 +2104,7 @@ def test_scan_survives_failures(workdir):
             self.name, self.serial, self.homed = name, "45000000", True
             self.position_trusted, self.distrust_reason = True, None
             self.limit_mm = (0.0, 300.0)
+            self.limit_declared = True
 
         def frame_note(self):
             return "as mounted"
@@ -2284,6 +2686,10 @@ def test_gui_estop(app, workdir):
             self.name, self.serial, self.model = name, "45000000", "LTS300C"
             self.homed, self.invert, self.is_open = True, False, True
             self.travel_mm = self.limit_mm = (0.0, 300.0)
+            self.limit_declared = True
+            # An envelope stated is an envelope declared: this double has one,
+            # so it must answer the question the window asks at connect.
+            self.limit_declared = True
             self.stopped = 0
 
         @property
@@ -2336,6 +2742,7 @@ def test_gui_estop(app, workdir):
         uut=None, demo=True, replay=None, no_connect=True,
         geometry=os.path.join(workdir, "estop_geom.json"),
         calibration=os.path.join(workdir, "estop_cal.json"),
+        machine=os.path.join(workdir, "estop_machine.json"),
         out_dir=os.path.join(workdir, "estopcaps"),
         screenshot=None, screenshot_tab=0, screenshot_warmup=0)
     win = gui.MainWindow(ns)
@@ -2452,6 +2859,8 @@ def test_magnet_wizard_reopens(app, workdir):
             self.homed, self.invert = True, False
             self.travel_mm = (0.0, 300.0)
             self.limit_mm = (0.0, 300.0)
+            self.limit_declared = True
+            self.limit_declared = True
             self.position_trusted, self.distrust_reason = True, None
 
         @property
@@ -2487,6 +2896,7 @@ def test_magnet_wizard_reopens(app, workdir):
         uut=None, demo=True, replay=None, no_connect=True,
         geometry=os.path.join(workdir, "reopen_geom.json"),
         calibration=os.path.join(workdir, "reopen_cal.json"),
+        machine=os.path.join(workdir, "reopen_machine.json"),
         out_dir=os.path.join(workdir, "reopencaps"),
         screenshot=None, screenshot_tab=0, screenshot_warmup=0)
     win = gui.MainWindow(ns)
@@ -2606,7 +3016,8 @@ def test_magnet_wizard_saves(app, workdir):
 
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, geometry=geom_path,
-        calibration=cal_path, out_dir=os.path.join(workdir, "wizcaps"),
+        calibration=cal_path, machine=os.path.join(workdir, "wiz_machine.json"),
+        out_dir=os.path.join(workdir, "wizcaps"),
         screenshot=None, screenshot_tab=0, screenshot_warmup=0,
         no_connect=True)
     win = gui.MainWindow(ns)
@@ -2706,6 +3117,7 @@ def test_autoconnect(app, workdir):
             uut=None, demo=False, replay=None,
             geometry=os.path.join(workdir, "probe_geometry.json"),
             calibration=os.path.join(workdir, "calibration.json"),
+            machine=os.path.join(workdir, "machine.json"),
             out_dir=os.path.join(workdir, "captures"),
             screenshot=None, screenshot_tab=0, screenshot_warmup=0,
             no_connect=False)
@@ -2780,6 +3192,7 @@ def test_app(app, args, workdir):
         uut=None, demo=not (args.replay or args.live), replay=args.replay,
         geometry=os.path.join(workdir, "probe_geometry.json"),
         calibration=os.path.join(workdir, "calibration.json"),
+        machine=os.path.join(workdir, "machine.json"),
         # Into the temp dir, not captures/. A test run used to leave ~9 MB of
         # synthetic recordings, reports and health CSVs in the real capture
         # directory, named identically to the bench data beside them and
@@ -3197,12 +3610,15 @@ def main():
         test_magnet_persistence(workdir)
         test_magnet_plane_persistence(workdir)
         test_stage_frame_persistence(workdir)
+        test_machine_coils(workdir)
+        test_machine_placement(workdir)
         test_crash_handler(workdir)
         test_gui_estop(app, workdir)
         test_magnet_wizard_reopens(app, workdir)
         test_live_plot_reset(app, workdir)
         test_magnet_wizard_saves(app, workdir)
         test_autoconnect(app, workdir)
+        test_machine_tab(app, workdir)
         test_app(app, args, workdir)
 
     print(f"\n{CHECKS - len(FAILS)}/{CHECKS} checks passed")
