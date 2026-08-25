@@ -38,7 +38,7 @@ modules they import only exist on the carrier.
 
 The part of them that matters most is checked anyway. Both files duplicate
 octobee's gain tables, and a drift between the two would silently rescale every
-field the probe reports. `selftest.test_gain_tables()` reads the tables straight
+field the probe reports. `tests/test_onbox.py` reads the tables straight
 out of these files and compares them against octobee's own `GAIN_TO_RANGE`.
 
 `rc.user/` is excluded from linting entirely — it is captured vendor boot

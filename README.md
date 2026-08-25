@@ -1191,9 +1191,9 @@ entirely reasonable and are uniformly wrong.
 | `octobee/profile.py` | PC | span timing, event-loop lag and GL renderer detection behind `--profile` |
 | `octobee_launch.pyw` | PC | what the desktop icon runs: no console, but startup failures still reported in a native dialog |
 | `octobee.ico` | PC | application icon |
-| `selftest.py` | PC | end-to-end verification, offline or against the hardware. 454 checks; the quality gate |
+| `tests/` | PC | end-to-end verification, offline or against the hardware. 41 tests, 458 checks; the quality gate |
 | `pyproject.toml` | PC | packaging and the ruff lint configuration, with a reason beside every rule that is switched off |
-| `.github/workflows/checks.yml` | CI | runs `ruff check` and `selftest.py` on every push |
+| `.github/workflows/checks.yml` | CI | runs `ruff check` and `pytest` on every push |
 
 The command-line tools need only `numpy` and `matplotlib`. The GUI additionally
 needs `PyQt6`, `pyqtgraph` and `PyOpenGL` — `pip install -r requirements.txt`.
@@ -1453,7 +1453,7 @@ In practice:
   rather than metrology until someone puts a known field on it;
 - a wrong range setting is **invisible**: it simply rescales the affected
   sensors, and nothing on screen looks wrong. That is why `calibration.json`
-  carries the audited registers, and why the selftest asserts them.
+  carries the audited registers, and why the suite asserts them.
 
 A corollary worth remembering: **a raw capture stores counts, not field.**
 Reading one back needs the gain the chips were running at the time, and that
@@ -1606,9 +1606,13 @@ single stage above 6%.
 ### Verifying it still works
 
 ```bash
-python selftest.py                     # synthetic probe, no hardware
-python selftest.py --replay captures/ambient_test.npz
-python selftest.py --live              # against the real carriers
+pytest                                 # synthetic probe, no hardware
+pytest --replay captures/ambient_test.npz
+pytest --live                          # against the real carriers
+
+pytest -k stage                        # just the stage tests
+pytest -x                              # stop at the first failure
+pytest tests/gui -q                    # just the ones that drive the window
 ```
 
 It drives the whole pipeline and then reads the written files back to check the
@@ -1623,7 +1627,7 @@ CI fails if the working tree comes back dirty. Run the linter alongside it:
 ```bash
 pip install -e ".[gui,dev]"
 ruff check .                           # config and reasons in pyproject.toml
-python selftest.py
+pytest
 ```
 
 Both run on every push via `.github/workflows/checks.yml`. `pyproject.toml`

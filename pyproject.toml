@@ -45,14 +45,20 @@ gui = [
     "pyqtgraph>=0.13",
     "PyOpenGL>=3.1",
 ]
-dev = ["ruff>=0.6"]
+dev = ["ruff>=0.6", "pytest>=8.0"]
+
+[tool.pytest.ini_options]
+# rootdir-relative imports, so `from tests.helpers import check` works whether
+# pytest is run from the checkout or from anywhere else.
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.ruff]
 line-length = 88
 target-version = "py310"
 # The on-box scripts run on the carrier against a vendor library that is not
 # installed here, so they cannot be import-checked from this machine. Their
-# gain tables ARE checked, by selftest.test_gain_tables().
+# gain tables ARE checked, by tests/test_onbox.py.
 extend-exclude = ["fw_backup_*", "onbox/rc.user"]
 
 [tool.ruff.lint]
@@ -101,5 +107,6 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # The Qt event-loop entry points genuinely need a few long argument lists.
 "src/octobee/gui/window.py" = ["PLR0913"]
-# Test names read as sentences and the file is one long script by design.
-"selftest.py" = ["PLR0915"]
+# Test names read as sentences, and a test that asserts thirty things
+# about one calibration run is doing its job, not sprawling.
+"tests/**" = ["PLR0915"]
