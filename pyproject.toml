@@ -28,6 +28,16 @@ dependencies = [
     "matplotlib>=3.7",
 ]
 
+[project.scripts]
+# One command with the instruments under it. `octobee` on its own lists them.
+octobee = "octobee.cli.main:main"
+
+[project.gui-scripts]
+# gui-scripts, not scripts: on Windows this builds an entry point that runs
+# under pythonw.exe, so the desktop shortcut opens the window without a console
+# behind it. That is the whole reason octobee_launch.pyw existed.
+octobee-gui = "octobee.gui.app:main"
+
 [project.optional-dependencies]
 # The GUI. The command-line tools need none of this.
 gui = [

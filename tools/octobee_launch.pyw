@@ -2,8 +2,11 @@
 """
 octobee_launch.pyw -- what the desktop icon runs.
 
-Why this exists rather than pointing the shortcut straight at the GUI
---------------------------------------------------------------------
+Why this exists rather than pointing the shortcut straight at octobee-gui
+------------------------------------------------------------------------
+`pip install -e .` now builds octobee-gui.exe, which already runs under
+pythonw with no console, so the shortcut can point at that instead and most of
+the time should. What that entry point cannot do is tell you why it failed.
 A .pyw runs under pythonw.exe, which has no console. That is what you want for
 a desktop application -- but it also means anything that fails before the
 window opens fails *silently*: no traceback, no window, nothing. Missing PyQt6,

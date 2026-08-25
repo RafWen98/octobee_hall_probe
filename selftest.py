@@ -18,6 +18,7 @@ import argparse
 import ast
 import csv
 import inspect
+import importlib
 import json
 import os
 import subprocess
@@ -32,6 +33,7 @@ from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.gui import window as gui
+from octobee.cli import main as cli
 from octobee.gui.crash import CrashHandler
 from octobee.gui.dialogs.magnet import MagnetWizard
 from octobee.gui.widgets.plot import LivePlot
@@ -2436,6 +2438,32 @@ def test_csv_quoting():
               rows[3][2] == "")
 
 
+def test_cli_commands():
+    """Every subcommand the front door advertises must actually be there.
+
+    The dispatcher names modules as strings, so a module that moves or a main()
+    that is renamed breaks a command that nothing else exercises -- and breaks
+    it at the moment someone types it, which is the worst time to find out.
+    """
+    print("\ncommand line")
+    check("the usage listing names every command",
+          all(name in cli._usage() for name in cli.COMMANDS),
+          str(sorted(cli.COMMANDS)))
+    missing = []
+    for name, (modname, _) in sorted(cli.COMMANDS.items()):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception as exc:
+            missing.append(f"{name}: {modname} will not import ({exc})")
+            continue
+        if not callable(getattr(mod, "main", None)):
+            missing.append(f"{name}: {modname} has no main()")
+    check(f"all {len(cli.COMMANDS)} subcommands resolve to a main()",
+          not missing, "; ".join(missing))
+    check("an unknown command is refused, not run",
+          cli.main(["definitely-not-a-command"]) == 2)
+
+
 def test_gain_tables():
     """The on-box scripts duplicate octobee's gain tables. Catch any drift."""
     print("\ngain table consistency")
@@ -3620,6 +3648,7 @@ def main():
     test_config_loading()
     test_csv_quoting()
     test_raw_survives_a_kill()
+    test_cli_commands()
     test_gain_tables()
     test_cross_calibration()
     test_shipped_calibration()
