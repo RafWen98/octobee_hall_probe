@@ -140,102 +140,92 @@ stages are addressed by serial number and assumed to be mounted forwards.
 import argparse
 import contextlib
 import ctypes as C
-import json
 import os
-import subprocess
 import sys
 import time
 
 from octobee import paths
-
-AXIS_CONFIG = "stages.json"
-
-# The install path is fixed by the Kinesis installer. Overridable because a
-# 32-bit install lands in Program Files (x86) and some sites relocate it.
-KINESIS_DIR = os.environ.get(
-    "KINESIS_DIR", r"C:\Program Files\Thorlabs\Kinesis")
-
-# Integrated Stepper Controllers: the LTS/MLJ/K10CR family. Serial prefix 45
-# is LongTravelStage, which is what the LTS300C reports.
-ISC_DLL = "Thorlabs.MotionControl.IntegratedStepperMotors.dll"
-ISC_PREFIX = "45"
-
-# ISC_GetRealValueFromDeviceUnit / ISC_GetDeviceUnitFromRealValue selector.
-UNIT_DISTANCE = 0
-UNIT_VELOCITY = 1
-UNIT_ACCELERATION = 2
-
-# Fallback scaling for the LTS300C, used only if the DLL's own unit conversion
-# fails (it needs ISC_LoadSettings to have succeeded first). Measured against
-# the device: axis max 122880000 du == 300.0 mm.
-DEFAULT_DU_PER_MM = 409600.0
-
-# Motion profile applied when a stage opens, unless stages.json says otherwise.
-# Kinesis's own 20 mm/s / 20 mm/s^2 puts every move longer than about 5 mm into
-# the motor's resonance band -- see the note at the top of this file.
-#
-# 6 mm/s is a BENCH RESULT, not a calculation. The first estimate was 8, on the
-# reasoning that a 5 mm jog already peaked at 10 mm/s and was quiet; that was
-# wrong, and wrong in an instructive way. A jog only touches its peak for an
-# instant, where a long absolute move sits at the cap for tens of seconds, and
-# it is the sustained tone that is objectionable. Brief peaks are a poor guide
-# to what a traverse will sound like. 8 was still audible on this rig, 6 is not.
-#
-# It is not free: a full 300 mm traverse goes from about 16 s at the shipped
-# settings to about 51 s. The acceleration is for the ramps rather than the top
-# speed, and is left where it is -- lowering it further would only make long
-# moves slower without changing the tone they settle at.
-DEFAULT_VEL_MM_S = 6.0
-DEFAULT_ACCEL_MM_S2 = 10.0
-
-# A hard ceiling on every commanded move, whatever a config file, a spin box or
-# a command line asks for. The default above is what the rig normally runs at;
-# this is the line it may not cross even when someone deliberately raises it.
-#
-# It exists because a velocity setting is not a promise. The controller keeps
-# its own stored settings and ISC_LoadSettings puts them back every time a
-# stage is opened -- so anything that opens a device outside this module (the
-# Kinesis application, a crashed process, a power cycle) leaves it at the
-# shipped 20 mm/s, and the next absolute move runs at that. The stages are
-# therefore given their profile again immediately before every move rather
-# than once when they are opened: one extra DLL call against a move that takes
-# seconds, in exchange for "the speed on screen is the speed it will use".
-MAX_VEL_MM_S = 10.0
-
-
-def clamp_velocity(mm_s):
-    """Whatever was asked for, capped at MAX_VEL_MM_S."""
-    return min(float(mm_s), MAX_VEL_MM_S)
-
-# Status word, from the header's GetStatusBits documentation. Only the bits
-# this module acts on or reports are named.
-STATUS_BITS = (
-    (0x00000001, "cw_hard_limit"),
-    (0x00000002, "ccw_hard_limit"),
-    (0x00000004, "cw_soft_limit"),
-    (0x00000008, "ccw_soft_limit"),
-    (0x00000010, "moving_cw"),
-    (0x00000020, "moving_ccw"),
-    (0x00000040, "jogging_cw"),
-    (0x00000080, "jogging_ccw"),
-    (0x00000100, "motor_connected"),
-    (0x00000200, "homing"),
-    (0x00000400, "homed"),
-    (0x00001000, "tracking"),
-    (0x00002000, "settled"),
-    (0x00004000, "motion_error"),
-    (0x01000000, "current_limit"),
-    (0x80000000, "enabled"),
+from octobee.motion.config import (
+    AXIS_CONFIG,
+    load_axis_frames,
+    load_axis_map,
+    load_axis_motion,
+    load_home_order,
+    save_axis_map,
+    save_axis_motion,
 )
-MOVING_MASK = 0x000002F0    # any of moving/jogging cw+ccw, or homing
-HOMED_BIT = 0x00000400
-MOTION_ERROR_BIT = 0x00004000
-ENABLED_BIT = 0x80000000
-HARD_LIMIT_MASK = 0x00000003    # either physical end-of-travel switch
+from octobee.motion.kinesis import (
+    DEFAULT_DU_PER_MM,
+    ENABLED_BIT,
+    HARD_LIMIT_MASK,
+    HOMED_BIT,
+    ISC_PREFIX,
+    KINESIS_DIR,
+    MOTION_ERROR_BIT,
+    MOVING_MASK,
+    STATUS_BITS,
+    TLI_HardwareInformation,
+    UNIT_ACCELERATION,
+    UNIT_DISTANCE,
+    UNIT_VELOCITY,
+    StageError,
+    device_info,
+    dll,
+    kinesis_is_running,
+    list_devices,
+)
+from octobee.motion.kinesis import check_rc as _check
+from octobee.motion.timing import (
+    DEFAULT_ACCEL_MM_S2,
+    DEFAULT_VEL_MM_S,
+    MAX_VEL_MM_S,
+    clamp_velocity,
+    move_time_s,
+    move_timeout_s,
+    peak_speed_mm_s,
+)
 
-
-class StageError(RuntimeError):
-    """Any failure talking to a stage, including a non-zero API return."""
+# Re-exported so that `stage.<anything>` keeps meaning what it meant before the
+# module was split. The names above are the module's public surface whether
+# they are defined here or next door, and every caller -- the GUI, the scanner,
+# the test suite -- was written against that surface.
+__all__ = [
+    "AXIS_CONFIG",
+    "DEFAULT_ACCEL_MM_S2",
+    "DEFAULT_DU_PER_MM",
+    "DEFAULT_VEL_MM_S",
+    "ENABLED_BIT",
+    "HARD_LIMIT_MASK",
+    "HOMED_BIT",
+    "ISC_PREFIX",
+    "KINESIS_DIR",
+    "MAX_VEL_MM_S",
+    "MOTION_ERROR_BIT",
+    "MOVING_MASK",
+    "STATUS_BITS",
+    "UNIT_ACCELERATION",
+    "UNIT_DISTANCE",
+    "UNIT_VELOCITY",
+    "MotionInterlock",
+    "MotionInterlocked",
+    "Stage",
+    "StageError",
+    "StageSet",
+    "clamp_velocity",
+    "device_info",
+    "dll",
+    "kinesis_is_running",
+    "list_devices",
+    "load_axis_frames",
+    "load_axis_map",
+    "load_axis_motion",
+    "load_home_order",
+    "move_time_s",
+    "move_timeout_s",
+    "peak_speed_mm_s",
+    "save_axis_map",
+    "save_axis_motion",
+]
 
 
 class MotionInterlocked(StageError):
@@ -294,248 +284,6 @@ class MotionInterlock:
             raise MotionInterlocked(
                 f"motion is latched off ({self._reason}) -- {what} refused. "
                 f"Clear the emergency stop before commanding any move.")
-
-
-# ---------------------------------------------------------------------------
-# ctypes binding
-# ---------------------------------------------------------------------------
-
-class TLI_DeviceInfo(C.Structure):
-    _fields_ = [
-        ("typeID", C.c_uint32),
-        ("description", C.c_char * 65),
-        ("serialNo", C.c_char * 16),
-        ("PID", C.c_uint32),
-        ("isKnownType", C.c_bool),
-        ("motorType", C.c_int),
-        ("isPiezoDevice", C.c_bool),
-        ("isLaser", C.c_bool),
-        ("isCustomType", C.c_bool),
-        ("isRack", C.c_bool),
-        ("maxChannels", C.c_short),
-    ]
-
-
-class TLI_HardwareInformation(C.Structure):
-    _fields_ = [
-        ("serialNumber", C.c_uint32),
-        ("modelNumber", C.c_char * 8),
-        ("type", C.c_ushort),
-        ("firmwareVersion", C.c_uint32),
-        ("notes", C.c_char * 48),
-        ("deviceDependantData", C.c_ubyte * 12),
-        ("hardwareVersion", C.c_ushort),
-        ("modificationState", C.c_ushort),
-        ("numChannels", C.c_short),
-    ]
-
-
-_DLL = None
-
-
-def _bind(dll):
-    """Attach argtypes/restypes. Without these ctypes assumes int returns and
-    silently truncates the DWORD status word and the 64-bit pointers."""
-    sig = {
-        "TLI_BuildDeviceList": ([], C.c_short),
-        "TLI_GetDeviceListSize": ([], C.c_short),
-        "TLI_GetDeviceListExt": ([C.c_char_p, C.c_uint32], C.c_short),
-        "TLI_GetDeviceInfo": ([C.c_char_p, C.POINTER(TLI_DeviceInfo)], C.c_short),
-        "ISC_Open": ([C.c_char_p], C.c_short),
-        "ISC_Close": ([C.c_char_p], None),
-        "ISC_LoadSettings": ([C.c_char_p], C.c_bool),
-        "ISC_StartPolling": ([C.c_char_p, C.c_int], C.c_bool),
-        "ISC_StopPolling": ([C.c_char_p], None),
-        "ISC_ClearMessageQueue": ([C.c_char_p], None),
-        "ISC_EnableChannel": ([C.c_char_p], C.c_short),
-        "ISC_DisableChannel": ([C.c_char_p], C.c_short),
-        "ISC_GetPosition": ([C.c_char_p], C.c_int),
-        "ISC_RequestPosition": ([C.c_char_p], C.c_short),
-        "ISC_GetStatusBits": ([C.c_char_p], C.c_uint32),
-        "ISC_RequestStatusBits": ([C.c_char_p], C.c_short),
-        "ISC_Home": ([C.c_char_p], C.c_short),
-        "ISC_MoveToPosition": ([C.c_char_p, C.c_int], C.c_short),
-        "ISC_MoveRelative": ([C.c_char_p, C.c_int], C.c_short),
-        # Declared, but nothing here calls them -- the GUI's jog buttons are
-        # relative moves. If you ever do use MoveJog, note that it runs off
-        # ISC_SetJogVelParams, a SEPARATE velocity table that SetVelParams does
-        # not touch and that MAX_VEL_MM_S therefore does not cap. Cap it there
-        # too, or a jog will quietly run at the shipped 20 mm/s.
-        "ISC_MoveJog": ([C.c_char_p, C.c_int], C.c_short),
-        "ISC_SetJogStepSize": ([C.c_char_p, C.c_uint], C.c_short),
-        "ISC_SetJogMode": ([C.c_char_p, C.c_int, C.c_int], C.c_short),
-        "ISC_StopProfiled": ([C.c_char_p], C.c_short),
-        "ISC_StopImmediate": ([C.c_char_p], C.c_short),
-        "ISC_CanMoveWithoutHomingFirst": ([C.c_char_p], C.c_bool),
-        "ISC_GetHardwareInfoBlock":
-            ([C.c_char_p, C.POINTER(TLI_HardwareInformation)], C.c_short),
-        "ISC_GetFirmwareVersion": ([C.c_char_p], C.c_uint32),
-        "ISC_GetMotorTravelLimits":
-            ([C.c_char_p, C.POINTER(C.c_double), C.POINTER(C.c_double)], C.c_short),
-        "ISC_GetMotorParamsExt":
-            ([C.c_char_p, C.POINTER(C.c_double), C.POINTER(C.c_double),
-              C.POINTER(C.c_double)], C.c_short),
-        "ISC_GetRealValueFromDeviceUnit":
-            ([C.c_char_p, C.c_int, C.POINTER(C.c_double), C.c_int], C.c_short),
-        "ISC_GetDeviceUnitFromRealValue":
-            ([C.c_char_p, C.c_double, C.POINTER(C.c_int), C.c_int], C.c_short),
-        "ISC_GetVelParams":
-            ([C.c_char_p, C.POINTER(C.c_int), C.POINTER(C.c_int)], C.c_short),
-        "ISC_SetVelParams": ([C.c_char_p, C.c_int, C.c_int], C.c_short),
-        "ISC_GetBacklash": ([C.c_char_p], C.c_long),
-        "ISC_SetBacklash": ([C.c_char_p, C.c_long], C.c_short),
-        "ISC_GetCalibrationFile": ([C.c_char_p, C.c_char_p, C.c_short], C.c_bool),
-        "ISC_SetCalibrationFile": ([C.c_char_p, C.c_char_p, C.c_bool], None),
-    }
-    missing = []
-    for name, (argtypes, restype) in sig.items():
-        try:
-            fn = getattr(dll, name)
-        except AttributeError:
-            # An older or differently-built Kinesis is a supportable situation;
-            # a raw AttributeError from deep in a binding helper is not. Name
-            # every entry point that is absent, in one message.
-            missing.append(name)
-            continue
-        fn.argtypes = argtypes
-        fn.restype = restype
-    if missing:
-        raise StageError(
-            f"{ISC_DLL} in {KINESIS_DIR} does not export "
-            f"{', '.join(missing)}. That is an older or differently-built "
-            f"Kinesis than this module was written against -- update it, or "
-            f"point KINESIS_DIR at the install that has these.")
-
-
-def dll():
-    """Load the Kinesis C API once, or explain precisely why it will not."""
-    global _DLL
-    if _DLL is not None:
-        return _DLL
-    if not os.path.isdir(KINESIS_DIR):
-        raise StageError(
-            f"Kinesis is not installed at {KINESIS_DIR}. Set KINESIS_DIR if it "
-            f"lives elsewhere.")
-    path = os.path.join(KINESIS_DIR, ISC_DLL)
-    if not os.path.exists(path):
-        raise StageError(f"{ISC_DLL} missing from {KINESIS_DIR}")
-    # The DLL pulls in DeviceManager.dll and the FTDI layer from the same
-    # folder. Without this they resolve against the process cwd and fail.
-    os.add_dll_directory(KINESIS_DIR)
-    try:
-        d = C.CDLL(path)     # the header declares __cdecl throughout
-    except OSError as exc:
-        raise StageError(f"cannot load {path}: {exc}") from exc
-    _bind(d)
-    _DLL = d
-    return d
-
-
-def peak_speed_mm_s(distance_mm, vel_mm_s, accel_mm_s2):
-    """How fast a trapezoidal move of `distance_mm` actually gets, mm/s.
-
-    A move short enough to spend all of itself ramping never reaches the
-    velocity cap: it peaks at sqrt(a*d) and turns round. That is the whole
-    explanation for a rig that is quiet at 2 mm and howls at 20 -- the setting
-    did not change, the distance did.
-    """
-    d = abs(float(distance_mm))
-    if accel_mm_s2 <= 0:
-        return float(vel_mm_s)
-    return min(float(vel_mm_s), (accel_mm_s2 * d) ** 0.5)
-
-
-def move_time_s(distance_mm, vel_mm_s, accel_mm_s2):
-    """How long a trapezoidal move of this length actually takes, seconds.
-
-    Triangular if it is too short to reach the cap, trapezoidal if not -- the
-    same split as peak_speed_mm_s, seen from the other side.
-    """
-    d, v, a = abs(float(distance_mm)), float(vel_mm_s), float(accel_mm_s2)
-    if d <= 0 or v <= 0 or a <= 0:
-        return 0.0
-    if d <= v * v / a:                       # never reaches the cap
-        return 2.0 * (d / a) ** 0.5
-    return d / v + v / a
-
-
-def move_timeout_s(distance_mm, vel_mm_s, accel_mm_s2):
-    """A generous deadline for a move of this length, seconds.
-
-    A fixed 180 s was wrong at both ends. At 0.1 mm/s -- which the speed box
-    allows -- a 300 mm traverse takes 50 minutes, so the deadline fired on a
-    move that was proceeding perfectly and stopped it. That mattered more once
-    a timeout started marking the position untrustworthy: a spurious one now
-    costs a re-home, and mid-raster it ends the map.
-
-    Three times the calculated time plus 5 s. Wide enough that only a genuine
-    stall reaches it, narrow enough that a stalled axis is not left grinding
-    for an hour.
-    """
-    return max(30.0, 3.0 * move_time_s(distance_mm, vel_mm_s, accel_mm_s2) + 5.0)
-
-
-def _check(rc, what):
-    if rc != 0:
-        raise StageError(f"{what} failed (Kinesis error {rc})")
-
-
-# ---------------------------------------------------------------------------
-# discovery
-# ---------------------------------------------------------------------------
-
-def list_devices():
-    """Serial numbers of every integrated-stepper controller on the bus.
-
-    An empty list almost always means the Kinesis application is running and
-    holding the devices, not that they are unplugged -- these are exclusive-open
-    FTDI devices. kinesis_is_running() distinguishes the two.
-    """
-    d = dll()
-    _check(d.TLI_BuildDeviceList(), "TLI_BuildDeviceList")
-    buf = C.create_string_buffer(512)
-    # Checked, like the call above it. An unchecked failure here hands back an
-    # empty buffer, which reads as "no stages on the bus" -- the same symptom
-    # as the Kinesis-is-running case this module works hard to tell apart.
-    _check(d.TLI_GetDeviceListExt(buf, 512), "TLI_GetDeviceListExt")
-    return [s for s in buf.value.decode(errors="replace").split(",") if s]
-
-
-def kinesis_is_running():
-    """True if the Kinesis GUI is up, which makes every stage unopenable.
-
-    Only ever used to make an error message more helpful, so any failure to
-    ask -- no tasklist, not Windows, a timeout -- is answered with "do not
-    know", spelled False.
-    """
-    try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq Thorlabs.MotionControl.Kinesis.exe"],
-            capture_output=True, text=True, timeout=10, check=False).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "Thorlabs.MotionControl.Kinesis.exe" in out
-
-
-def device_info(serial):
-    d = dll()
-    info = TLI_DeviceInfo()
-    # This one call inverts the convention the rest of the API uses. From the
-    # shipped header: "<returns> 1 if successful, 0 if not." Everything else
-    # here returns 0 for success, so checking it with _check() reports a
-    # perfectly good call as "Kinesis error 1" -- and on this machine it does
-    # so while having filled the struct correctly (typeID 45, "APT Stepper
-    # Motor Controller"). That took out `octobee/motion/stage.py list` entirely.
-    if d.TLI_GetDeviceInfo(serial.encode(), C.byref(info)) == 0:
-        raise StageError(f"TLI_GetDeviceInfo({serial}) found no such device "
-                         f"-- the device list may be stale; rebuild it with "
-                         f"list_devices()")
-    return {
-        "serial": serial,
-        "type_id": info.typeID,
-        "description": info.description.decode(errors="replace").strip(),
-        "is_isc": serial.startswith(ISC_PREFIX),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1483,167 +1231,6 @@ class StageSet:
 
 
 # ---------------------------------------------------------------------------
-# axis map persistence
-# ---------------------------------------------------------------------------
-
-def load_axis_map(path=None):
-    path = path or paths.config(AXIS_CONFIG)
-    if not os.path.exists(path):
-        return {}
-    with open(path, encoding="utf-8") as fh:
-        doc = json.load(fh)
-    return {str(k): str(v) for k, v in doc.get("axes", {}).items()}
-
-
-def load_axis_frames(path=None):
-    """axis -> {"invert": bool, "origin_mm": float|None, "limit_mm": pair|None}.
-
-    Kept beside the axis map rather than derived from it because which way a
-    stage runs is a fact about the BRACKET, not about the stage: swap two
-    controllers over and the serials move, the mounting does not. "limit_mm"
-    is the same kind of fact -- the working envelope belongs to the fixture,
-    not to the leadscrew.
-    """
-    path = path or paths.config(AXIS_CONFIG)
-    if not os.path.exists(path):
-        return {}
-    with open(path, encoding="utf-8") as fh:
-        doc = json.load(fh)
-    out = {}
-    for name, raw_spec in (doc.get("frame") or {}).items():
-        # shorthand: {"z": true}
-        spec = {"invert": raw_spec} if isinstance(raw_spec, bool) else raw_spec
-        origin = spec.get("origin_mm")
-        limit = spec.get("limit_mm")
-        if limit is not None:
-            if len(limit) != 2:
-                raise StageError(
-                    f"{path}: frame.{name}.limit_mm must be [low, high], "
-                    f"got {limit!r}")
-            limit = (float(limit[0]), float(limit[1]))
-        out[str(name)] = {
-            "invert": bool(spec.get("invert", False)),
-            "origin_mm": None if origin is None else float(origin),
-            "limit_mm": limit,
-        }
-    return out
-
-
-def load_home_order(path=None, axes=()):
-    """The order home_all() should reference the axes in, safest first.
-
-    Declared rather than inferred: which axis has to retract before the others
-    may sweep is a property of the fixture on the bench, and no amount of
-    reading the config can work it out. An axis named here that is not on the
-    machine is ignored rather than an error -- the safe order for a three-axis
-    rig should stay valid when you unplug one to work on it.
-    """
-    path = path or paths.config(AXIS_CONFIG)
-    if not os.path.exists(path):
-        return ()
-    with open(path, encoding="utf-8") as fh:
-        doc = json.load(fh)
-    order = doc.get("home_order") or ()
-    known = set(axes) if axes else None
-    return tuple(str(n) for n in order if known is None or n in known)
-
-
-def load_axis_motion(path=None, axes=()):
-    """axis -> (velocity_mm_s, accel_mm_s2), the profile each axis opens with.
-
-    stages.json carries it as
-
-        "motion": {"velocity_mm_s": 8.0, "accel_mm_s2": 10.0,
-                   "axes": {"z": {"velocity_mm_s": 5.0}}}
-
-    The block applies to every axis, and "axes" overrides one of them -- z
-    lifts the head against gravity and is the one most likely to want its own
-    number. Anything left unsaid falls back to the module defaults, so a rig
-    with no stages.json still opens quiet rather than at Kinesis's 20 mm/s.
-    """
-    path = path or paths.config(AXIS_CONFIG)
-    doc = {}
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-    block = doc.get("motion") or {}
-    per_axis = block.get("axes") or {}
-
-    def _pick(spec, key, fallback):
-        val = spec.get(key)
-        return fallback if val is None else float(val)
-
-    base_v = _pick(block, "velocity_mm_s", DEFAULT_VEL_MM_S)
-    base_a = _pick(block, "accel_mm_s2", DEFAULT_ACCEL_MM_S2)
-    out = {}
-    for name in axes:
-        spec = per_axis.get(name) or {}
-        # Clamped on the way in, so a stages.json written before the ceiling
-        # existed -- or edited by hand -- cannot reintroduce the shipped
-        # 20 mm/s through the back door.
-        out[str(name)] = (clamp_velocity(_pick(spec, "velocity_mm_s", base_v)),
-                          _pick(spec, "accel_mm_s2", base_a))
-    return out
-
-
-def save_axis_motion(path=None, velocity_mm_s=None, accel_mm_s2=None,
-                     axis=None):
-    """Write the motion profile into stages.json, leaving the rest of it alone.
-
-    With no axis this sets the block that applies to everything; with one it
-    writes an override for that axis only.
-    """
-    path = path or paths.config(AXIS_CONFIG)
-    doc = {}
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-    block = doc.setdefault("motion", {})
-    target = block if axis is None else block.setdefault("axes", {}).setdefault(
-        str(axis), {})
-    if velocity_mm_s is not None:
-        target["velocity_mm_s"] = clamp_velocity(velocity_mm_s)
-    if accel_mm_s2 is not None:
-        target["accel_mm_s2"] = float(accel_mm_s2)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.write("\n")
-    return path
-
-
-def save_axis_map(mapping, path=None, frames=None):
-    path = path or paths.config(AXIS_CONFIG)
-    doc = {}
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-    doc["axes"] = {str(k): str(v) for k, v in mapping.items()}
-    if frames is not None:
-        existing = doc.get("frame") or {}
-        out = {}
-        for name, spec in frames.items():
-            # Merged onto what is already there, not written over it. The
-            # caller of this is the GUI's "Save axis map", which knows about
-            # inversion and nothing about soft limits -- and a save that
-            # quietly deleted the working envelope would remove the only thing
-            # keeping the head out of the fixture, at the moment someone was
-            # doing routine housekeeping.
-            prev = existing.get(str(name))
-            entry = dict(prev) if isinstance(prev, dict) else {}
-            entry["invert"] = bool(spec.get("invert", False))
-            if spec.get("origin_mm") is not None:
-                entry["origin_mm"] = float(spec["origin_mm"])
-            if spec.get("limit_mm") is not None:
-                entry["limit_mm"] = [float(spec["limit_mm"][0]),
-                                     float(spec["limit_mm"][1])]
-            out[str(name)] = entry
-        doc["frame"] = out
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.write("\n")
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2031,3 +1618,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
