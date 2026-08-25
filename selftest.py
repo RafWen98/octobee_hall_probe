@@ -1059,35 +1059,35 @@ def test_machine_tab(app, workdir):
         check("the coil file named in the placement is loaded on startup",
               win.session.coils is not None and len(win.session.coils) == 2,
               "nothing loaded" if win.session.coils is None else win.session.coils.note)
-        check("every coil is listed", win.tbl_coils.rowCount() == 2,
-              f"{win.tbl_coils.rowCount()} rows")
+        check("every coil is listed", win.tab_machine.tbl_coils.rowCount() == 2,
+              f"{win.tab_machine.tbl_coils.rowCount()} rows")
 
         # Switch a coil off through the table, as a click does.
-        item = win.tbl_coils.item(0, 0)
+        item = win.tab_machine.tbl_coils.item(0, 0)
         item.setCheckState(QtCore.Qt.CheckState.Unchecked)
         check("unticking a coil switches it off",
               win.session.machine.energised == ["C2"], str(win.session.machine.energised))
         check("and the view is told",
-              win.machine_view.energised == {"C2"},
-              str(win.machine_view.energised))
+              win.tab_machine.machine_view.energised == {"C2"},
+              str(win.tab_machine.machine_view.energised))
 
         # A coil that is off is still solid: putting the probe on top of the
         # coil that was just switched off must still report a collision.
         on_coil = win.session.coils["C1"].points_mm[0]
         for attr, value in zip(("x_mm", "y_mm", "z_mm"), on_coil):
-            win.machine_pose_spins[attr].setValue(float(value))
-        win.refresh_machine(force=True)
+            win.tab_machine.machine_pose_spins[attr].setValue(float(value))
+        win.tab_machine.refresh_machine(force=True)
         check("driving the probe onto a switched-off coil still collides",
-              "INSIDE" in win.lbl_clearance.text(), win.lbl_clearance.text())
+              "INSIDE" in win.tab_machine.lbl_clearance.text(), win.tab_machine.lbl_clearance.text())
 
-        win.machine_pose_spins["x_mm"].setValue(float(on_coil[0]) + 4000.0)
-        win.refresh_machine(force=True)
+        win.tab_machine.machine_pose_spins["x_mm"].setValue(float(on_coil[0]) + 4000.0)
+        win.tab_machine.refresh_machine(force=True)
         check("and moving it away again clears",
-              "clear of" in win.lbl_clearance.text(),
-              win.lbl_clearance.text())
+              "clear of" in win.tab_machine.lbl_clearance.text(),
+              win.tab_machine.lbl_clearance.text())
 
         # The pose the tab is showing is the pose that gets written down.
-        win.on_machine_save()
+        win.tab_machine.on_machine_save()
         saved = omach.MachineConfig.load(cfg_path)
         check("Save writes the pose that is on screen",
               abs(saved.pose.x_mm - (on_coil[0] + 4000.0)) < 1e-6
