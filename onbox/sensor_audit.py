@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-onbox_sensor_audit.py -- RUNS ON THE ACQ1001 CARRIER, not on the PC.
+sensor_audit.py -- RUNS ON THE ACQ1001 CARRIER, not on the PC.
 
 Reads every SENM3Dx register that affects sensitivity, offset and calibration,
 for all 8 sensors on this carrier, and prints them as one table so that any
@@ -11,9 +11,9 @@ bias current and EEPROM calibration status live inside the ASIC and are reachabl
 only over SPI, from the carrier itself.
 
 Copy it over and run it:
-    scp onbox_sensor_audit.py root@acq1001_694:/tmp/
-    ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py'
-    ssh root@acq1001_695 'python3 /tmp/onbox_sensor_audit.py'   # repeat per box
+    scp sensor_audit.py root@acq1001_694:/tmp/
+    ssh root@acq1001_694 'python3 /tmp/sensor_audit.py'
+    ssh root@acq1001_695 'python3 /tmp/sensor_audit.py'   # repeat per box
 
 Options:
     --id-sweep [SECONDS]   walk sensor 1..8, muting each one's Bx/By/Bz in turn,

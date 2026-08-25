@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-onbox_gain_config.py -- RUNS ON THE ACQ1001 CARRIER, not on the PC.
+gain_config.py -- RUNS ON THE ACQ1001 CARRIER, not on the PC.
 
 Reads, changes and permanently stores the SENM3Dx amplifier gain for all 8
 sensors on this carrier, with a full EEPROM backup first and a restore path.
@@ -37,11 +37,11 @@ gain. That is why this is a safe change to make.
 
 Usage
 -----
-    python3 onbox_gain_config.py show
-    python3 onbox_gain_config.py backup --out /tmp/eeprom_backup.json
-    python3 onbox_gain_config.py set --gain 3000       # registers + EEPROM
-    python3 onbox_gain_config.py verify --gain 3000
-    python3 onbox_gain_config.py restore --in /tmp/eeprom_backup.json
+    python3 gain_config.py show
+    python3 gain_config.py backup --out /tmp/eeprom_backup.json
+    python3 gain_config.py set --gain 3000       # registers + EEPROM
+    python3 gain_config.py verify --gain 3000
+    python3 gain_config.py restore --in /tmp/eeprom_backup.json
 """
 
 import argparse

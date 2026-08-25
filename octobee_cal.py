@@ -21,7 +21,7 @@ What this script canNOT tell you
 --------------------------------
 Whether an amplitude difference is a *gain setting* difference or a *sensor
 calibration* difference. Gain lives in the SENM3Dx G_CTRL registers, reachable
-only over SPI on the carrier itself -- run onbox_sensor_audit.py for that.
+only over SPI on the carrier itself -- run onbox/sensor_audit.py for that.
 
 Usage
 -----
@@ -117,7 +117,7 @@ def gain_uniformity(boxes, hp_len=201):
         return float(np.std((x - smooth)[hp_len:-hp_len]))
 
     print("-" * 78)
-    print("amplifier gain uniformity  (SPI-free check -- see onbox_sensor_audit.py")
+    print("amplifier gain uniformity  (SPI-free check -- see onbox/sensor_audit.py")
     print("                            for the definitive register readout)")
     print("-" * 78)
     print(f"{'sensor':>7} {'field noise':>12} {'VCM noise':>11} {'ratio':>8}   verdict")
@@ -196,7 +196,7 @@ def gain_uniformity(boxes, hp_len=201):
             print("   amplifier gain (G_CTRL_X/Z/Y) and/or low-pass corner (PWM_CTRL).")
             print("   A chip at higher gain gives a bigger spike for the same field,")
             print("   so this is a direct candidate for your unequal spike heights.")
-            print("   Confirm with onbox_sensor_audit.py on both boxes.")
+            print("   Confirm with onbox/sensor_audit.py on both boxes.")
         else:
             print(f"\n   both boxes agree to within {f:.2f}x -- gains look uniform.")
     print()
@@ -221,7 +221,7 @@ def report(boxes, ranges, do_plot, plot_path):
     for bx in boxes:
         print(f"{bx['host']}: sensor range +/-{bx['range_mt']:g} mT "
               f"({bx['v_per_t']:g} V/T) -- set with --range, read the true value "
-              f"with onbox_sensor_audit.py")
+              f"with onbox/sensor_audit.py")
     if len({bx['range_mt'] for bx in boxes}) > 1:
         print("NOTE: the two carriers are on different ranges, so raw volts are "
               "NOT comparable between them -- only the mT columns are.")
@@ -330,7 +330,7 @@ def report(boxes, ranges, do_plot, plot_path):
         if spread > 1.3:
             print("  -> that is well beyond sensor-to-sensor calibration tolerance.")
             print("     Check, in this order: (1) amplifier gain register per chip")
-            print("     (onbox_sensor_audit.py), (2) whether EEPROM calibration is")
+            print("     (onbox/sensor_audit.py), (2) whether EEPROM calibration is")
             print("     actually loaded on every chip, (3) magnet distance/alignment.")
     else:
         print("no clear magnet response in this capture -- pass a magnet by the probe")
@@ -425,7 +425,7 @@ def main():
                    help="sensor measurement range in mT: 20, 40, 400 or 4000. "
                         "Give it once to apply to both boxes, or once per box in "
                         "--uut order -- the two carriers can be set to different "
-                        "gains. Read the true value with onbox_sensor_audit.py. "
+                        "gains. Read the true value with onbox/sensor_audit.py. "
                         "Default: whatever calibration.json records.")
     p.add_argument("--plot", action="store_true", help="also write a PNG")
     p.add_argument("--plot-path", default="octobee_cal.png")

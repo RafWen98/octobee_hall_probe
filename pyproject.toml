@@ -44,7 +44,7 @@ target-version = "py310"
 # The on-box scripts run on the carrier against a vendor library that is not
 # installed here, so they cannot be import-checked from this machine. Their
 # gain tables ARE checked, by selftest.test_gain_tables().
-extend-exclude = ["fw_backup_*", "rcuser_backup"]
+extend-exclude = ["fw_backup_*", "onbox/rc.user"]
 
 [tool.ruff.lint]
 select = [

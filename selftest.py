@@ -2438,9 +2438,9 @@ def test_gain_tables():
     here = os.path.dirname(os.path.abspath(__file__))
     want_range = {g: r for g, (r, _) in ob.GAIN_TO_RANGE.items()}
     want_vpt = {g: v for g, (_, v) in ob.GAIN_TO_RANGE.items()}
-    for name, expect in (("onbox_gain_config.py",
+    for name, expect in (("onbox/gain_config.py",
                           {"GAIN_RANGE_MT": want_range, "GAIN_VPT": want_vpt}),
-                         ("onbox_sensor_audit.py",
+                         ("onbox/sensor_audit.py",
                           {"GAIN_RANGE_MT": want_range})):
         src = open(os.path.join(here, name), encoding="utf-8").read()
         ns = {}
@@ -2499,7 +2499,7 @@ def test_shipped_calibration():
         check("calibration.json is present", False)
         return
     cal = ocal.Calibration.load(ocal.CONFIG_NAME)
-    # Re-read live with: ssh root@acq1001_69x 'python3 /tmp/onbox_gain_config.py show'
+    # Re-read live with: ssh root@acq1001_69x 'python3 /tmp/gain_config.py show'
     # All 16 confirmed at gain 3000 / EGain_sel 0x00 on 2026-08-19.
     check("all 16 are on the SPI-audited +/-20 mT range",
           all(r == 20.0 for r in cal.ranges_mt), f"{cal.ranges_mt}")

@@ -1,5 +1,5 @@
 #!/bin/sh
-# onbox_set_sample_rate.sh -- RUNS ON THE ACQ1001 CARRIER.
+# set_sample_rate.sh -- RUNS ON THE ACQ1001 CARRIER.
 #
 # Set (or just report) the ACQ423 sample rate, with the aliasing cost stated.
 #

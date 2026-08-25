@@ -11,7 +11,7 @@ on a square tube pointing outwards, so "sensor 5" on the ribbon is not obviously
 How it works
 ------------
 1. On the carrier, run the sweep:
-       ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py --id-sweep 4'
+       ssh root@acq1001_694 'python3 /tmp/sensor_audit.py --id-sweep 4'
    It mutes each sensor's Bx/By/Bz over SPI, one sensor at a time, in position
    order 1..8, holding each for a few seconds.
 

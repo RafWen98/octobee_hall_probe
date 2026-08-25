@@ -14,7 +14,7 @@ Hardware chain (as found on the bench, 2026-08-19)
         acq1001_695  192.168.1.83   ACQ423 s/n E42310298   -> sensors  9..16
 
     Which carrier holds which physical half of the probe is an ASSUMPTION.
-    Confirm it (and the axis order) with onbox_sensor_audit.py / a magnet pass.
+    Confirm it (and the axis order) with onbox/sensor_audit.py / a magnet pass.
 
 Channel map (OCTO-BEE User Guide rev 6, sec 3.7)
 ------------------------------------------------

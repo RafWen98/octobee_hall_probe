@@ -321,7 +321,7 @@ largest field any sensor will see:
 ```bash
 # make everything ±40 mT (matches the current 694 setting)
 "$PUTTY/plink.exe" -ssh -batch -pw "$PW" -hostkey "$HK" root@acq1001_695 \
-    'python3 /tmp/onbox_sensor_audit.py --set-gain 1500'
+    'python3 /tmp/sensor_audit.py --set-gain 1500'
 ```
 
 This writes registers only, so it is **lost at power cycle**. Make it permanent
@@ -366,7 +366,7 @@ got one too before it was taken back out. It is gone on purpose:
   1500, and 694 was left on the EEPROM's 1500.
 
 With no loop, a bad EEPROM shows up immediately as gain 1500 in
-`onbox_gain_config.py verify`. `/mnt/local/rc.user` on both boxes now carries a
+`onbox/gain_config.py verify`. `/mnt/local/rc.user` on both boxes now carries a
 comment block explaining this. `set-device-gain.py` is still installed on both
 (it is a useful manual tool) — it is just not run at boot.
 
@@ -394,15 +394,15 @@ factors yourself (§4 step 5).
 #### Backups and undo
 
 Full 256-byte EEPROM dumps of all 16 chips, taken before any write, are in
-`eeprom_backup/`. Original `rc.user` files are in `rcuser_backup/`, and
+`onbox/eeprom/`. Original `rc.user` files are in `onbox/rc.user/`, and
 `/mnt/local/rc.user.bak.pre-gain` on 694.
 
 ```bash
 # revert one carrier's EEPROM exactly as it was
-python3 /tmp/onbox_gain_config.py restore --in /tmp/eeprom_acq1001_694.json
+python3 /tmp/gain_config.py restore --in /tmp/eeprom_acq1001_694.json
 # or just change gain again
-python3 /tmp/onbox_gain_config.py set --gain 1500
-python3 /tmp/onbox_gain_config.py verify --gain 1500
+python3 /tmp/gain_config.py set --gain 1500
+python3 /tmp/gain_config.py verify --gain 1500
 ```
 
 If you change gain, **change it in both places** — EEPROM *and* the `rc.user`
@@ -411,7 +411,7 @@ would silently be overridden. That is exactly how the two boxes came to differ.
 
 One chip needed a retry: 694 sensor 7 first wrote checksum `0xbb` where `0xba`
 was correct and reported `valid=False`. Re-running `activate_EEPROM_config()`
-fixed it. `onbox_gain_config.py verify` is what catches this — always run it.
+fixed it. `onbox/gain_config.py verify` is what catches this — always run it.
 
 ### A library bug to know about
 
@@ -473,9 +473,9 @@ are reachable only over SPI from the carrier. A chip at gain 1500 gives exactly
 half the response of one at 3000, for the same field.
 
 ```bash
-scp onbox_sensor_audit.py root@acq1001_694:/tmp/
-ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py'
-ssh root@acq1001_695 'python3 /tmp/onbox_sensor_audit.py'
+scp onbox/sensor_audit.py root@acq1001_694:/tmp/
+ssh root@acq1001_694 'python3 /tmp/sensor_audit.py'
+ssh root@acq1001_695 'python3 /tmp/sensor_audit.py'
 ```
 
 The root password is the one on the printed sheet that shipped with the units
@@ -487,8 +487,8 @@ the password on the command line:
 ```bash
 PUTTY="/c/Program Files/PuTTY"
 HK=SHA256:51adMhUSu461QXQICNZfCpfA81hV1nomlMNQPhKaq3M    # acq1001_694 host key
-"$PUTTY/pscp.exe"  -batch -pw "$PW" -hostkey "$HK" onbox_sensor_audit.py root@acq1001_694:/tmp/
-"$PUTTY/plink.exe" -ssh -batch -pw "$PW" -hostkey "$HK" root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py'
+"$PUTTY/pscp.exe"  -batch -pw "$PW" -hostkey "$HK" onbox/sensor_audit.py root@acq1001_694:/tmp/
+"$PUTTY/plink.exe" -ssh -batch -pw "$PW" -hostkey "$HK" root@acq1001_694 'python3 /tmp/sensor_audit.py'
 ```
 
 Better still, install a key once and drop the password entirely
@@ -515,7 +515,7 @@ calibration is *not loaded* and it runs on datasheet defaults.
 To harmonise gain across a box:
 
 ```bash
-ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py --set-gain 3000'
+ssh root@acq1001_694 'python3 /tmp/sensor_audit.py --set-gain 3000'
 ```
 
 That writes registers only, so it is lost at power cycle. Make it permanent by
@@ -525,7 +525,7 @@ writing the same values to EEPROM and calling `activate_EEPROM_config()`.
 
 ```bash
 # terminal 1
-ssh root@acq1001_694 'python3 /tmp/onbox_sensor_audit.py --id-sweep 4'
+ssh root@acq1001_694 'python3 /tmp/sensor_audit.py --id-sweep 4'
 # terminal 2, started right after
 python octobee_idmap.py --uut acq1001_694 --seconds 70
 ```
@@ -1133,10 +1133,10 @@ but it is not a resolution win and it is not a priority.
 | `octobee_live.py` | PC | live plot of all 16 sensors, both boxes, one window |
 | `octobee_cal.py` | PC | health + calibration report, optional PNG |
 | `octobee_idmap.py` | PC | proves the channel↔sensor map (SPI sweep or magnet pass) |
-| `onbox_sensor_audit.py` | **carrier** | SPI register audit of all 8 chips; `--id-sweep`, `--set-gain` |
-| `onbox_gain_config.py` | **carrier** | reads/sets the amplifier gain **permanently** in EEPROM, with a backup and a restore path — see §3 |
-| `onbox_set_sample_rate.sh` | **carrier** | report or set the ADC rate, with the aliasing cost stated |
-| `fix_carrier_keys.sh` | **carrier** | repair `authorized_keys` and install the workstation key |
+| `onbox/sensor_audit.py` | **carrier** | SPI register audit of all 8 chips; `--id-sweep`, `--set-gain` |
+| `onbox/gain_config.py` | **carrier** | reads/sets the amplifier gain **permanently** in EEPROM, with a backup and a restore path — see §3 |
+| `onbox/set_sample_rate.sh` | **carrier** | report or set the ADC rate, with the aliasing cost stated |
+| `onbox/fix_carrier_keys.sh` | **carrier** | repair `authorized_keys` and install the workstation key |
 | `octobee_gui.py` | PC | the application: live view, 3D probe head, calibration, exports |
 | `probe_geometry.py` | PC | chip positions and per-chip rotation matrices on the tube |
 | `probe_view3d.py` | PC | the 3D probe-head widget |
@@ -1263,7 +1263,7 @@ diagnostics, exports — and the right half always shows the probe head in 3D
 with a peak-|B| bar chart underneath, so the state of all 16 sensors is visible
 whatever tab you are on.
 
-![The Live tab against the real carriers](docs/gui-live-hardware.png)
+![The Live tab against the real carriers](docs/images/gui-live-hardware.png)
 
 *Live, both carriers, no magnet. S16 is excluded automatically and dropped from
 the legend; the bar chart ranks the rest by peak |B| and reproduces the known
@@ -1294,7 +1294,7 @@ goes to the GPU, so the tube frame that every calibration, pose solve and export
 is written in is untouched — remount the probe and it is one matrix to change,
 with nothing to recalibrate.
 
-![A magnet passing the probe](docs/gui-magnet-pass.png)
+![A magnet passing the probe](docs/images/gui-magnet-pass.png)
 
 *A magnet travelling along the probe (`--demo`). Each sensor answers in turn,
 and the arrows on the 3D model track it.*
@@ -1315,7 +1315,7 @@ and the arrows on the 3D model track it.*
    calibration, or Hall bias current.
 5. **Apply gain trim** to equalise what is left, then **Save calibration**.
 
-![The Calibration tab](docs/gui-calibration.png)
+![The Calibration tab](docs/images/gui-calibration.png)
 
 Each sensor's measurement range is set per row in the Sensors tab rather than
 globally, because the range is a per-chip register and the two halves of this
@@ -1324,8 +1324,8 @@ all 16 run gain 3000, +/-20 mT, 63 V/T, and the shipped `calibration.json`
 records exactly that -- re-read live off both carriers with:
 
 ```bash
-ssh root@acq1001_694 'python3 /tmp/onbox_gain_config.py show'
-ssh root@acq1001_695 'python3 /tmp/onbox_gain_config.py show'
+ssh root@acq1001_694 'python3 /tmp/gain_config.py show'
+ssh root@acq1001_695 'python3 /tmp/gain_config.py show'
 ```
 
 Before that harmonisation S1-S8 sat at gain 1500 (+/-40 mT, 34.65 V/T), which
