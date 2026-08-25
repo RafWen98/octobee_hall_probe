@@ -866,8 +866,8 @@ class MagnetWizard(QtWidgets.QDialog):
             win.session.log(f"gain trim applied from the guided run "
                         f"(no geometry weighting needed); {note} -> "
                         f"{cal_path}")
-            win._calibration_changed("the gain trim")
-            win.refresh_cal_report()
+            win.tab_calib.calibration_changed.emit("the gain trim")
+            win.tab_calib.refresh_cal_report()
             if balance["notes"]:
                 QtWidgets.QMessageBox.warning(
                     self, "Gain trim applied, with a caveat",
@@ -948,7 +948,7 @@ class MagnetWizard(QtWidgets.QDialog):
         # knows every place a position reaches -- the 3D view, the plot, the
         # sensor table, the demo source -- and a second copy of that list here
         # would be one item short the first time somebody adds a fifth.
-        win.on_reload_geometry()
+        win.tab_calib.on_reload_geometry()
 
     def closeEvent(self, event):
         """Stop cleanly, and let QDialog finish the job.

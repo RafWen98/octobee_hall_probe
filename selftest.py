@@ -33,6 +33,7 @@ from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.gui import window as gui
 from octobee.gui.crash import CrashHandler
+from octobee.gui.dialogs.magnet import MagnetWizard
 from octobee.calib import roll as opc
 from octobee.calib import poses as opcap
 from octobee.calib import poses as pcap
@@ -2907,15 +2908,15 @@ def test_magnet_wizard_reopens(app, workdir):
     win.session.stages = FakeSet({"x": FakeStage("x"), "y": FakeStage("y")})
     try:
         for attempt in (1, 2, 3):
-            win.on_guided_magnet()
+            win.tab_calib.on_guided_magnet()
             app.processEvents()
             check(f"the wizard opens (attempt {attempt})",
-                  win._magnet_wizard is not None
-                  and win._magnet_wizard.isVisible())
-            win._magnet_wizard.close()
+                  win.tab_calib._magnet_wizard is not None
+                  and win.tab_calib._magnet_wizard.isVisible())
+            win.tab_calib._magnet_wizard.close()
             app.processEvents()
             check(f"and closing it lets go of the handle (attempt {attempt})",
-                  win._magnet_wizard is None,
+                  win.tab_calib._magnet_wizard is None,
                   "a stuck handle makes the button silently do nothing")
 
         # Closing must not leave anything modal behind either -- that would
@@ -2929,9 +2930,9 @@ def test_magnet_wizard_reopens(app, workdir):
         probe.close()
 
         # An unfinished run is only in the dialog, so closing has to ask.
-        win.on_guided_magnet()
+        win.tab_calib.on_guided_magnet()
         app.processEvents()
-        wiz = win._magnet_wizard
+        wiz = win.tab_calib._magnet_wizard
         g = win.session.geom
         for sweep in _synth_magnet_run(
                 g, np.ones(16),
@@ -3032,7 +3033,7 @@ def test_magnet_wizard_saves(app, workdir):
     QtWidgets.QMessageBox.warning = staticmethod(lambda *a, **k: None)
     QtWidgets.QMessageBox.exec = lambda self: 0
     try:
-        wiz = gui.MagnetWizard(win)
+        wiz = MagnetWizard(win)
         g = win.session.geom
         rng = np.random.default_rng(19)
         gain = rng.normal(1.0, 0.07, 16)
@@ -3064,7 +3065,7 @@ def test_magnet_wizard_saves(app, workdir):
         # Unticked, it must leave the file alone -- and say the run is safe.
         ocal.Calibration().save(cal_path)
         win.session.cal = ocal.Calibration.load(cal_path)
-        wiz2 = gui.MagnetWizard(win)
+        wiz2 = MagnetWizard(win)
         for sweep in _synth_magnet_run(g, gain, magnet).sweeps:
             wiz2.run.add(sweep)
         wiz2.chk_apply.setChecked(False)
@@ -3234,7 +3235,7 @@ def test_app(app, args, workdir):
     # ---- tare ----
     v = win.session.roll.view()
     before = np.abs(np.median(v, axis=0)).max() if v.shape[0] else float("nan")
-    win.start_collect("tare", 0.5)
+    win.tab_calib.start_collect("tare", 0.5)
     pump(win, app, 2.5)
     check("tare completed", win.session.collecting is None)
     check("tare stored a non-trivial zero", np.any(win.session.cal.zero_mt != 0),
@@ -3263,7 +3264,7 @@ def test_app(app, args, workdir):
         win.session.collecting = {"what": "tare", "blocks": [], "n": 0, "need": 1,
                           "peak": None, "baseline": None, "tag": None,
                           "decim": 1}
-        win._collect_block(win.session.cal.to_mt(fixed), fixed)
+        win.tab_calib.collect_block(win.session.cal.to_mt(fixed), fixed)
         check(f"tare at trim {trim:g} completed", win.session.collecting is None)
         zeros_at[trim] = win.session.cal.zero_mt.copy()
     d = float(np.abs(zeros_at[2.0] - zeros_at[1.0]).max())
@@ -3277,9 +3278,9 @@ def test_app(app, args, workdir):
     pump(win, app, 1.0)
 
     # ---- magnet pass ----
-    win.btn_magnet.setChecked(True)
+    win.tab_calib.btn_magnet.setChecked(True)
     pump(win, app, 4.0)
-    win.btn_magnet.setChecked(False)
+    win.tab_calib.btn_magnet.setChecked(False)
     app.processEvents()
     check("magnet pass captured peaks", win.session.magnet_peaks is not None)
     if win.session.magnet_peaks is not None:
@@ -3292,12 +3293,12 @@ def test_app(app, args, workdir):
 
         # ---- gain trim ----
         before_spread = rep.get("raw_spread")
-        win.on_apply_gain()
+        win.tab_calib.on_apply_gain()
         trimmed = win.session.magnet_peaks * win.session.cal.gain_corr[:, 0]
         after = trimmed[live].max() / trimmed[live].min()
         check("gain trim narrows the spread", after < 1.0001,
               f"{before_spread:.2f}x -> {after:.4f}x")
-        win.on_clear_gain()
+        win.tab_calib.on_clear_gain()
         check("gain trim clears", np.allclose(win.session.cal.gain_corr, 1.0))
 
     # ---- Earth-field roll calibration panel ----
@@ -3308,20 +3309,20 @@ def test_app(app, args, workdir):
     # through disk. The physics is graded in test_posecal() against a known
     # truth instead.
     check("roll panel is built",
-          all(hasattr(win, a) for a in ("btn_solve_roll", "btn_apply_roll",
-                                        "lbl_sweeps", "spin_bearth",
-                                        "chk_isotropic", "spin_sweep_s")))
+          all(hasattr(win.tab_calib, a)
+              for a in ("btn_solve_roll", "btn_apply_roll", "lbl_sweeps",
+                        "spin_bearth", "chk_isotropic", "spin_sweep_s")))
     check("solve is disabled with no sweeps recorded",
-          not win.btn_solve_roll.isEnabled())
+          not win.tab_calib.btn_solve_roll.isEnabled())
 
     win.session.cal.gain_corr = np.full((pgeom.N_SENSORS, 3), 2.0)
     for tag in ("A", "B", "C"):
-        win.start_sweep(tag, 0.4)
+        win.tab_calib.start_sweep(tag, 0.4)
         pump(win, app, 2.0)
     win.session.cal.clear_gain()
     check("all three sweeps recorded", set(win.session.sweeps) == {"A", "B", "C"},
-          win.lbl_sweeps.text())
-    check("solve enabled once sweeps exist", win.btn_solve_roll.isEnabled())
+          win.tab_calib.lbl_sweeps.text())
+    check("solve enabled once sweeps exist", win.tab_calib.btn_solve_roll.isEnabled())
 
     if set(win.session.sweeps) == {"A", "B", "C"}:
         # A sweep must be independent of whatever trim was loaded when it was
@@ -3334,17 +3335,17 @@ def test_app(app, args, workdir):
               sw.ranges_mt is not None
               and np.allclose(sw.ranges_mt, win.session.cal.ranges_mt))
 
-        win.on_solve_roll()
+        win.tab_calib.on_solve_roll()
         check("roll solve produced a solution", win.session.pose_solution is not None,
               "" if win.session.pose_solution is not None
-              else " ".join(win.cal_report.toPlainText().split())[:300])
-        check("apply is enabled after a solve", win.btn_apply_roll.isEnabled())
+              else " ".join(win.tab_calib.cal_report.toPlainText().split())[:300])
+        check("apply is enabled after a solve", win.tab_calib.btn_apply_roll.isEnabled())
         if win.session.pose_solution is not None:
             sol = win.session.pose_solution
             check("solve used all three orientations",
                   sorted(sol.tags) == ["A", "B", "C"], f"{sol.tags}")
             check("report reaches the calibration pane",
-                  "gain spread" in win.cal_report.toPlainText())
+                  "gain spread" in win.tab_calib.cal_report.toPlainText())
             win.session.cal.apply_pose_solution(sol)
             check("applying installs the matrix and clears the trim",
                   win.session.cal.has_matrix and np.allclose(win.session.cal.gain_corr, 1.0))
@@ -3363,9 +3364,9 @@ def test_app(app, args, workdir):
                        and np.allclose(back.ranges_mt, sw.ranges_mt))
             check("sweeps round trip through disk", ok)
 
-    win.on_clear_sweeps()
+    win.tab_calib.on_clear_sweeps()
     check("clearing sweeps disables solve",
-          not win.session.sweeps and not win.btn_solve_roll.isEnabled())
+          not win.session.sweeps and not win.tab_calib.btn_solve_roll.isEnabled())
 
     # ---- display cannot starve acquisition ----
     win.cmb_view.setCurrentIndex(list(gui.VIEW_RATES).index(10.0))
@@ -3491,7 +3492,7 @@ def test_app(app, args, workdir):
     g = pgeom.Geometry(mapping="ring-major")
     g.tube_width_mm = 55.0
     g.save(ns.geometry)
-    win.on_reload_geometry()
+    win.tab_calib.on_reload_geometry()
     check("geometry reload reaches the 3D view",
           abs(win.view3d.geom.tube_width_mm - 55.0) < 1e-9)
     check("geometry reload reaches the sensor table",

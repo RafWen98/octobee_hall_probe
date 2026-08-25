@@ -104,6 +104,17 @@ class Session:
 
         self._log_pane = None
 
+    def decim(self):
+        """Samples of stream per sample of output, at least 1.
+
+        Derived entirely from the source and the chosen output rate, and asked
+        for by the acquisition tick and by anything that collects a timed
+        block, so it lives with the two numbers it is made of.
+        """
+        if self.source is None:
+            return 1
+        return max(1, int(round(self.source.fs_hz / self.out_rate)))
+
     # ---- logging ----------------------------------------------------------
     #
     # A callable rather than the widget itself, so that everything which needs
