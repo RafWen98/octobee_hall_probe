@@ -58,6 +58,7 @@ PORT_STREAM = 4210          # raw aggregator stream
 PORT_SITE0 = 4220           # motherboard command port; site N -> 4220 + N
 
 NCHAN_AI = 32               # ACQ423ELF channels per box
+AI_SITE = 1                 # the ACQ423 sits in site 1 on both carriers
 SENSORS_PER_BOX = NCHAN_AI // 4
 AXES = ("Z", "Y", "X", "VCM")
 
@@ -247,7 +248,7 @@ class Layout:
     """Stream frame geometry for one carrier, read back from the box."""
 
     def __init__(self, ssb, nchan_ai=NCHAN_AI, spad_lw=7, fs_hz=200000.0,
-                 adc_range="+/-10V"):
+                 adc_range="+/-10V", sites=(), counting_sites=()):
         self.ssb = ssb
         self.nchan_ai = nchan_ai
         self.spad_lw = spad_lw
@@ -259,6 +260,31 @@ class Layout:
         self.spad0_lw = self.n_lw - spad_lw   # first SPAD longword
         self.site2_lw = self.ai_lw
         self.n_site2_lw = self.spad0_lw - self.ai_lw
+        # Which sites the aggregator is reading, and which of those are
+        # actually counting. Both carriers on this rig have a quadrature module
+        # in site 2 and only one of them has it switched on, so the presence of
+        # a longword between the analogue channels and the scratchpad says
+        # nothing on its own -- see encoder_columns.
+        self.sites = tuple(int(v) for v in sites)
+        self.counting_sites = tuple(int(v) for v in counting_sites)
+
+    @property
+    def encoder_sites(self):
+        """Aggregated sites other than the ADC, in the order they appear."""
+        return tuple(s for s in self.sites if s != AI_SITE)
+
+    @property
+    def encoder_columns(self):
+        """{site: column in `enc`} for the sites that are actually counting.
+
+        The aggregator emits one longword per non-ADC site, in site order, so
+        the column is just the position in that list. A site whose phaseA_en
+        is off still occupies its column -- it simply never changes, which is
+        exactly what a calibration would find and what makes leaving it in
+        harmless.
+        """
+        return {site: i for i, site in enumerate(self.encoder_sites)
+                if site in self.counting_sites}
 
     @property
     def volts_per_count(self):
@@ -274,9 +300,40 @@ class Layout:
         return self.volt_offset == 0.0
 
     def __repr__(self):
+        counting = ",".join(str(s) for s in sorted(self.encoder_columns)) or "-"
         return (f"Layout(ssb={self.ssb}B, {self.nchan_ai}ch, "
-                f"{self.n_site2_lw} enc LW, {self.spad_lw} SPAD LW, "
+                f"{self.n_site2_lw} enc LW (counting: {counting}), "
+                f"{self.spad_lw} SPAD LW, "
                 f"fs={self.fs_hz/1e3:g}kHz, {self.adc_range})")
+
+
+def _encoder_sites(u):
+    """(every aggregated site, the ones whose quadrature counter is running).
+
+    Asked of the box rather than inferred from the frame size, because on this
+    rig the two answers differ: acq1001_694 aggregates a quadrature module in
+    site 2 with phaseA_en=0, so it contributes a longword that never counts,
+    while acq1001_695 has three with phaseA_en=1. Picking the carrier with
+    "some encoder longwords" therefore picks the wrong one.
+
+    Anything that cannot be read is left out rather than assumed on: a site
+    that does not answer phaseA_en is not a quadrature module, and a module
+    that will not say whether it is counting is not one to take positions from.
+    """
+    try:
+        sites = [int(v) for v in u.value("sites").split(",") if v.strip()]
+    except (ValueError, RuntimeError, OSError):
+        return (), ()
+    counting = []
+    for site in sites:
+        if site == AI_SITE:
+            continue
+        try:
+            if int(u.value("phaseA_en", site=site)):
+                counting.append(site)
+        except (ValueError, RuntimeError, OSError):
+            continue
+    return tuple(sites), tuple(counting)
 
 
 def probe_uut(host):
@@ -297,7 +354,8 @@ def probe_uut(host):
                 f"{', '.join(sorted(ADC_RANGES))}. Every volts-per-count in "
                 f"this codebase comes from that table, so guessing here would "
                 f"silently rescale every field number.")
-        return Layout(ssb, nchan_ai, spad_lw, fs, rng)
+        sites, counting = _encoder_sites(u)
+        return Layout(ssb, nchan_ai, spad_lw, fs, rng, sites, counting)
     finally:
         u.close()
 

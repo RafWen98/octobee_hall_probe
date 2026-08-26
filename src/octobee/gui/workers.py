@@ -9,6 +9,8 @@ from PyQt6 import QtCore
 
 from octobee.acq import carrier as ob
 from octobee import live as olive
+from octobee import machine as omach
+from octobee.motion import encoder as oenc
 from octobee.motion import scan as oscan
 from octobee.motion import stage as ostage
 from octobee.gui.sources import LiveSource
@@ -220,6 +222,172 @@ class StageWorker(QtCore.QThread):
             self.done.emit(self.what, f"{type(e).__name__}: {e}")
 
 
+class PlanWorker(QtCore.QThread):
+    """Work out which of a volume's grid nodes the probe body can occupy.
+
+    Off the GUI thread because it is seconds, not milliseconds: a 300 mm cube
+    on a 5 mm grid is 227,000 positions, and the whole point of drawing the
+    reachable region is that somebody adjusts the pose and watches it change.
+    A one-second freeze per adjustment would make that unusable.
+
+    Nothing here touches hardware; it is arithmetic against the coil file.
+    """
+
+    done = QtCore.pyqtSignal(object, str)             # boolean grid, error
+    progress = QtCore.pyqtSignal(int, int)
+
+    def __init__(self, volume, placement, cloud, coils, radius_mm, margin_mm,
+                 labels=None):
+        super().__init__()
+        self.volume = volume
+        self.placement = placement
+        self.cloud = cloud
+        self.coils = coils
+        self.radius_mm = float(radius_mm)
+        self.margin_mm = float(margin_mm)
+        self.labels = labels
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
+
+    def run(self):
+        try:
+            grid = omach.reachable_grid(
+                self.volume.lo_mm, self.volume.step_mm, self.volume.shape,
+                self.placement, self.cloud, self.coils, self.radius_mm,
+                margin_mm=self.margin_mm, labels=self.labels,
+                progress=lambda i, n: self.progress.emit(int(i), int(n)))
+            self.done.emit(None if self._abort else grid, "")
+        except Exception as e:
+            self.done.emit(None, f"{type(e).__name__}: {e}")
+
+
+class EncoderCalibrationWorker(QtCore.QThread):
+    """Find which stream column is which axis, and its counts per millimetre.
+
+    Drives one axis at a time a known distance and reads the encoder counts
+    either side of the move. The counts themselves arrive on the acquisition
+    tick, so this thread never touches the stream: it asks for a reading
+    through `counts_now`, which the tick keeps fresh, and waits long enough
+    either side for one to have landed.
+
+    Moving ONE axis at a time is not politeness, it is the whole method -- the
+    column that moved is the column that belongs to the axis that moved, and
+    two at once makes that unanswerable.
+    """
+
+    done = QtCore.pyqtSignal(object, str)             # {axis: spec}, error
+    message = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int, int)
+
+    # Long enough for a tick to have delivered a block at any sane output rate,
+    # and for the axis to have stopped ringing enough that it is not still
+    # counting.
+    SETTLE_S = 0.6
+
+    def __init__(self, stages, read_counts, distance_mm=None, axes=None):
+        super().__init__()
+        self.stages = stages
+        self.read_counts = read_counts
+        self.distance_mm = float(distance_mm or oenc.CALIBRATION_MM)
+        self.axes = list(axes or oenc.AXES)
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
+
+    def _counts(self):
+        time.sleep(self.SETTLE_S)
+        return self.read_counts()
+
+    def run(self):
+        found, problems = {}, []
+        try:
+            self.stages.interlock.require_clear("an encoder calibration")
+            for i, axis in enumerate(self.axes):
+                if self._abort:
+                    break
+                self.progress.emit(i, len(self.axes))
+                if axis not in self.stages.names:
+                    continue
+                st = self.stages[axis]
+                lo, hi = st.limit_mm
+                here = st.position_mm
+                # Away from whichever limit is closer, so a rig parked at the
+                # end of its travel calibrates instead of refusing.
+                step = self.distance_mm
+                if here + step > hi:
+                    step = -self.distance_mm
+                if here + step < lo:
+                    problems.append(f"{axis}: no room to move "
+                                    f"{self.distance_mm:g} mm either way "
+                                    f"inside {lo:g}..{hi:g} mm")
+                    continue
+                before = self._counts()
+                st.move_by(step)
+                after = self._counts()
+                if before is None or after is None:
+                    problems.append(
+                        f"{axis}: no encoder counts arrived -- only "
+                        f"acq1001_695 carries them, and only while the stream "
+                        f"is running")
+                    st.move_by(-step)
+                    continue
+                column, scale, note = oenc.fit_scale(before, after, step)
+                st.move_by(-step)            # put it back where it was found
+                if column is None:
+                    problems.append(f"{axis}: {note}")
+                    continue
+                found[axis] = {"column": column, "counts_per_mm": scale}
+                self.message.emit(f"encoders: {axis} -> {note}")
+            self.progress.emit(len(self.axes), len(self.axes))
+            self.done.emit(found, "; ".join(problems))
+        except Exception as e:
+            self.done.emit(found, f"{type(e).__name__}: {e}")
+
+
+class SweepWorker(QtCore.QThread):
+    """Drive the stages through a volume sweep.
+
+    Unlike ScanWorker this does NOT own the carriers. A sweep reads the live
+    stream that is already running, so the boxes stay on their reduced rate,
+    the live plot keeps working, and there is no clock to restore afterwards.
+    What it owns is the motion; the field arrives through the acquisition tick
+    and is filed against `runner.line_index` from there.
+    """
+
+    done = QtCore.pyqtSignal(int, str)                # lines completed, error
+    progress = QtCore.pyqtSignal(int, int, str)       # i, n, where
+    message = QtCore.pyqtSignal(str)
+
+    def __init__(self, runner):
+        super().__init__()
+        self.runner = runner
+        self._abort = False
+
+    def abort(self):
+        """Ask the sweep to stop. The line in flight is cut short, not finished.
+
+        The opposite of ScanWorker's choice, and for the opposite reason: a
+        settled point half taken is worthless, where a line half swept is half
+        a line of perfectly good data with its own positions against it.
+        """
+        self._abort = True
+
+    def run(self):
+        try:
+            self.runner.log_fn = self.message.emit
+            n = self.runner.run(
+                should_abort=lambda: self._abort,
+                on_progress=lambda i, total, line: self.progress.emit(
+                    i, total, ", ".join(f"{k}={v:g}"
+                                        for k, v in sorted(line.fixed.items()))))
+            self.done.emit(n, "")
+        except Exception as e:
+            self.done.emit(self.runner.lines_done, f"{type(e).__name__}: {e}")
+
+
 class ScanWorker(QtCore.QThread):
     """
     Drive a field map: move, settle, average, repeat.
@@ -234,6 +402,14 @@ class ScanWorker(QtCore.QThread):
 
     done = QtCore.pyqtSignal(object, str)             # FieldMap, error
     progress = QtCore.pyqtSignal(int, int, str, float)  # i, n, where, sem_ut
+    # The measurement itself, point by point: where the stage was and the
+    # (16, 3) mT it read there. `progress` carries a formatted string and a
+    # noise figure, which is all a progress bar needs and nothing a plot can
+    # use -- and a scan that only reports its numbers at the end is a scan you
+    # watch as a progress bar for eleven minutes and then find out about.
+    # Separate signal rather than more arguments on `progress`, so nothing
+    # already connected to it has to change.
+    point = QtCore.pyqtSignal(dict, object)           # {axis: mm}, (16, 3) mT
     message = QtCore.pyqtSignal(str)
 
     def __init__(self, hosts, stages, grid, seconds, cal, settle_s,
@@ -274,6 +450,10 @@ class ScanWorker(QtCore.QThread):
                 where = " ".join(f"{k}={v:g}" for k, v in point.items())
                 self.progress.emit(i, n, where,
                                    float(stats.get("sem_ut", float("nan"))))
+                # A copy, because `row` is the scan's own array and this is
+                # crossing into the GUI thread, where it will be read at some
+                # later moment the scan knows nothing about.
+                self.point.emit(dict(point), np.array(row, float))
 
             fm = oscan.run_scan(
                 self.hosts, self.stages, self.grid, self.seconds, self.cal,

@@ -155,8 +155,20 @@ def test_close_is_clean(app, workdir):
         screenshot=None, screenshot_tab=0, screenshot_warmup=0)
     win = gui.MainWindow(ns)
     try:
+        # Closed with a recording open, which is the awkward case: stopping it
+        # is what normally raises the "saved to" box, and a modal put up
+        # during teardown is a window that will not close.
+        win.tab_export.chk_csv.setChecked(True)
+        win.tab_export.chk_raw.setChecked(False)
+        win.act_record.setChecked(True)
+        check("a file is open before the close", win.session.csv_rec is not None)
         win.closeEvent(QtGui.QCloseEvent())
         check("closeEvent completes without raising", True)
+        check("the recording is closed on the way out",
+              win.session.csv_rec is None)
+        check("and nothing was left on screen to dismiss",
+              win._saved_box is None,
+              "the path is still in the Log and on the Data output tab")
     finally:
         win.close()
         app.processEvents()
@@ -224,9 +236,236 @@ def test_machine_tab(app, workdir):
         check("a map started now would record the machine around it",
               meta["summary"].startswith("1/2 coils energised"),
               meta["summary"])
+
+        _check_machine_gizmo(win)
+        _check_machine_ring(win)
+        _check_machine_volume(win, app)
     finally:
         win.close()
         app.processEvents()
+
+
+def _drag(view, frm, to):
+    """Press at one widget pixel, move to another, release. As a mouse does."""
+    for kind, at, buttons in (
+            (QtCore.QEvent.Type.MouseButtonPress, frm,
+             QtCore.Qt.MouseButton.NoButton),
+            (QtCore.QEvent.Type.MouseMove, to,
+             QtCore.Qt.MouseButton.LeftButton),
+            (QtCore.QEvent.Type.MouseButtonRelease, to,
+             QtCore.Qt.MouseButton.NoButton)):
+        point = QtCore.QPointF(float(at[0]), float(at[1]))
+        getattr(view, {QtCore.QEvent.Type.MouseButtonPress: "mousePressEvent",
+                       QtCore.QEvent.Type.MouseMove: "mouseMoveEvent",
+                       QtCore.QEvent.Type.MouseButtonRelease:
+                           "mouseReleaseEvent"}[kind])(
+            QtGui.QMouseEvent(kind, point, point,
+                              QtCore.Qt.MouseButton.LeftButton, buttons,
+                              QtCore.Qt.KeyboardModifier.NoModifier))
+
+
+def _check_machine_ring(win):
+    """The ring round the zero point turns the probe about the machine's Z.
+
+    Dragged in the plane the ring lives in rather than in pixels, so the check
+    is a real one: pick two points on the ring 40 degrees apart in the world,
+    project them, and see whether the pose came out 40 degrees different.
+    """
+    tab, view = win.tab_machine, win.tab_machine.machine_view
+    origin = view._gizmo_origin
+    radius = view._ring_mm
+
+    def on_ring(deg):
+        a = np.radians(deg)
+        world = origin + radius * np.array([np.cos(a), np.sin(a), 0.0])
+        return view._to_screen(world[None, :])[0]
+
+    was = win.session.machine.pose.rot_z_deg
+    frm, to = on_ring(200.0), on_ring(240.0)
+    check("the ring is on screen where the pointer can reach it",
+          np.isfinite(frm).all() and np.isfinite(to).all()
+          and view._ring_at(QtCore.QPointF(*frm)),
+          f"{frm} -> {to}")
+    check("and an arrow does not also claim that pixel",
+          view._axis_at(QtCore.QPointF(*frm)) is None,
+          "the arrow would win the click and slide the probe instead")
+    _drag(view, frm, to)
+    now = win.session.machine.pose.rot_z_deg
+    check("dragging the ring turns the probe by the angle dragged",
+          abs(((now - was) - 40.0 + 180.0) % 360.0 - 180.0) < 1.0,
+          f"{was:g} -> {now:g} deg")
+    check("and only the rotation moved",
+          (win.session.machine.pose.x_mm, win.session.machine.pose.y_mm,
+           win.session.machine.pose.z_mm) == (
+              tab.machine_pose_spins["x_mm"].value(),
+              tab.machine_pose_spins["y_mm"].value(),
+              tab.machine_pose_spins["z_mm"].value()))
+    check("the drawing follows the pose, not the other way round",
+          np.allclose(view._placement.rotation(),
+                      omach.rotation_matrix(now), atol=1e-12))
+    tab.machine_pose_spins["rot_z_deg"].setValue(0.0)
+
+
+def _check_machine_volume(win, app):
+    """Planning a swept volume: what is drawn, and what is refused.
+
+    Driven with coil avoidance ON against a coil set the probe is sitting
+    right next to, because the interesting answer is the carved one -- a plan
+    that ignores the coils is arithmetic, and a plan that does not is the
+    feature.
+    """
+    tab, view = win.tab_machine, win.tab_machine.machine_view
+    session = win.session
+
+    # A box the probe can reach into, with a coil through part of it.
+    # The test coil set is two 1 m circles about the origin, so a box reaching
+    # out towards x = 1 m has winding through the middle of it. Anywhere else
+    # and the avoidance has nothing to do and the check proves nothing.
+    for attr, value in (("x_mm", 800.0), ("y_mm", -150.0), ("z_mm", -150.0)):
+        tab.machine_pose_spins[attr].setValue(value)
+    tab.chk_vol_all.setChecked(False)
+    for i, (start, size) in enumerate(((0.0, 300.0),) * 3):
+        tab.vol_spins["from"][i].setValue(start)
+        tab.vol_spins["size"][i].setValue(size)
+    tab.spin_vol_step.setValue(50.0)
+    tab.spin_vol_margin.setValue(5.0)
+
+    vol = tab.volume()
+    check("the volume the controls describe is the box that was typed",
+          np.allclose(vol.lo_mm, [0, 0, 0]) and np.allclose(vol.hi_mm, [300] * 3)
+          and vol.step_mm == 50.0, vol.describe())
+    check("editing it invalidates any plan made for the old one",
+          tab._plan is None and not tab.btn_vol_start.isEnabled(),
+          "a stale path would be drawn while the rig ran a different one")
+    check("and the box is drawn where the stages can actually go",
+          view._volume_item.visible(),
+          f"volume item visible: {view._volume_item.visible()}")
+
+    tab.chk_vol_avoid.setChecked(True)
+    tab.on_volume_plan()
+    deadline = time.time() + 60.0
+    while (tab._plan_worker is not None and tab._plan_worker.isRunning()
+           and time.time() < deadline):
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+
+    check("planning produces lines to sweep", tab._plan is not None
+          and len(tab._plan.lines) > 0, tab.lbl_volume.text()[:100])
+    check("the coils took some of the volume away",
+          tab._reachable is not None and not tab._reachable.all(),
+          "nothing was carved -- the probe fits everywhere, so this "
+          "configuration does not exercise the avoidance")
+    check("the path that survived is drawn, and so is what did not",
+          view._path_item.visible() and view._dropped_item.visible(),
+          f"path {view._path_item.visible()}, dropped "
+          f"{view._dropped_item.visible()}")
+
+    # The promise the label makes has to be the promise the plan keeps.
+    if session.probe_cloud is None:
+        session.probe_cloud = omach.probe_cloud(session.geom)
+    ends = []
+    for line in tab._plan.lines:
+        for where in (line.start_mm, line.stop_mm):
+            ends.append([line.fixed.get(a, 0.0) if a != line.sweep else where
+                         for a in ("x", "y", "z")])
+    good = omach.clear_of_coils(
+        session.machine.pose.flange_path_mm(np.array(ends)),
+        session.machine.pose, session.probe_cloud, session.coils,
+        session.machine.coil_radius_mm, margin_mm=5.0)
+    check("every planned line really does clear the coils by the margin set",
+          bool(good.all()), f"{int((~good).sum())} of {len(good)} do not")
+
+    # Flying it must move the drawn probe and leave the stages alone.
+    tab.on_volume_preview()
+    check("flying the path starts an animation", tab._preview is not None)
+    seen = set()
+    for _ in range(12):
+        tab._preview_step()
+        if tab._preview_at:
+            seen.add(tuple(round(v, 3) for v in tab._preview_at.values()))
+        app.processEvents()
+    check("and it walks the probe along the path rather than sitting still",
+          len(seen) > 3, f"{len(seen)} distinct positions")
+    check("the clearance readout follows the flown probe",
+          "clear of" in tab.lbl_clearance.text()
+          or "INSIDE" in tab.lbl_clearance.text(), tab.lbl_clearance.text())
+    tab._stop_preview()
+    check("stopping it hands the drawing back to the real stage reading",
+          tab._preview is None and tab._preview_at is None)
+
+    # Nothing to run against: there are no stages in this test, and starting
+    # anyway is the failure that would drive an unconnected rig.
+    check("starting a map with no stages connected is refused",
+          not tab.btn_vol_start.isEnabled() or session.stages is not None,
+          "the start button is live with nothing to move")
+
+def _check_machine_gizmo(win):
+    """The drag handle on the probe's zero point moves the probe, and only it.
+
+    Driven through the widget's own mouse handlers rather than by calling the
+    move directly: what is worth testing is the whole chain -- picking the
+    arrow out of the drawing in screen pixels, turning a mouse movement back
+    into millimetres, and writing them into the placement box -- and every step
+    of that is where a sign or a projection can be wrong.
+    """
+    tab = win.tab_machine
+    view = tab.machine_view
+    view.resize(800, 600)
+    # Back inside the machine, and framed: the checks above left the probe four
+    # metres off to one side, where the handle is behind the camera.
+    for attr in ("x_mm", "y_mm", "z_mm"):
+        tab.machine_pose_spins[attr].setValue(0.0)
+    view.reset_camera()
+    tab.refresh_machine(force=True)
+
+    screen = view._gizmo_screen()
+    check("the handle is on screen at the probe's zero point",
+          screen is not None and np.allclose(
+              view._gizmo_origin, win.session.machine.pose.origin_mm(None)),
+          "off screen" if screen is None else str(view._gizmo_origin))
+    if screen is None:
+        return
+
+    before = np.array([win.session.machine.pose.x_mm,
+                       win.session.machine.pose.y_mm,
+                       win.session.machine.pose.z_mm])
+    step = screen[1] - screen[0]                    # the x arrow, in pixels
+    push_px = 40.0
+    want = push_px / float(np.hypot(*step)) * view._gizmo_len_mm
+    _drag(view, 0.5 * (screen[0] + screen[1]),
+          0.5 * (screen[0] + screen[1]) + push_px * step / np.hypot(*step))
+
+    after = np.array([win.session.machine.pose.x_mm,
+                      win.session.machine.pose.y_mm,
+                      win.session.machine.pose.z_mm])
+    # 0.06 mm: the spin box the drag writes through keeps one decimal.
+    check("dragging the x arrow slides the probe that far along machine x",
+          abs((after[0] - before[0]) - want) < 0.06,
+          f"moved {after[0] - before[0]:.3f} mm, wanted {want:.3f} mm")
+    check("and leaves y and z exactly where they were",
+          np.array_equal(after[1:], before[1:]),
+          f"{before[1:]} -> {after[1:]}")
+    check("the spin box shows what was dragged",
+          abs(tab.machine_pose_spins["x_mm"].value() - after[0]) < 1e-9,
+          f"{tab.machine_pose_spins['x_mm'].value():.3f} vs {after[0]:.3f}")
+
+    # Empty space still orbits. A handle that swallowed every click would make
+    # the view unturnable, which is worse than not having one.
+    azimuth = view.opts["azimuth"]
+    _drag(view, (5.0, 5.0), (95.0, 25.0))
+    check("a drag away from the handle still turns the camera",
+          view.opts["azimuth"] != azimuth
+          and np.array_equal([win.session.machine.pose.x_mm,
+                              win.session.machine.pose.y_mm,
+                              win.session.machine.pose.z_mm], after),
+          f"azimuth {azimuth:.1f} -> {view.opts['azimuth']:.1f}")
+
+    view.set_gizmo_visible(False)
+    check("turning the handle off takes it out of the drawing",
+          view._gizmo_screen() is None
+          and not view._gizmo_items[0].visible(), "still there")
+    view.set_gizmo_visible(True)
 
 
 def test_app(app, args, workdir):
@@ -436,6 +675,29 @@ def test_app(app, args, workdir):
     check("acquisition continues with the 3D head off", win.session.roll.filled >= before)
     win.probe_pane.chk_3d.setChecked(True)
 
+    # The peak bars are the other thing in the right-hand pane that can be
+    # given up for space, and for the same reason: the head and the stage
+    # controls are what you want tall while driving the rig somewhere.
+    win.probe_pane.chk_bars.setChecked(False)
+    before = win.session.roll.filled
+    pump(win, app, 1.0)
+    check("the peak bars can be turned off", win.probe_pane.bars.isHidden())
+    check("acquisition continues with the peak bars off",
+          win.session.roll.filled >= before)
+    win.probe_pane.chk_bars.setChecked(True)
+    pump(win, app, 0.5)
+    check("and turned back on", not win.probe_pane.bars.isHidden())
+
+    # The jog pane is in the right-hand column, not in the tab stack: moving
+    # the head and watching the field answer is one action.
+    pane = win.tab_stages.jog_pane
+    check("the jog pane is in the right-hand pane, outside the tabs",
+          pane.parent() is not None and not win.tabs.isAncestorOf(pane),
+          "on the tab strip it would cost a trip away from what you are watching")
+    check("with nothing connected it offers no move",
+          not pane.rows["x"]["target"].isEnabled()
+          and not pane.btn_home.isEnabled())
+
     win.act_pause.setChecked(True)
     n_before = win.session.roll.filled
     pump(win, app, 1.0)
@@ -447,15 +709,48 @@ def test_app(app, args, workdir):
     win.tab_export.chk_csv.setChecked(True)
     win.tab_export.chk_raw.setChecked(True)
     win.tab_export.chk_tube.setChecked(False)
+    check("the Record button carries no dot before it is pressed",
+          win.act_record.icon().isNull())
     win.act_record.setChecked(True)
     check("CSV recorder opened", win.session.csv_rec is not None)
     check("raw recorder opened", win.session.raw_rec is not None)
+    check("a dot appears on the Record button while capturing",
+          not win.act_record.icon().isNull()
+          and win.act_record.text() == "Recording")
     csv_path = win.session.csv_rec.path if win.session.csv_rec else None
     raw_path = win.session.raw_rec.path if win.session.raw_rec else None
     pump(win, app, 3.0)
     rows_written = win.session.csv_rec.n_rows if win.session.csv_rec else 0
     win.act_record.setChecked(False)
     check("recording stopped cleanly", win.session.csv_rec is None and win.session.raw_rec is None)
+    check("and the dot goes with the file being closed",
+          win.act_record.icon().isNull() and win.act_record.text() == "Record")
+
+    # Stopping says where the data went. The Log and the Data output tab both
+    # carried the path already and both were being missed -- the one place
+    # nobody looks after a capture is the tab they were not on.
+    saved = win._saved_box
+    check("stopping a recording says where the files were written",
+          saved is not None)
+    if saved is not None:
+        told = saved.text() + "\n" + saved.informativeText()
+        check("the box names both files",
+              os.path.basename(csv_path or "") in told
+              and os.path.basename(raw_path or "") in told, told.replace("\n", " | "))
+        check("and the folder they are in",
+              os.path.basename(win.session.out_dir) in told)
+        check("it does not block the window while it is up",
+              not saved.isModal() or saved.windowModality()
+              != QtCore.Qt.WindowModality.ApplicationModal,
+              "a snapshot and a field map both stop recording first")
+        saved.close()
+        # Twice: the box is only released when its deleteLater is delivered,
+        # and Qt holds activeModalWidget on it until then.
+        app.processEvents()
+        app.processEvents()
+    check("dismissing it leaves nothing modal behind",
+          QtWidgets.QApplication.activeModalWidget() is None)
+    check("and the window stops holding on to it", win._saved_box is None)
 
     # ---- read the CSV back and check it ----
     if csv_path and os.path.exists(csv_path):
@@ -548,6 +843,10 @@ def test_app(app, args, workdir):
     tube_path = win.session.csv_rec.path if win.session.csv_rec else None
     pump(win, app, 1.5)
     win.act_record.setChecked(False)
+    if win._saved_box is not None:
+        win._saved_box.close()
+        app.processEvents()
+        app.processEvents()
     if tube_path and os.path.exists(tube_path):
         with open(tube_path, encoding="utf-8") as f:
             head = "".join(f.readlines()[:12])

@@ -4,12 +4,13 @@ import os
 import time
 
 import numpy as np
-from PyQt6 import QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from octobee.calib import magnet as omag
 from octobee.motion import scan as oscan
 from octobee.calib import geometry as pgeom
 from octobee.gui.sources import LiveSource
+from octobee.gui.widgets.magnetlive import MagnetPassPlot
 from octobee.gui.workers import ScanWorker
 
 NO_AXIS = "(none)"
@@ -87,8 +88,13 @@ class MagnetWizard(QtWidgets.QDialog):
         self.win = win
         self.setWindowTitle("Guided magnet calibration")
         self.setModal(False)
-        self.resize(760, 640)
-        self.run = omag.MagnetRun(axis="y")
+        self.resize(900, 780)
+        # The full scale every capture in this run will be converted through,
+        # taken once at the start rather than read back at analysis time: the
+        # calibration on disk moves on, and "did this run clip" is a question
+        # about the day it was measured. It is what range_check() judges.
+        self.run = omag.MagnetRun(
+            axis="y", ranges_mt=win.session.cal.ranges_mt)
         self._worker = None
         self._t0 = 0.0
         self._start_mm = None
@@ -101,6 +107,8 @@ class MagnetWizard(QtWidgets.QDialog):
         self._released = False   # have the carriers been taken off live yet
         self._save_base = None   # where the poses are being written as they land
         self._wrapped_up = False  # has the once-per-run finishing work been done
+        self._plot_axis = "y"    # which axis the pass being drawn is moving
+        self._railed = False     # has a channel already been reported clipped
 
         lay = QtWidgets.QVBoxLayout(self)
         self.lbl_step = QtWidgets.QLabel()
@@ -207,7 +215,20 @@ class MagnetWizard(QtWidgets.QDialog):
             "more and the extra points buy nothing.\n"
             "  - the dither needs a quarter of it, for the same reason in "
             "reverse.\n\n"
-            "Within a factor of two is close enough.\n\n"
+            "This box used to say 'within a factor of two is close enough'. "
+            "That was too generous, and it cost a 44-minute run on "
+            "2026-08-25: entered at 20 mm against a real standoff nearer "
+            "50, the dither came out a tenth of the distance instead of a "
+            "quarter, its fit went DEGENERATE without failing, and the "
+            "correction multiplied the gain trim's spread from 1.30x to "
+            "5.9x. Nothing about it looked wrong on screen.\n\n"
+            "So: get it right to about 30 %, and measure to the CHIPS, not "
+            "to the face of the magnet. A magnet's field acts as though it "
+            "comes from inside it, so face-to-face with a caliper reads "
+            "short -- add half the magnet's length, and however far the die "
+            "sits inside its package.\n\n"
+            "Pass A and pass B forgive a bad guess here. Pass C does not, "
+            "and pass C is the one that multiplies into the trim.\n\n"
             "The standard run pairs a 20 mm standoff with a 10 mm cut "
             "half-span -- half of what the rule above asks for, at the same "
             "21 points, so the cut is spent closer in around the peak. "
@@ -341,7 +362,21 @@ class MagnetWizard(QtWidgets.QDialog):
             "It is rewritten after every pose, so you can see the faces "
             "arrive one at a time — and stop early if something is obviously "
             "wrong rather than paying for all four.")
-        lay.addWidget(self.report, 1)
+
+        # The pass as it is measured, above the report of the poses already
+        # finished. A splitter rather than a fixed division because which of
+        # the two matters depends on where in the run you are: the plot during
+        # a pass, the report between poses.
+        self.live = MagnetPassPlot()
+        self.live.set_full_scale(float(np.min(win.session.cal.ranges_mt))
+                                 if win.session.cal.ranges_mt is not None
+                                 else None)
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        split.addWidget(self.live)
+        split.addWidget(self.report)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        lay.addWidget(split, 1)
 
         row = QtWidgets.QHBoxLayout()
         self.chk_apply = QtWidgets.QCheckBox(
@@ -755,7 +790,34 @@ class MagnetWizard(QtWidgets.QDialog):
                                   self.spin_settle.value(), restore)
         self._worker.message.connect(win.session.log)
         self._worker.progress.connect(self.on_progress)
+        self._worker.point.connect(self.on_point)
         self._worker.done.connect(self.on_pass_done)
+
+        # Which axis this pass is actually moving, so the plot's x is the
+        # thing being swept rather than always the tube axis -- pass B moves
+        # transversely and pass C along the standoff, and drawing either of
+        # those against y would be a vertical line.
+        self._railed = False
+        self._plot_axis = {"locate": self.cmb_axis.currentText(),
+                           "cut": self._across_name(),
+                           "dither": self._normal_name()}.get(kind) \
+            or self.cmb_axis.currentText()
+        self.live.begin(
+            f"pose {len(self.run) + 1} of {omag.N_POSES} — {PASS_NAMES[kind]}",
+            self._plot_axis)
+        # Ring markers are positions along the TUBE, so they only mean
+        # anything on the pass whose x axis is the tube axis. Drawing them on
+        # the cut or the dither would put four lines at y coordinates on an
+        # axis measured in x or z -- lines in the right units and the wrong
+        # place, which is worse than no lines at all.
+        #
+        # On pass A they are the PREVIOUS pose's rings, which is the useful
+        # overlay rather than a tautology: the head is only turned between
+        # poses, never moved along, so this pose's four peaks must land on
+        # last pose's four lines. A pose that also shifted the head sideways
+        # is the one setup fault that breaks the equal-approach argument
+        # quietly, and this is what it looks like when it happens.
+        self.live.set_rings(self._rings if kind == "locate" else [])
         # Without this the main window's stop button does not know this thread
         # exists, and stopping the axes mid-pass would leave it to carry on to
         # the next one -- see MainWindow.register_motion_worker.
@@ -770,6 +832,33 @@ class MagnetWizard(QtWidgets.QDialog):
         self.bar.setValue(i)
         elapsed = time.time() - self._t0
         self.bar.setFormat(f"%v / %m — {elapsed / max(i, 1) * (n - i):.0f} s left")
+
+    def on_point(self, point, row):
+        """One measured point, straight onto the plot.
+
+        Also the first place a channel on the rail can be caught. The end-of-
+        run range check is honest but late: it tells you about a clipped
+        sensor after all four poses, and the fix -- move the magnet, start
+        again -- costs the whole 44 minutes. Said once per pass rather than
+        once per point, because a clipped channel stays clipped for as long as
+        the magnet is near it and sixty identical log lines is not a warning,
+        it is noise.
+        """
+        self.live.add(point.get(self._plot_axis, float("nan")), row)
+        fs = self.win.session.cal.ranges_mt
+        if fs is None or self._railed:
+            return
+        over = [i + 1 for i in range(omag.N_SENSORS)
+                if np.max(np.abs(np.asarray(row, float)[i])) >= fs[i]]
+        if over:
+            self._railed = True
+            self.win.session.log(
+                f"guided magnet calibration: {', '.join('S' + str(s) for s in over)} "
+                f"hit full scale at {self._plot_axis}="
+                f"{point.get(self._plot_axis, float('nan')):.1f} mm. A clipped "
+                f"peak reads LOW and flat, and the trim would turn that sensor "
+                f"UP to compensate. Stop, move the magnet further away, and "
+                f"start again -- this will not come out in the analysis.")
 
     def _sweep_from(self, fm, pose):
         return omag.PoseSweep.from_fieldmap(
@@ -913,6 +1002,83 @@ class MagnetWizard(QtWidgets.QDialog):
         self._refresh()
 
     # ---- finishing -------------------------------------------------------
+    def _dither_gate(self):
+        """Should pass C be trusted? -> True/False, having said why.
+
+        The command-line `octobee magnet apply` has always run this check and
+        refused a degenerate fit. The wizard did not -- it called response()
+        on the default and applied whatever came out -- and the wizard is the
+        path an operator actually uses. That gap is what let the run of
+        2026-08-25 write a 5.89x trim into calibration.json from a dither that
+        had measured nothing, and it is why this is here rather than in a
+        docstring somewhere saying it ought to be.
+
+        Refusing rather than asking is deliberate. "Apply it anyway" is not a
+        judgement call an operator is in a position to make at the end of a
+        44-minute run, and the fallback is not a worse answer -- it is the
+        A+B answer, which is the whole run minus one pass, and which on that
+        day was 1.30x and correct.
+        """
+        if not any(s.dithers for s in self.run.sweeps):
+            return False
+        q = self.run.dither_quality(expect_mm=self.spin_standoff.value())
+        summary = (f"pass C: {q['n_fitted']}/{omag.N_SENSORS} sensors fitted, "
+                   f"median {q['median_mm']:.1f} mm, median n "
+                   f"{q['median_n']:.2f}, corr(d,n) {q['corr_d_n']:+.3f}")
+        if q["usable"]:
+            self.win.session.log(f"guided magnet calibration: {summary} -- "
+                                 f"usable, the standoff correction is in")
+            return True
+        for n in q["notes"]:
+            self.win.session.log(f"guided magnet calibration: {n}")
+        self.win.session.log(
+            f"guided magnet calibration: {summary} -- NOT usable, so pass C "
+            f"is dropped and the trim comes from passes A+B. The dither is "
+            f"still on disk and can be re-applied with `octobee magnet apply "
+            f"--standoff <mm>` once the real standoff is known.")
+        QtWidgets.QMessageBox.warning(
+            self, "Standoff dither dropped",
+            "The standoff dither did not measure anything, so it has been "
+            "left out of the trim:\n\n  - "
+            + "\n  - ".join(q["notes"])
+            + "\n\nThe trim below is from passes A and B, which is the same "
+              "run minus one pass and is a valid measurement. Nothing is "
+              "lost: the dither is saved with the run, and once you know the "
+              "real standoff you can re-derive with\n\n"
+              "    octobee magnet apply <run>.npz --standoff <mm> "
+              "--replacing <run>.npz\n\n"
+              "The usual cause is the standoff box: it sizes the dither, and "
+              "a dither much shorter than a quarter of the real distance "
+              "cannot see the curvature it is there to measure.")
+        return False
+
+    def _range_gate(self):
+        """Did anything clip? -> the range_check dict, or None if unknown.
+
+        Reported, not refused. A clipped channel makes that sensor's trim
+        wrong, but the other fifteen are still a measurement, and refusing the
+        lot would throw away a run that mostly worked -- so this says which
+        sensors not to believe and leaves the decision where it belongs.
+        """
+        if self.run.ranges_mt is None or not self.run.sweeps:
+            return None
+        rng = self.run.range_check(self.run.ranges_mt)
+        for n in rng["notes"]:
+            self.win.session.log(f"guided magnet calibration: {n}")
+        if not rng["usable"]:
+            QtWidgets.QMessageBox.warning(
+                self, "A channel ran out of range",
+                "\n  - ".join(["Some sensors reached full scale during this "
+                               "run:"] + rng["notes"])
+                + "\n\nA clipped peak does not look like an error -- it looks "
+                  "like a slightly smaller peak with a flat top, and the trim "
+                  "then turns that sensor UP to compensate. Treat those "
+                  "sensors' trims as wrong.\n\nMoving the magnet further away "
+                  "is the fix, not raising the range: at 1/r^3 a small move "
+                  "buys a lot of headroom, and a wider range costs resolution "
+                  "on every sensor for the sake of one.")
+        return rng
+
     def finish(self):
         win = self.win
         # The per-pose saves have been writing to this base since pose 1, so
@@ -938,14 +1104,25 @@ class MagnetWizard(QtWidgets.QDialog):
             # factor again. The retry saves, and does nothing else.
             self._settle_finished(saved)
             return
+        # Decided before anything is applied, because it changes WHAT is
+        # applied. Pass C multiplies into the trim, so a dither that did not
+        # converge does not degrade the answer a little -- it replaces it. On
+        # 2026-08-25 a degenerate fit turned a 1.30x spread into a 5.89x one
+        # and nothing on screen looked wrong. dither_quality() is the check;
+        # the run refuses pass C rather than asking, because "apply it anyway"
+        # is never the right answer to a fit that measured nothing.
+        use_dither = self._dither_gate()
+        rng = self._range_gate()
+
         # Said before the trim is touched, because it decides what the trim
         # is worth: opposite faces that disagree mean part of it is geometry.
-        balance = self.run.face_balance(win.session.geom)
+        # Judged on the same passes as the trim it is judging.
+        balance = self.run.face_balance(win.session.geom, use_dither=use_dither)
         for note in balance["notes"]:
             win.session.log(f"guided magnet calibration: {note}")
 
         if self.chk_apply.isChecked():
-            resp, _best = self.run.response()
+            resp, _best = self.run.response(use_dither=use_dither)
             _corr, skipped = win.session.cal.cross_calibrate(resp)
             note = (f"kept their previous trim: {', '.join(skipped)}"
                     if skipped else "every live sensor trimmed")
@@ -953,12 +1130,16 @@ class MagnetWizard(QtWidgets.QDialog):
             if any(s.is_plane for s in self.run.sweeps):
                 passes.append("plane")
             if any(s.dithers for s in self.run.sweeps):
-                passes.append("standoff dither")
+                passes.append("standoff dither" if use_dither
+                              else "standoff dither DROPPED (degenerate fit)")
             win.session.cal.notes = (f"gain trim from the guided magnet run of "
                              f"{time.strftime('%Y-%m-%d %H:%M')} "
                              f"({os.path.basename(path)}); passes: "
                              f"{', '.join(passes)}; no geometry weighting -- "
-                             f"every sensor was measured at its own peak")
+                             f"every sensor was measured at its own peak"
+                             + ("" if rng is None or rng["usable"] else
+                                f"; {len(rng['over'])} sensors reached full "
+                                f"scale during the run"))
             cal_path = win.session.cal.save(win.session.args.calibration)
             kept = win.session.cal.archived_to
             win.session.log(f"gain trim applied from the guided run "

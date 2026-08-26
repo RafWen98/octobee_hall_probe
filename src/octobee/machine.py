@@ -76,10 +76,11 @@ CONFIG_NAME = "machine.json"
 
 # The winding pack has to be given a thickness before anything can be said
 # about clearance, and no simsopt file records one: the optimiser works with
-# infinitely thin filaments. 20 mm is a placeholder that is honest about being
-# one -- it is the number to change first, in the tool, once the real conductor
-# is measured.
-DEFAULT_COIL_RADIUS_MM = 20.0
+# infinitely thin filaments. 60 mm is the winding pack this rig is being built
+# around -- still a number to check against the real conductor rather than one
+# read out of any file, but close enough that the clearance figure starts out
+# in the right place instead of a hundred millimetres optimistic.
+DEFAULT_COIL_RADIUS_MM = 60.0
 
 # Points per coil when a centreline is evaluated. 256 puts the chord error of a
 # 3 m coil at well under a tenth of a millimetre, which is far below anything
@@ -639,6 +640,24 @@ def _coarse_outline(coil):
     return cached
 
 
+_COARSE_BY_CURVE = {}
+
+
+def _coarse_outline_of(points_mm):
+    """_coarse_outline for a bare centreline, cached by array identity."""
+    key = id(points_mm)
+    cached = _COARSE_BY_CURVE.get(key)
+    if cached is not None:
+        return cached
+    shim = type("_Curve", (), {"points_mm": points_mm, "_coarse": None})()
+    cached = _coarse_outline(shim)
+    # Bounded: a session loads a handful of coil sets, not thousands.
+    if len(_COARSE_BY_CURVE) > 256:
+        _COARSE_BY_CURVE.clear()
+    _COARSE_BY_CURVE[key] = cached
+    return cached
+
+
 def clearance(points_mm, coilset, radius_mm, labels=None):
     """Closest approach from a cloud of probe points to the coil surfaces.
 
@@ -731,26 +750,215 @@ def probe_cloud(geom, spacing_mm=8.0):
     return pgeom.to_world(np.vstack(clouds))
 
 
+# How many grid nodes are put against the coils in one go. Each costs an
+# (N, 32) matrix per coil, so the whole grid at once is hundreds of megabytes
+# for no gain; sixty-four thousand keeps the working set inside cache-sized
+# BLAS calls and still amortises the per-call overhead away.
+REACH_CHUNK = 65536
+
+# Refuse a dilation whose structuring element is bigger than this. The probe
+# voxelises to a few thousand cells at any sensible scan step; a hundred
+# thousand means the step was set to something like a tenth of a millimetre,
+# where this whole approach is the wrong tool and a straight answer beats an
+# hour of grinding.
+MAX_BODY_VOXELS = 100000
+
+# And refuse the dilation itself past this much work -- one OR of the whole
+# grid per probe cell, so cells x nodes. A 300 mm cube is 12 M at a 10 mm step
+# and 320 M at 5 mm, which are a tenth of a second and five seconds; 1 mm would
+# be seven thousand times the 5 mm figure, and the useful thing to do about
+# that is say so immediately rather than appear to be working.
+MAX_DILATION_OPS = 2_000_000_000
+
+
+class VolumeTooFine(ValueError):
+    """The requested step makes the reachable-volume calculation absurd."""
+
+
+def reachable_grid(origin_rig_mm, step_mm, shape, placement, cloud_mount_mm,
+                   coilset, radius_mm, margin_mm=0.0, labels=None,
+                   progress=None):
+    """Which nodes of a regular rig-frame grid the probe body can occupy.
+
+    This is the question a scan plan actually asks, and it is not the question
+    `clearance` answers. `clearance` says how close the probe is to a winding
+    at ONE place, exactly, in a few milliseconds. A 300 mm cube on a 10 mm grid
+    has thirty thousand places in it, and asking exactly costs a minute -- long
+    enough that nobody moves a slider and watches the volume change, which is
+    the whole point of drawing it.
+
+    So it is done the other way round. The probe body is rigid and, on this
+    rig, cannot tilt: the stage only translates it. The set of flange positions
+    that put some part of the probe inside a winding is therefore exactly the
+    forbidden region DILATED by the probe's own shape -- a Minkowski sum, which
+    on a regular grid is a handful of shifted ORs over a boolean array. One
+    pass marks the nodes that are too close to a coil; the dilation turns that
+    into "somewhere the flange cannot be" in a fraction of a second.
+
+    Everything is in the RIG frame, which is the frame the stages move in and
+    the frame a scan is specified in: node (i, j, k) is
+    `origin_rig_mm + step_mm * (i, j, k)`, a stage reading, carried into the
+    machine by `placement.flange_path_mm` -- stage zero included, so a node
+    here and a clearance printed for the same stage reading agree.
+    `cloud_mount_mm` is probe_cloud() output, already in that frame.
+
+    CONSERVATIVE, AND BY A STATED AMOUNT. Two approximations are made and both
+    are paid for up front rather than hidden:
+
+      * the probe is snapped to the grid, which moves any part of it by at
+        most half a diagonal, `step * sqrt(3) / 2`;
+      * coils are measured against their decimated outlines FIRST, and every
+        node the decimation cannot settle is then measured against the real
+        curve -- so the decimation costs time, not standoff.
+
+    Only the snap is therefore paid for, and it is added to the exclusion
+    radius: a node is called reachable only if it is reachable for every body
+    position consistent with it. The answer can refuse a position that is in
+    fact fine -- never the reverse. At a 10 mm step that is 8.7 mm of extra
+    standoff, which `grid_standoff_mm` reports so it can be read as part of the
+    margin rather than mistaken for precision.
+
+    Returns a boolean array of `shape`: True where the probe fits.
+    """
+    shape = tuple(int(v) for v in shape)
+    step = float(step_mm)
+    origin = np.asarray(origin_rig_mm, dtype=float).reshape(3)
+    if step <= 0.0:
+        raise VolumeTooFine("the grid step must be positive")
+    if coilset is None or not len(coilset):
+        return np.ones(shape, dtype=bool)
+    curves = [c.points_mm for c in coilset
+              if labels is None or c.label in labels]
+    if not curves:
+        return np.ones(shape, dtype=bool)
+
+    # ---- the probe, as whole grid cells ----
+    body = np.asarray(cloud_mount_mm, dtype=float).reshape(-1, 3)
+    cells = np.unique(np.rint(body / step).astype(np.int64), axis=0)
+    if len(cells) > MAX_BODY_VOXELS:
+        raise VolumeTooFine(
+            f"a {step:g} mm step chops the probe into {len(cells):,} cells; "
+            f"the reachable volume is computed by dilating the coils with the "
+            f"probe, and that is more shifts than it is worth. Use a coarser "
+            f"step for the volume, or turn coil avoidance off.")
+    snap_mm = step * math.sqrt(3.0) / 2.0
+    lo_c, hi_c = cells.min(axis=0), cells.max(axis=0)
+    work = len(cells) * int(np.prod(shape, dtype=np.int64))
+    if work > MAX_DILATION_OPS:
+        raise VolumeTooFine(
+            f"a {step:g} mm step over this box needs {work / 1e9:.0f} billion "
+            f"operations to work out where the probe fits. Use a coarser step "
+            f"for the volume -- it only sets how far apart the swept LINES "
+            f"are, not how finely each line is sampled -- or turn coil "
+            f"avoidance off.")
+
+    # ---- the region the probe can reach into, one node per grid cell ----
+    big = tuple(int(shape[a] + hi_c[a] - lo_c[a]) for a in range(3))
+    axes = [origin[a] + step * (np.arange(big[a]) + lo_c[a]) for a in range(3)]
+
+    # Two passes per coil, as `clearance` does it: the decimated outline says
+    # which nodes are certainly in and certainly out, and only the band it
+    # cannot settle -- a shell a couple of centimetres thick around each
+    # winding -- is put against the real 256-point curve. That is an eighth of
+    # the cost of measuring everything exactly, and gives the same answer.
+    # Nodes are built a slab at a time rather than all at once: the expanded
+    # grid is bigger than the volume by the probe's own size on every side, and
+    # materialising it as one (N, 3) float array is where a fine step runs the
+    # machine out of memory long before it runs out of patience.
+    threshold = radius_mm + margin_mm + snap_mm
+    total = int(np.prod(big, dtype=np.int64))
+    forbidden = np.zeros(total, dtype=bool)
+    per_slab = max(1, REACH_CHUNK // max(1, big[1] * big[2]))
+    for i0 in range(0, big[0], per_slab):
+        i1 = min(i0 + per_slab, big[0])
+        nodes = np.stack(np.meshgrid(axes[0][i0:i1], axes[1], axes[2],
+                                     indexing="ij"), axis=-1).reshape(-1, 3)
+        chunk = placement.flange_path_mm(nodes)
+        hit = np.zeros(len(chunk), dtype=bool)
+        for curve in curves:
+            coarse, slack = _coarse_outline_of(curve)
+            idx = np.flatnonzero(~hit)
+            if not len(idx):
+                break
+            d2, _t = _segment_distances(chunk[idx], coarse)
+            near = np.sqrt(np.maximum(d2.min(axis=1), 0.0))
+            hit[idx[near <= threshold - slack]] = True
+            band = idx[(near > threshold - slack) & (near <= threshold + slack)]
+            if len(band):
+                d2, _t = _segment_distances(chunk[band], curve)
+                exact = np.sqrt(np.maximum(d2.min(axis=1), 0.0))
+                hit[band[exact <= threshold]] = True
+        forbidden[i0 * big[1] * big[2]:i1 * big[1] * big[2]] = hit
+        if progress is not None:
+            progress(i1, big[0])
+    forbidden = forbidden.reshape(big)
+
+    # ---- dilate: the flange cannot be anywhere that puts a cell in there ----
+    blocked = np.zeros(shape, dtype=bool)
+    for cell in cells:
+        i, j, k = (int(cell[a] - lo_c[a]) for a in range(3))
+        blocked |= forbidden[i:i + shape[0], j:j + shape[1], k:k + shape[2]]
+    return ~blocked
+
+
+def grid_standoff_mm(step_mm, coilset=None, labels=None):
+    """How much standoff `reachable_grid` adds on top of the asked-for margin.
+
+    Only the grid snap: the coil decimation is refined away rather than paid
+    for. `coilset` is accepted and ignored so callers need not know that.
+    """
+    return float(step_mm) * math.sqrt(3.0) / 2.0
+
+
+def clear_of_coils(origins_mm, placement, cloud_mount_mm, coilset, radius_mm,
+                   margin_mm=0.0, labels=None, progress=None,
+                   should_abort=None):
+    """Exactly which of these flange positions the probe body can occupy.
+
+    The authority, and the slow one: one full `clearance` per position, the
+    same answer the tab prints for the pose on screen. `reachable_grid` plans
+    with it; this checks what the plan actually ended up asking for, which is a
+    far smaller set -- the ends of each scan line rather than every node of the
+    volume they were carved out of.
+
+    `origins_mm` are flange positions in MACHINE millimetres, one per row.
+    Returns a boolean (N,) array.
+    """
+    origins = np.asarray(origins_mm, dtype=float).reshape(-1, 3)
+    if coilset is None or not len(coilset) or not len(origins):
+        return np.ones(len(origins), dtype=bool)
+    body = np.asarray(cloud_mount_mm, dtype=float) @ placement.rotation().T
+    ok = np.zeros(len(origins), dtype=bool)
+    for i, here in enumerate(origins):
+        if should_abort is not None and should_abort():
+            break
+        gap = clearance(here + body, coilset, radius_mm, labels=labels)
+        ok[i] = gap.gap_mm > margin_mm
+        if progress is not None and not i % 32:
+            progress(i, len(origins))
+    if progress is not None:
+        progress(len(origins), len(origins))
+    return ok
+
+
 # ==========================================================================
 # where the probe is: the mount pose, and the stage on top of it
 # ==========================================================================
 
-def rotation_matrix(yaw_deg, pitch_deg, roll_deg):
-    """Rz(yaw) Ry(pitch) Rx(roll) -- yaw applied last, as read out loud.
+def rotation_matrix(rot_z_deg):
+    """Rz -- the only rotation this rig has.
 
-    Yaw is the one that matters on this rig (it swings the probe round the
-    torus), so it is the outermost: changing it turns the whole assembly about
-    the machine's Z axis whatever pitch and roll are already set, which is what
-    somebody typing into the box expects.
+    The probe is bolted to a three-axis cartesian gantry that cannot tilt it:
+    the tube lies horizontal along the rig's Y and the only freedom is which
+    way round the machine the whole assembly is turned, about the machine's Z,
+    which is the axis of the torus. Pitch and roll used to be settable and were
+    always zero, and a pose box that can be set to something the rig cannot do
+    is a way to produce a confident clearance number about an impossible
+    position.
     """
-    y, p, r = (math.radians(v) for v in (yaw_deg, pitch_deg, roll_deg))
-    cz, sz = math.cos(y), math.sin(y)
-    cy, sy = math.cos(p), math.sin(p)
-    cx, sx = math.cos(r), math.sin(r)
-    rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
-    ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
-    rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
-    return rz @ ry @ rx
+    a = math.radians(rot_z_deg)
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
 class Placement:
@@ -763,15 +971,12 @@ class Placement:
 
     AXES = ("x", "y", "z")
 
-    def __init__(self, x_mm=0.0, y_mm=0.0, z_mm=0.0,
-                 yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0,
+    def __init__(self, x_mm=0.0, y_mm=0.0, z_mm=0.0, rot_z_deg=0.0,
                  stage_zero_mm=None, travel_mm=None):
         self.x_mm = float(x_mm)
         self.y_mm = float(y_mm)
         self.z_mm = float(z_mm)
-        self.yaw_deg = float(yaw_deg)
-        self.pitch_deg = float(pitch_deg)
-        self.roll_deg = float(roll_deg)
+        self.rot_z_deg = float(rot_z_deg)
         self.stage_zero_mm = dict.fromkeys(self.AXES, 0.0)
         self.stage_zero_mm.update({k: float(v) for k, v
                                    in (stage_zero_mm or {}).items()
@@ -784,7 +989,7 @@ class Placement:
 
     # ---- the transform ----
     def rotation(self):
-        return rotation_matrix(self.yaw_deg, self.pitch_deg, self.roll_deg)
+        return rotation_matrix(self.rot_z_deg)
 
     def offset_mm(self, stage_mm=None):
         """Where the stages have carried the probe, in the mount frame."""
@@ -796,6 +1001,21 @@ class Placement:
         """The flange, in machine mm."""
         base = np.array([self.x_mm, self.y_mm, self.z_mm])
         return base + self.rotation() @ self.offset_mm(stage_mm)
+
+    def flange_path_mm(self, rig_mm):
+        """(N, 3) rig positions -> where the flange sits, machine mm.
+
+        The vector form of origin_mm(), for the things that ask about a whole
+        set of stage positions at once rather than the one the probe is at: the
+        corners of a volume, the ends of every line of a sweep, the nodes of a
+        reachability grid. Same arithmetic, same stage zero, so a box drawn by
+        this and a clearance computed by origin_mm() cannot disagree about
+        where the rig's 100 mm is.
+        """
+        rig = np.asarray(rig_mm, dtype=float).reshape(-1, 3)
+        zero = np.array([self.stage_zero_mm[a] for a in self.AXES])
+        base = np.array([self.x_mm, self.y_mm, self.z_mm])
+        return base + (rig - zero) @ self.rotation().T
 
     def to_machine(self, points_mount_mm, stage_mm=None):
         """Mount-frame points (probe_geometry's world frame) -> machine mm."""
@@ -820,22 +1040,38 @@ class Placement:
     # ---- persistence ----
     def to_dict(self):
         return {"x_mm": self.x_mm, "y_mm": self.y_mm, "z_mm": self.z_mm,
-                "yaw_deg": self.yaw_deg, "pitch_deg": self.pitch_deg,
-                "roll_deg": self.roll_deg,
+                "rot_z_deg": self.rot_z_deg,
                 "stage_zero_mm": dict(self.stage_zero_mm),
                 "travel_mm": {k: list(v) for k, v in self.travel_mm.items()}}
 
-    _FIELDS = frozenset(("x_mm", "y_mm", "z_mm", "yaw_deg", "pitch_deg",
-                         "roll_deg", "stage_zero_mm", "travel_mm"))
+    _FIELDS = frozenset(("x_mm", "y_mm", "z_mm", "rot_z_deg",
+                         "stage_zero_mm", "travel_mm"))
 
     @classmethod
-    def from_dict(cls, doc):
-        return cls(**{k: v for k, v in (doc or {}).items() if k in cls._FIELDS})
+    def from_dict(cls, doc, on_note=None):
+        """Read a pose, including one written before the tilts were removed.
+
+        `yaw_deg` was rotation about the machine's Z under a different name, so
+        it is carried straight across. A file with a non-zero pitch or roll
+        describes a pose this rig has never been able to reach; it is dropped
+        rather than silently approximated, and said out loud, because the
+        difference shows up as a clearance number and not as an error.
+        """
+        doc = dict(doc or {})
+        if "rot_z_deg" not in doc and "yaw_deg" in doc:
+            doc["rot_z_deg"] = doc["yaw_deg"]
+        stale = [k for k in ("pitch_deg", "roll_deg")
+                 if abs(float(doc.get(k) or 0.0)) > 1e-9]
+        if stale and on_note is not None:
+            on_note("the saved pose has " + " and ".join(
+                f"{k.split('_')[0]} {float(doc[k]):g} deg" for k in stale)
+                + ", which this rig cannot do -- dropped, leaving the "
+                  "rotation about Z. Re-measure the pose if it mattered.")
+        return cls(**{k: v for k, v in doc.items() if k in cls._FIELDS})
 
     def describe(self):
         return (f"flange at ({self.x_mm:+.0f}, {self.y_mm:+.0f}, "
-                f"{self.z_mm:+.0f}) mm, yaw {self.yaw_deg:g} deg, "
-                f"pitch {self.pitch_deg:g} deg, roll {self.roll_deg:g} deg")
+                f"{self.z_mm:+.0f}) mm, turned {self.rot_z_deg:g} deg about Z")
 
 
 class MachineConfig:
@@ -858,7 +1094,13 @@ class MachineConfig:
         # worth being able to save.
         self.energised = None if energised is None else list(energised)
         self.track_stage = bool(track_stage)
-        self.pose = pose if isinstance(pose, Placement) else Placement.from_dict(pose)
+        # Anything the saved pose could not be read literally -- a tilt from
+        # before the rig's freedoms were stated honestly. Held rather than
+        # printed, because this is constructed before there is anywhere to
+        # print to; the GUI empties it into the log when the tab announces.
+        self.pose_notes = []
+        self.pose = (pose if isinstance(pose, Placement)
+                     else Placement.from_dict(pose, self.pose_notes.append))
         self.notes = str(notes or "")
 
     # ---- coils ----

@@ -38,6 +38,7 @@ import os
 
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
+from octobee.motion import encoder as oenc
 from octobee.calib import geometry as pgeom
 from octobee import machine as omach
 from octobee import paths
@@ -82,6 +83,14 @@ class Session:
         # Rebuilt whenever the source or the output rate changes; it holds
         # the tail of the last block, which belongs to the next row.
         self.decimator = ocal.Decimator(1)
+        # Encoder counts ride the same stream and have to come out row for row
+        # with the field, so they get their own Decimator at the same factor,
+        # fed the same number of samples on the same tick. Two instances
+        # rather than one array because the field is converted to millitesla
+        # on the way through and the counts must not be.
+        self.enc_decimator = ocal.Decimator(1)
+        self.enc_stream = None
+        self.encoders = oenc.EncoderMap()
         self.prev_clkdiv = {}
         self.out_rate = 500.0
 
@@ -90,6 +99,14 @@ class Session:
         self.collecting = None          # 'tare' | 'magnet' | 'sweep'
         self.csv_rec = None
         self.raw_rec = None
+
+        # A volume sweep in flight. The runner is driven by its own thread and
+        # says which line is being swept; the acquisition tick files decimated
+        # blocks against that. Both None when nothing is sweeping, which is
+        # what the tick checks -- one attribute read per tick when idle.
+        self.volume_runner = None
+        self.volume_log = None
+        self.volume_t = 0.0
 
         # ---- results other tabs read ---------------------------------------
         self.sweeps = {}                # tag -> roll sweep
@@ -127,6 +144,9 @@ class Session:
         samples it is holding were taken under the old one.
         """
         self.decimator = ocal.Decimator(self.decim())
+        self.enc_decimator = ocal.Decimator(self.decim())
+        cols = int(getattr(self.source, "enc_columns", 0) or 0)
+        self.enc_stream = oenc.EncoderStream(cols) if cols else None
         return self.decimator
 
     # ---- logging ----------------------------------------------------------

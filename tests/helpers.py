@@ -336,16 +336,25 @@ def _synth_magnet_run(g, gain, magnet_world, span_mm=260.0, step_mm=4.0,
 
 
 def _synth_magnet_passes(g, gain, magnet_world, jitter, standoff_mm=30.0,
-                         plane=True, dither=True, seed=4):
+                         plane=True, dither=True, seed=4, noise_ut=0.0):
     """A guided run with ARM MISPLACEMENT, measured by all three passes.
 
     `jitter` is (across, along, standoff) rms in mm, applied per sensor in the
     probe's own frame so that it rides with the head through the four poses --
     which is what a real arm does, and what makes the error impossible to
     average away by rolling.
+
+    `noise_ut` is per-point, per-axis Gaussian noise in microtesla -- what a
+    real average at one point actually leaves. It defaults to zero because
+    most of the checks here are about the METHOD and are clearer without it,
+    but pass C's failure mode cannot be reproduced without it: a noiseless fit
+    recovers the right distance from a badly sized dither, and it is the noise
+    sliding d and n along their shared valley that produces the degenerate
+    answer that looks healthy. See test_dither_quality.
     """
     rng = np.random.default_rng(seed)
     jit = rng.normal(0.0, 1.0, (16, 3)) * np.asarray(jitter, float)
+    sigma_mt = float(noise_ut) / 1000.0
 
     def roll(deg):
         c, s = np.cos(np.deg2rad(deg)), np.sin(np.deg2rad(deg))
@@ -359,6 +368,8 @@ def _synth_magnet_passes(g, gain, magnet_world, jitter, standoff_mm=30.0,
             r = magnet_world - p
             d = np.linalg.norm(r)
             b[i] = gain[i] * (r / d) * (50.0 / d) ** 3
+        if sigma_mt > 0:
+            b = b + rng.normal(0.0, sigma_mt, b.shape)
         return b
 
     across = "x" if plane else None

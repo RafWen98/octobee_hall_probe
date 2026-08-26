@@ -11,13 +11,25 @@ What this tab does NOT own: the emergency stop and the motion-worker registry
 (octobee/gui/estop.py -- they have to reach further than any tab), and the
 toolbar. What it needs from those arrives as four callables, named at the top
 of __init__.
+
+Like Live, this module puts a second widget somewhere else:
+
+    StagesTab      find, reference, jog, and the field map, in the tab strip
+    StageJogPane   the three axes and nothing else, in the right-hand pane --
+                   because "nudge it 2 mm and watch what the field does" is a
+                   thing you do while looking at the Live plot or the Machine
+                   view, and it should not cost a trip through the tab strip
+
+The pane is a second face on this tab, not a second implementation. Every
+button on it calls the method the tab's own button calls, so the interlock,
+the busy check and the not-homed refusal are written once.
 """
 
 import os
 import time
 
 import numpy as np
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from octobee.gui.sources import LiveSource
 from octobee.gui.workers import ScanWorker, StageWorker, _stage_set_for
@@ -266,6 +278,15 @@ class StagesTab(QtWidgets.QWidget):
         lay.addWidget(g3)
 
         lay.addStretch(1)
+
+        # Lives in the window's right-hand pane, not in this layout. Built
+        # here anyway so that everything which guards a move -- stage_action,
+        # the not-homed refusal, sync_controls -- has one owner.
+        self.jog_pane = StageJogPane(jog=self.on_stage_jog,
+                                     goto=self.on_stage_goto,
+                                     home=lambda: self.on_stage_home(None),
+                                     stop=self.motion.stop)
+
         self._update_scan_estimate()
         self._set_stage_controls_enabled(False)
 
@@ -420,6 +441,8 @@ class StagesTab(QtWidgets.QWidget):
         for r in range(self.stage_table.rowCount()):
             self.stage_table.setItem(r, 3, QtWidgets.QTableWidgetItem("—"))
             self.stage_table.setItem(r, 4, QtWidgets.QTableWidgetItem("closed"))
+        for ax in self.stage_rows:
+            self.jog_pane.set_present(ax, False)
         self.session.log("stages: closed")
 
     def stage_action(self, what, fn):
@@ -474,6 +497,9 @@ class StagesTab(QtWidgets.QWidget):
                     # to find that out by pressing Go.
                     lo, hi = self.session.stages[ax].limit_mm
                     row["target"].setRange(lo, hi)
+                self.jog_pane.set_present(ax, have,
+                                          self.session.stages[ax].limit_mm
+                                          if have else None)
             self._set_stage_controls_enabled(True)
             for ax, row in self.scan_rows.items():
                 have = ax in self.session.stages.names
@@ -705,6 +731,11 @@ class StagesTab(QtWidgets.QWidget):
         self.btn_scan_start.setEnabled(live)
         # Stopping stays available in every state that is not "no stages".
         self.btn_stage_stop.setEnabled(self.session.stages is not None)
+        # The right-hand pane is the same three axes under the same gate: it
+        # must never offer a move this tab is refusing.
+        self.jog_pane.set_live(live, {ax: row.get("present", False)
+                                      for ax, row in self.stage_rows.items()})
+        self.jog_pane.set_stop_enabled(self.session.stages is not None)
 
     def refresh_stage_table(self):
         """Position and state per stage, off the DLL's own polling cache."""
@@ -721,6 +752,7 @@ class StagesTab(QtWidgets.QWidget):
             except ostage.StageError:
                 continue
             self.motion.watchdog(snap)
+            self.jog_pane.set_axis_state(st.name, snap)
             # Before opening, all the bus can say is "APT Stepper Motor
             # Controller"; the actual model only arrives with the settings.
             if snap["model"] and self.stage_table.item(r, 1).text() != snap["model"]:
@@ -955,3 +987,195 @@ class StagesTab(QtWidgets.QWidget):
         self.btn_stage_connect.setEnabled(False)
         self.stage_action("connect", lambda emit: stages.open())
         return True
+
+
+class StageJogPane(QtWidgets.QWidget):
+    """The three axes, in the right-hand pane, next to what they move.
+
+    Deliberately smaller than the Stages tab. There is no device list, no axis
+    map and no field map here -- those are set up once and then not touched
+    again. What does get touched constantly is "nudge it 2 mm and watch what
+    the field does", and until now that meant leaving whichever view you were
+    reading to do it.
+
+    Nothing is duplicated but the widgets. Every button calls straight back
+    into StagesTab, so the emergency-stop latch, the one-move-at-a-time guard
+    and the refusal to move an unreferenced axis absolutely are each still
+    written exactly once, in the tab.
+    """
+
+    AXES = ("x", "y", "z")
+
+    def __init__(self, jog, goto, home, stop, parent=None):
+        super().__init__(parent)
+        self._jog = jog
+        self._goto = goto
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 4)
+        lay.setSpacing(4)
+
+        head = QtWidgets.QLabel(
+            "Stages — the same three axes as the Stages tab, and the same "
+            "guards on them.")
+        head.setWordWrap(True)
+        head.setStyleSheet("color:#9aa3b2; font-size:11px;")
+        lay.addWidget(head)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(3)
+        for col, text in ((3, "step"), (6, "move to")):
+            hdr = QtWidgets.QLabel(text)
+            hdr.setStyleSheet("color:#9aa3b2; font-size:10px;")
+            hdr.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+            grid.addWidget(hdr, 0, col)
+
+        self.rows = {}
+        for r, ax in enumerate(self.AXES, start=1):
+            lbl = QtWidgets.QLabel(ax)
+            lbl.setStyleSheet("font-weight:bold;")
+            pos = QtWidgets.QLabel("—")
+            pos.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight
+                             | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            pos.setMinimumWidth(84)
+            # Fixed-width digits: the readout ticks five times a second while
+            # an axis is moving, and in a proportional font the whole row
+            # jitters as the digits change under it.
+            pos.setFont(QtGui.QFontDatabase.systemFont(
+                QtGui.QFontDatabase.SystemFont.FixedFont))
+            step = QtWidgets.QDoubleSpinBox()
+            step.setRange(0.001, 100.0)
+            step.setDecimals(3)
+            step.setValue(1.0)
+            step.setSuffix(" mm")
+            step.setMinimumWidth(104)
+            minus = QtWidgets.QPushButton("−")
+            plus = QtWidgets.QPushButton("+")
+            for b in (minus, plus):
+                b.setMaximumWidth(30)
+            target = QtWidgets.QDoubleSpinBox()
+            target.setRange(0.0, 300.0)
+            target.setDecimals(3)
+            target.setSuffix(" mm")
+            target.setMinimumWidth(104)
+            go = QtWidgets.QPushButton("Go")
+            go.setMaximumWidth(40)
+            here = QtWidgets.QPushButton("⇣")
+            here.setMaximumWidth(26)
+            here.setToolTip("Put the current reading in the box next door, as "
+                            "a starting point to edit.")
+
+            minus.clicked.connect(
+                lambda _, a=ax, s=step: self._jog(a, -s.value()))
+            plus.clicked.connect(
+                lambda _, a=ax, s=step: self._jog(a, +s.value()))
+            go.clicked.connect(
+                lambda _, a=ax, t=target: self._goto(a, t.value()))
+            here.clicked.connect(lambda _, a=ax: self.take_position(a))
+
+            for c, wdg in enumerate((lbl, pos, minus, step, plus, here, target,
+                                     go)):
+                grid.addWidget(wdg, r, c)
+            self.rows[ax] = {"pos": pos, "step": step, "target": target,
+                             "present": False, "mm": None, "trusted": True,
+                             "widgets": (minus, step, plus, here, target, go)}
+        grid.setColumnStretch(1, 1)
+        lay.addLayout(grid)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        self.btn_home = QtWidgets.QPushButton("Home all")
+        self.btn_home.setToolTip(
+            "Drives every axis into its limit switch, one at a time, across "
+            "the whole travel. It asks first — the probe and its cabling "
+            "have to be clear of the entire range of movement.")
+        self.btn_home.clicked.connect(lambda: home())      # noqa: PLW0108
+        self.btn_stop = QtWidgets.QPushButton("Stop moving")
+        self.btn_stop.setStyleSheet(
+            "background:#7a1f1f; color:#fff; font-weight:bold;")
+        self.btn_stop.setToolTip(
+            "End the move in progress without latching the machine off. "
+            "Profiled, so positions stay trustworthy and nothing needs "
+            "re-homing.\n\n"
+            "For 'something is wrong', use EMERGENCY STOP in the top right "
+            "(or Esc).")
+        self.btn_stop.clicked.connect(lambda: stop())       # noqa: PLW0108
+        row.addWidget(self.btn_home)
+        row.addWidget(self.btn_stop)
+        lay.addLayout(row)
+
+        self.lbl_note = QtWidgets.QLabel("stages not connected")
+        self.lbl_note.setWordWrap(True)
+        self.lbl_note.setStyleSheet("color:#9aa3b2; font-size:11px;")
+        lay.addWidget(self.lbl_note)
+
+        self.set_live(False)
+        self.set_stop_enabled(False)
+
+    def take_position(self, axis):
+        """Copy the live reading into that axis's target box."""
+        mm = self.rows[axis]["mm"]
+        if mm is not None:
+            self.rows[axis]["target"].setValue(mm)
+
+    def set_present(self, axis, present, limits=None):
+        """Say whether this axis exists, and what it is allowed to reach.
+
+        The soft limit rather than the travel, exactly as on the tab: a box
+        that offers a number the axis will refuse is an invitation to find
+        that out by pressing Go.
+        """
+        row = self.rows.get(axis)
+        if row is None:
+            return
+        row["present"] = bool(present)
+        if present and limits is not None:
+            row["target"].setRange(float(limits[0]), float(limits[1]))
+        if not present:
+            row["pos"].setText("—")
+            row["pos"].setStyleSheet("")
+            row["mm"] = None
+            row["trusted"] = True
+
+    def set_live(self, live, present=None):
+        """Enable the move controls, per axis, under the tab's own gate."""
+        for ax, row in self.rows.items():
+            if present is not None:
+                row["present"] = bool(present.get(ax, row["present"]))
+            for wdg in row["widgets"]:
+                wdg.setEnabled(bool(live) and row["present"])
+        self.btn_home.setEnabled(bool(live))
+        self._note()
+
+    def set_stop_enabled(self, on):
+        self.btn_stop.setEnabled(bool(on))
+
+    def set_axis_state(self, axis, snap):
+        """One axis's line of the stage table, off the DLL's polling cache."""
+        row = self.rows.get(axis)
+        if row is None:
+            return
+        mm = float(snap["position_mm"])
+        row["mm"] = mm
+        row["trusted"] = bool(snap["trusted"])
+        row["pos"].setText(f"{mm:9.3f} mm")
+        # Amber while it is moving, red while the counter cannot be believed.
+        # The number is shown either way -- an unreferenced axis still has a
+        # reading, and blanking it would hide exactly the situation someone is
+        # trying to understand -- but it must not look like a coordinate.
+        row["pos"].setStyleSheet(
+            "color:#e07a5f;" if not snap["trusted"]
+            else "color:#e8c547;" if snap["moving"] else "")
+        self._note()
+
+    def _note(self):
+        """The one line under the buttons: what is stopping a move."""
+        present = [ax for ax, row in self.rows.items() if row["present"]]
+        if not present:
+            self.lbl_note.setText("stages not connected")
+            return
+        unref = [ax for ax in present if not self.rows[ax]["trusted"]]
+        self.lbl_note.setText(
+            f"{', '.join(unref)} not referenced — jogging is relative and "
+            f"works, Go is refused until it is homed" if unref else "")

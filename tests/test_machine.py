@@ -140,7 +140,7 @@ def test_machine_placement(workdir):
     # machine y -- if it moved along machine x regardless, the drawing would
     # be wrong in exactly the way nobody would notice until the head hit
     # something.
-    pose = omach.Placement(yaw_deg=90.0)
+    pose = omach.Placement(rot_z_deg=90.0)
     moved = pose.origin_mm({"x": 10.0, "y": 0.0, "z": 0.0})
     check("a stage move is applied in the rig's frame, not the machine's",
           np.allclose(moved, [0.0, 10.0, 0.0], atol=1e-9), str(moved))
@@ -151,17 +151,36 @@ def test_machine_placement(workdir):
     check("and moving off it moves the probe by the difference",
           np.allclose(pose.origin_mm({"x": 130.0}), [35.0, 0.0, 0.0]))
 
-    # Yaw is applied last, so whatever pitch and roll have already done to the
-    # assembly, changing yaw turns THAT about the machine's Z. Stated as the
-    # identity it has to satisfy rather than as one vector's image, because
-    # the vector could come out right for a rotation composed the other way.
-    tilted = omach.Placement(pitch_deg=20.0, roll_deg=90.0).rotation()
-    turned = omach.Placement(yaw_deg=35.0, pitch_deg=20.0,
-                             roll_deg=90.0).rotation()
-    rz = omach.rotation_matrix(35.0, 0.0, 0.0)
-    check("yaw turns the assembly about the machine's Z, whatever it is doing",
-          np.allclose(turned, rz @ tilted, atol=1e-12),
-          f"largest disagreement {np.abs(turned - rz @ tilted).max():.2e}")
+    # The rig has one rotation and it is about the machine's Z. Stated as the
+    # properties it has to satisfy rather than as one vector's image, because
+    # a vector can come out right for a rotation composed the other way.
+    r = omach.Placement(rot_z_deg=35.0).rotation()
+    check("the only rotation is about the machine's Z",
+          np.allclose(r @ [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], atol=1e-12)
+          and np.allclose(r @ r.T, np.eye(3), atol=1e-12)
+          and abs(np.linalg.det(r) - 1.0) < 1e-12,
+          f"Z maps to {r @ [0.0, 0.0, 1.0]}, det {np.linalg.det(r):.6f}")
+    check("and turning twice is the same as turning by the sum",
+          np.allclose(omach.rotation_matrix(20.0) @ omach.rotation_matrix(15.0),
+                      r, atol=1e-12))
+
+    # A pose written before the tilts were removed. yaw WAS rotation about Z
+    # under another name, so it comes across; a pitch or a roll describes a
+    # pose this rig has never been able to reach, and being quietly ignored is
+    # how it would come back as a confident clearance number.
+    notes = []
+    old_pose = omach.Placement.from_dict(
+        {"x_mm": 3.0, "yaw_deg": 45.0, "pitch_deg": 20.0, "roll_deg": 0.0},
+        notes.append)
+    check("a pose saved before the tilts went keeps its rotation about Z",
+          abs(old_pose.rot_z_deg - 45.0) < 1e-9 and old_pose.x_mm == 3.0,
+          f"{old_pose.rot_z_deg} deg")
+    check("and a tilt in it is dropped out loud, not silently",
+          len(notes) == 1 and "pitch 20" in notes[0], str(notes))
+    quiet = []
+    omach.Placement.from_dict({"yaw_deg": 10.0, "pitch_deg": 0.0}, quiet.append)
+    check("while a file with the tilts at zero says nothing", not quiet,
+          str(quiet))
 
     corners = omach.Placement(travel_mm={"x": (0.0, 300.0),
                                          "y": (0.0, 100.0),
@@ -176,14 +195,14 @@ def test_machine_placement(workdir):
     cfg = omach.MachineConfig(coil_file=coil_path, coil_radius_mm=12.5,
                               configuration="BiotSavart2", current_scale=0.01,
                               energised=["C2"], track_stage=False)
-    cfg.pose = omach.Placement(x_mm=1.5, yaw_deg=30.0,
+    cfg.pose = omach.Placement(x_mm=1.5, rot_z_deg=30.0,
                                stage_zero_mm={"y": 12.0})
     cfg.save(path)
     back = omach.MachineConfig.load(path)
     check("the placement survives a save and a load",
           (back.coil_radius_mm == 12.5 and back.configuration == "BiotSavart2"
            and back.energised == ["C2"] and back.track_stage is False
-           and abs(back.pose.yaw_deg - 30.0) < 1e-9
+           and abs(back.pose.rot_z_deg - 30.0) < 1e-9
            and abs(back.pose.stage_zero_mm["y"] - 12.0) < 1e-9),
           json.dumps(back.to_dict())[:120])
 
@@ -216,7 +235,7 @@ def test_machine_placement(workdir):
           and abs(meta["coils"]["C2"]["amp_turns"] + 0.03) < 1e-12,
           json.dumps(meta["coils"]))
     check("and where the probe was, in machine coordinates",
-          "probe_origin_mm" in meta and meta["pose"]["yaw_deg"] == 30.0,
+          "probe_origin_mm" in meta and meta["pose"]["rot_z_deg"] == 30.0,
           str(meta.get("probe_origin_mm")))
     check("and which file the coils came from",
           os.path.samefile(meta["coil_file"], coil_path), meta["coil_file"])

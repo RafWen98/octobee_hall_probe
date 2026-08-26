@@ -200,6 +200,17 @@ class ProbeHeadPane(QtWidgets.QWidget):
         chk_lbl.setChecked(True)
         chk_lbl.toggled.connect(self.view3d.set_labels_visible)
         row.addWidget(chk_lbl)
+        self.chk_bars = QtWidgets.QCheckBox("peak bars")
+        self.chk_bars.setChecked(True)
+        self.chk_bars.setToolTip(
+            "The bar chart underneath. Untick it to give the height back to "
+            "the head and to the stage controls below — the bars answer "
+            "\"are the spikes the same height\", which is not a question you "
+            "are asking while driving the rig somewhere. Nothing else "
+            "changes: acquisition, calibration and recording carry on, and "
+            "the health check still uses every channel.")
+        self.chk_bars.toggled.connect(self.on_bars_toggle)
+        row.addWidget(self.chk_bars)
         btn = QtWidgets.QPushButton("reset view")
         btn.clicked.connect(self.view3d.reset_camera)
         row.addWidget(btn)
@@ -211,6 +222,20 @@ class ProbeHeadPane(QtWidgets.QWidget):
         self._draw_ms = 0.0
         self.session.log("3D head on" if on else
                      "3D head off -- everything else carries on unchanged")
+
+    def on_bars_toggle(self, on):
+        """Hide the peak bars, and stop computing them.
+
+        The peak is a max over half a second of the rolling buffer across all
+        16 sensors, every refresh. A hidden widget still gets its setData
+        honoured, so leaving the update running would give back the screen
+        space and none of the time.
+        """
+        self.bars.setVisible(bool(on))
+        self._draw_ms = 0.0
+        self.session.log("peak bars on" if on else
+                     "peak bars off -- the head and the stage controls take "
+                     "the space; nothing else changes")
 
     def draw(self, recent):
         """Paint the head and the bars. Returns how long it took, in ms."""
@@ -224,15 +249,16 @@ class ProbeHeadPane(QtWidgets.QWidget):
                 self.spin_fs.blockSignals(True)
                 self.spin_fs.setValue(max(fs, 0.001))
                 self.spin_fs.blockSignals(False)
-        with self.session.prof.time("  peak bars"):
-            # Peak over a trailing half second, not the instantaneous value: a
-            # magnet passed by hand is over well inside one refresh, so
-            # sampling one point would miss most passes.
-            n = max(2, min(recent.shape[0],
-                           int(self.session.out_rate * self.bars.window_s)))
-            self.bars.update_values(
-                np.linalg.norm(recent[-n:], axis=-1).max(axis=0),
-                self.session.cal.dead)
+        if self.chk_bars.isChecked():
+            with self.session.prof.time("  peak bars"):
+                # Peak over a trailing half second, not the instantaneous
+                # value: a magnet passed by hand is over well inside one
+                # refresh, so sampling one point would miss most passes.
+                n = max(2, min(recent.shape[0],
+                               int(self.session.out_rate * self.bars.window_s)))
+                self.bars.update_values(
+                    np.linalg.norm(recent[-n:], axis=-1).max(axis=0),
+                    self.session.cal.dead)
         return (time.perf_counter() - t0) * 1000.0
 
     def gl_info(self):

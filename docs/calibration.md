@@ -261,6 +261,38 @@ because curvature is second order and a ±1 mm dither buries it under the slope.
 That hands the run back to the rule and takes it off the standard, which is the
 intended direction — a non-standard standoff has no standard sizing.
 
+> **Get the standoff right to about 30 %, and measure it to the chips.** This
+> page used to say a factor of two was close enough. It is not, and the failure
+> is silent. On 2026-08-25 a run entered at 20 mm against a real standoff nearer
+> 50 gave a dither a tenth of the distance instead of a quarter; the fit went
+> degenerate rather than failing, and the correction took the gain trim's spread
+> from 1.30× to 5.9×. Every number on screen looked plausible.
+>
+> Measure to the **chips**, not to the face of the magnet: the field acts as
+> though it comes from inside the magnet, so a caliper reading face-to-face is
+> short by roughly half the magnet's length, plus however far the die sits
+> inside its package. Passes A and B forgive a bad guess here. Pass C does not,
+> and pass C is the one that multiplies into the trim.
+>
+> The run now refuses a degenerate pass C rather than applying it —
+> `MagnetRun.dither_quality()`. The check that catches it is the correlation
+> between each sensor's fitted distance and its fitted exponent: the exponent
+> belongs to the magnet, so sixteen independent measurements have no reason to
+> correlate with anything, and a fit sliding along a degenerate valley
+> correlates near 1. On that run it was 0.994 — while the median exponent, 2.78,
+> looked perfectly healthy.
+>
+> **The wizard runs that check too, which for a while it did not.** The check
+> lived only in `octobee magnet apply`, and the wizard — the path an operator
+> actually uses — called `response()` on its default and applied whatever came
+> back. That gap is what wrote the 5.9× trim. The wizard now drops pass C when
+> the fit is degenerate, falls back to the A+B trim, says so on screen and in
+> the calibration's own notes (`standoff dither DROPPED (degenerate fit)`), and
+> tells you how to re-derive from the same run once the real standoff is known.
+> It refuses rather than asking: "apply it anyway" is not a decision worth
+> offering at the end of a 44-minute run, and the fallback is not a worse
+> answer, it is the same run minus one pass.
+
 **Every pose is written to disk as it lands**, to one growing pair of
 `captures/magcal_*.npz` / `.json` files, so a crash or a closed window after
 pose 3 costs the poses you have not driven yet and nothing else. When the run
@@ -287,12 +319,97 @@ two before the trim: if the standoff column is mostly `--`, pass C could not
 fit and the distances are assumed rather than measured, and the fix is a longer
 average per point.
 
+**The three components are kept now, not just `|B|`.** Everything above works
+on the magnitude, because sixteen chips are turned sixteen ways and a magnitude
+is the only thing directly comparable between them — but what a magnitude
+throws away is exactly the orientation. At the top of its own plane peak each
+sensor sits in the same place relative to the magnet as every other sensor does
+at its peak, so the sixteen **peak vectors** are sixteen looks at one physical
+vector. Undo the pose and they must all agree; whatever is left over is the
+chips being turned differently from what `probe_geometry.json` says.
+
+`MagnetRun.peak_vectors()` returns them, `orientation_check()` reports the
+disagreement in degrees, and both go into the `.json` sidecar per sensor
+alongside the measured `y peak`, `x peak` and standoff — so "where is S7 and
+which way is it turned" is one file open, not a re-derivation from the raw
+sweep. Three things are worth knowing about the number it gives:
+
+* **It is relative, and only relative.** The magnet's own direction never
+  enters, so this compares the sixteen chips against each other — which is the
+  right question for a probe whose sixteen sensors are supposed to be
+  interchangeable, and is not an absolute orientation solve.
+* **A whole face off together is the index, not the chips.** Four chips do not
+  turn together by accident; that is the head not having been turned a true
+  quarter. It is reported separately, and it does not touch the trim. The
+  per-sensor number to read is the one *within* a face, where those four were
+  measured in one head position and no indexing error can reach.
+* **It measures tilt well and roll about each board's own normal weakly.** A
+  chip rotated about its normal leaves a vector pointing along that normal
+  unchanged, and at the top of the peak the field is mostly along the normal.
+  Read it as a lower bound on the disagreement. Step 6 is still what settles
+  `chip_rot_deg`.
+
+On the run of 2026-08-25 the sixteen agree to **5.9° median, 11.4° worst**, and
+4.0° median within a face — which is the first time that number has ever been
+measured on this probe, and is larger than a well-built head should give.
+
+> **Clipping is the one failure that quietly makes the calibration worse.** The
+> sensor's analogue output stops at its configured full scale, and a clipped
+> peak does not look like an error — it looks like a slightly smaller peak with
+> a flat top, on a sensor the trim will then turn *up* to compensate. Nothing
+> downstream can see it afterwards.
+>
+> `MagnetRun.range_check()` catches it, per **axis** rather than on `|B|`: the
+> chip has three independent outputs and each clips on its own, so a sensor can
+> be comfortably inside range on magnitude while one component is on the rail —
+> which is precisely the case that produces a plausible `|B|` out of nonsense.
+> The dither is included and is usually what trips it, because pass C
+> deliberately visits points *closer* than the peak: at a quarter of the
+> standoff the near end sees about 2.4× the peak field, so a run sized against
+> the peak alone can still clip there.
+>
+> The fix is **distance, not range**. At 1/r³ a small move buys a lot of
+> headroom, and widening the range costs resolution on all sixteen for the sake
+> of one; the report says how much further to back off. The wizard also draws
+> full scale as a line on the live plot and says so in the log the first time a
+> channel touches it, so this is catchable in the first two minutes rather than
+> after all four poses.
+
+**You can watch it happen.** A pose of the standard run is 145 points at 2.5 s
+each — eleven minutes in which the only thing on screen used to be a progress
+bar. The wizard now plots `|B|` per sensor against whichever axis the current
+pass is moving, with the four sensors of the answering face drawn bright and
+the other twelve faint, and full scale marked as a horizontal line that stays
+out of the auto-range so it appears only when the data climbs near it. A
+magnet clamped where the sweep never reaches, a face answering at a tenth of
+the others, a peak walking off the end of the travel and a channel on the rail
+are all obvious in the first two minutes of a picture and invisible in a count
+of points.
+
+Pass A also carries the **previous pose's** rings as vertical lines, which is
+the more useful overlay than its own: the head is only turned between poses,
+never moved along, so this pose's four peaks must land on last pose's four
+lines. A pose that also shifted the head sideways is the one setup fault that
+breaks the equal-approach argument quietly — this is what it looks like while
+it is happening. (Ring positions are measured along the tube, so they are not
+drawn on the cut or the dither, whose axes are x and z. A line in the right
+units at the wrong place is worse than no line.)
+
+Pointed at the run of 2026-08-25 the plot says two things the numbers did not.
+The transverse cut is nearly **flat** across its ±10 mm — which is what a cut
+sized for 20 mm looks like at a real 50 mm standoff, and means the peak
+position was barely determined. And the last ring's peak is still **rising at
+the end of the 140 mm sweep**, so that sensor's peak was taken at the edge of
+the data rather than at the top of a curve. Both follow from the same wrong
+standoff, and both are one glance rather than a column of numbers.
+
 It does not replace Step 6 — but it takes most of Step 6's job. This fixes the
 scalar per-sensor response, says which sensor is where, and now measures the
 position error that Step 6 existed to sidestep. What the Earth-field roll sweep
-still does alone is pin each chip's **orientation** in three dimensions. Run
-this one first regardless: knowing which sensor is on which face makes the roll
-solve's per-face report readable.
+still does alone is turn the orientation *disagreement* above into an actual
+orientation — a matrix per chip, in three dimensions. Run this one first
+regardless: knowing which sensor is on which face makes the roll solve's
+per-face report readable.
 
 #### The one setup fault that looks exactly like gain
 

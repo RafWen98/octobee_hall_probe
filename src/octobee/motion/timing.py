@@ -49,6 +49,20 @@ def clamp_velocity(mm_s):
     """Whatever was asked for, capped at MAX_VEL_MM_S."""
     return min(float(mm_s), MAX_VEL_MM_S)
 
+
+def ramp_distance_mm(vel_mm_s, accel_mm_s2):
+    """How far a trapezoidal move spends getting up to speed, millimetres.
+
+    The reason a swept measurement wants to know: the first and last v^2/2a of
+    a move are not at the sweep velocity, so a line that starts exactly at the
+    edge of the region being mapped measures its own acceleration. Starting
+    this much earlier puts the ramp outside.
+    """
+    v, a = float(vel_mm_s), float(accel_mm_s2)
+    if v <= 0 or a <= 0:
+        return 0.0
+    return v * v / (2.0 * a)
+
 def peak_speed_mm_s(distance_mm, vel_mm_s, accel_mm_s2):
     """How fast a trapezoidal move of `distance_mm` actually gets, mm/s.
 

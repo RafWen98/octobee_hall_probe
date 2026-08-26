@@ -74,6 +74,20 @@ chase it.
 That number is whatever was left in the counter. Absolute moves and scans refuse
 to run until the axis is homed; jogging is relative and does not need it.
 
+### Two places to drive from, one set of guards
+
+The three axes appear twice: on this tab, and as a compact x/y/z panel in the
+window's right-hand pane, under the 3D head — so a nudge can be made while
+watching the live plot or the machine view rather than from a tab that hides
+them. The panel has no device list, no axis map and no field map; those are set
+up once, and what gets done constantly is the nudge.
+
+It is a second set of buttons, not a second implementation. Every one of them
+calls the method the tab's own button calls, so the interlock, the
+one-move-at-a-time check and the refusal to move an unreferenced axis
+absolutely are written once. A second panel with its own idea of when a move is
+allowed would be a second panel that can drive a latched machine.
+
 ### Why a bigger jog step is louder, and what to do about it
 
 Kinesis ships the LTS300C at **20 mm/s** with **20 mm/s²** of acceleration. A
@@ -142,8 +156,9 @@ There are two stop buttons and they answer different questions.
 every tab, and **Escape** does the same thing. It is enabled whether or not the
 stages are connected.
 
-**Stop moving** — on the Stages tab, beside the jog buttons. Profiled, does not
-latch, nothing needs re-homing. "That is far enough."
+**Stop moving** — on the Stages tab beside the jog buttons, and on the x/y/z
+panel in the right-hand pane. Profiled, does not latch, nothing needs
+re-homing. "That is far enough."
 
 The red one does three things, and each is deliberate:
 

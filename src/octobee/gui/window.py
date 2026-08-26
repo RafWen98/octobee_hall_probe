@@ -96,6 +96,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_was_automatic = False
         self._connecting = False
         self._magnet_wizard = None
+        # The "here is where it went" box, and the one state in which it must
+        # not appear: closing the window stops a running recording on the way
+        # out, and a dialog raised during teardown is a window that will not
+        # close.
+        self._saved_box = None
+        self._closing = False
 
         # Every thread that can command motion, and the latch that
         # overrides all of them. Built before _build_ui: the toolbar's
@@ -252,9 +258,23 @@ class MainWindow(QtWidgets.QMainWindow):
         left.setCurrentIndex(0)
         self.tabs = left
 
+        # The right-hand column: what the probe is reading, and the three
+        # axes that decide where it reads it. Both are things you want while
+        # working in some other tab -- moving the head 2 mm and watching the
+        # field answer is one action, and it used to cost a trip to the
+        # Stages tab and back to see the result.
+        right = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        right.addWidget(self.probe_pane)
+        right.addWidget(self.tab_stages.jog_pane)
+        right.setStretchFactor(0, 1)
+        right.setStretchFactor(1, 0)
+        # Collapsible: the jog pane is the one thing here somebody may never
+        # use, on a bench with no stages on it.
+        right.setSizes([760, 190])
+
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         split.addWidget(left)
-        split.addWidget(self.probe_pane)
+        split.addWidget(right)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([1000, 720])
@@ -271,6 +291,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tb = QtWidgets.QToolBar("main")
         tb.setIconSize(QtCore.QSize(16, 16))
         tb.setMovable(False)
+        # Icons beside the text, not instead of it: the only icon in here is
+        # the recording dot, and a toolbar of unlabelled buttons would be a
+        # steep price for one indicator.
+        tb.setToolButtonStyle(
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
 
         self.act_connect = QtGui.QAction("Connect", self)
@@ -352,7 +377,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.act_record = QtGui.QAction("Record", self)
         self.act_record.setCheckable(True)
+        self.act_record.setToolTip(
+            "Start writing what is arriving to disk, in whichever formats are "
+            "ticked on the Data output tab. A red dot appears here while a "
+            "file is actually open, and stopping says where it was written.")
         self.act_record.toggled.connect(self.on_record)
+        self._refresh_record_dot()
         tb.addAction(self.act_record)
 
         self.act_snapshot = QtGui.QAction("Snapshot", self)
@@ -693,6 +723,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 b = self.session.cal.to_mt(grouped)                        # (n,16,3) mT
             with self.session.prof.time("  decimate + buffer"):
                 bd = self.session.decimator.push(b)
+                # Before the early return, not after: the encoder decimator
+                # only stays in step with the field one if it is fed on every
+                # tick the field one is. Skipping it on a tick that produced
+                # no rows would put the counts a block behind for the rest of
+                # the session, and nothing downstream could tell.
+                enc = self._tick_encoders(blocks[0].shape[0])
+                if enc is not None and len(enc):
+                    self.tab_machine.note_encoder_counts(enc)
                 if bd.shape[0] == 0:
                     return
                 self.session.roll.push(bd.astype(np.float32))
@@ -701,9 +739,51 @@ class MainWindow(QtWidgets.QMainWindow):
                 with self.session.prof.time("  write CSV"):
                     self.session.csv_rec.write(bd)
 
+            # A volume sweep logs from here rather than owning the carriers, so
+            # the live plot and any recording carry on through it. `logging` is
+            # set by the motion thread and goes down before the return move, so
+            # what lands here is the swept line and not the way back.
+            runner = self.session.volume_runner
+            if runner is not None and runner.logging:
+                with self.session.prof.time("  log volume sweep"):
+                    # Stamped from the moment the block arrived, counting
+                    # backwards at the output rate. That clock is only used
+                    # for the fallback -- to line these rows up against stage
+                    # polls read over USB. Where the encoders are calibrated
+                    # the counts below carry their own position, latched when
+                    # the sample was converted, and no clock comes into it.
+                    n = bd.shape[0]
+                    self.session.volume_log.add_block(
+                        bd, time.time() - n / max(self.session.out_rate, 1e-9),
+                        runner.line_index, counts=enc)
+
             if self.session.collecting is not None:
                 with self.session.prof.time("  magnet/tare collect"):
                     self.tab_calib.collect_block(b, grouped)
+
+    def _tick_encoders(self, n_samples):
+        """Continuous, decimated encoder counts for this tick's rows, or None.
+
+        Returns an array whose row count matches the field's, because both
+        decimators were built with the same factor and have now been fed the
+        same number of samples. Where the source has no encoders -- acq1001_694
+        alone, a replay, the synthetic probe -- it returns None and everything
+        downstream falls back to asking the controllers where they are.
+        """
+        source, stream = self.session.source, self.session.enc_stream
+        raw = getattr(source, "enc", None)
+        if stream is None or raw is None:
+            return None
+        if raw.shape[0] != n_samples:
+            # The source promises these are the same rows; if that ever stops
+            # being true the honest thing is to drop them rather than log a
+            # position against the wrong sample.
+            self.session.log(
+                f"WARNING: {raw.shape[0]} encoder rows against {n_samples} "
+                f"analogue rows on one tick -- encoder positions dropped")
+            return None
+        with self.session.prof.time("  unwrap + decimate encoders"):
+            return self.session.enc_decimator.push(stream.push(raw))
 
     # Drawing is deliberately NOT done here. This tick has to keep draining the
     # reader queues or the carriers overrun and the recording gets holes in it,
@@ -886,14 +966,98 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.session.log("nothing selected to record -- see the Data output tab")
                 self.act_record.setChecked(False)
         else:
+            saved = []
             for rec, kind in ((self.session.csv_rec, "CSV"), (self.session.raw_rec, "raw")):
                 if rec is not None:
                     p = rec.close()
                     size = os.path.getsize(p) / 1e6 if os.path.exists(p) else 0
                     self.tab_export.note(f"{p}  ({size:.2f} MB, {kind})")
+                    saved.append((kind, p, size))
             self.session.csv_rec = None
             self.session.raw_rec = None
             self.tab_export.set_recording_text("")
+            self._report_saved(saved)
+        self._refresh_record_dot()
+
+    def _refresh_record_dot(self):
+        """A red dot on the Record button while a file is actually open.
+
+        Driven by the recorders, not by the button's checked state, and those
+        are not the same thing: pressing Record with nothing ticked on the
+        Data output tab puts the button down for as long as it takes to find
+        that out, and a dot in that moment would be a lie about where the data
+        went. Recording is also stopped from four other places -- a field map
+        starting, a snapshot, Disconnect, closing the window -- and this way
+        each of them gets the indicator right by doing nothing.
+        """
+        live = (self.session.csv_rec is not None
+                or self.session.raw_rec is not None)
+        self.act_record.setIcon(self._dot_icon("#e5383b") if live
+                                else QtGui.QIcon())
+        self.act_record.setText("Recording" if live else "Record")
+
+    @staticmethod
+    def _dot_icon(colour, size=12):
+        """A filled circle, drawn rather than shipped as a file.
+
+        Twelve pixels of solid colour is not worth an asset, a path to resolve
+        and a way for the installed copy to be missing it.
+        """
+        pm = QtGui.QPixmap(size, size)
+        pm.fill(QtCore.Qt.GlobalColor.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QColor(colour))
+        p.drawEllipse(1, 1, size - 2, size - 2)
+        p.end()
+        return QtGui.QIcon(pm)
+
+    def _report_saved(self, saved):
+        """Say where the recording went, in a box that has to be dismissed.
+
+        The Log and the Data output tab both already carry the path, and both
+        were being missed: a capture ends, the operator goes looking for the
+        file, and the one place they are not looking is the tab they were not
+        on. A file that has just been written is worth one modal.
+
+        Non-blocking (open() rather than exec()) on purpose. Stopping a
+        recording is also the first step of taking a snapshot and of starting
+        a field map, and neither of those may sit and wait for someone to
+        press OK.
+        """
+        if not saved or self._closing:
+            return
+        where = os.path.dirname(os.path.abspath(saved[0][1])) or "."
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        box.setWindowTitle("Recording saved")
+        box.setText(f"{len(saved)} file{'s' if len(saved) > 1 else ''} written "
+                    f"to\n{where}")
+        box.setInformativeText("\n".join(
+            f"{os.path.basename(p)}   ({size:.2f} MB, {kind})"
+            for kind, p, size in saved))
+        btn_open = box.addButton("Open folder",
+                                 QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        btn_ok = box.addButton(QtWidgets.QMessageBox.StandardButton.Ok)
+        box.setDefaultButton(btn_ok)
+        # Named explicitly. With two buttons and neither of them a Cancel,
+        # QMessageBox finds no escape button and then quietly ignores its own
+        # close event -- so Esc and the title-bar cross would both do nothing.
+        box.setEscapeButton(btn_ok)
+        box.finished.connect(
+            lambda _r, b=box, w=where: self._saved_box_done(b, btn_open, w))
+        # Held on the window: a QMessageBox opened without exec() is only kept
+        # alive by something referring to it.
+        self._saved_box = box
+        box.open()
+
+    def _saved_box_done(self, box, btn_open, where):
+        if box.clickedButton() is btn_open:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(where))
+        if self._saved_box is box:
+            self._saved_box = None
+        box.deleteLater()
 
     def _update_rec_label(self):
         parts = []
@@ -973,6 +1137,11 @@ class MainWindow(QtWidgets.QMainWindow):
             print(self.session.prof.text())
             print(f"\nevent loop lag: mean {self.session.lag.mean_ms:.1f} ms, "
                   f"worst {self.session.lag.max_ms:.0f} ms -- {self.session.lag.verdict()}")
+        # Before the recording is stopped, not after: stopping it is what
+        # would otherwise raise the "saved to" box, and that box would then be
+        # asking to be dismissed by a window that is already going away. The
+        # path is still in the Log and on the Data output tab.
+        self._closing = True
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
         if self.motion.busy():
@@ -992,6 +1161,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 | QtWidgets.QMessageBox.StandardButton.Cancel,
                 QtWidgets.QMessageBox.StandardButton.Cancel)
             if reply != QtWidgets.QMessageBox.StandardButton.Close:
+                # Still open, and still a window someone will record from.
+                self._closing = False
                 ev.ignore()
                 return
             self.motion.trigger("the window was closed while a job was running")

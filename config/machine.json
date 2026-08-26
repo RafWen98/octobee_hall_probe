@@ -1,6 +1,6 @@
 {
   "coil_file": "C:\\Users\\3DHall\\Documents\\designA\\designA_after_scaled.json",
-  "coil_radius_mm": 20.0,
+  "coil_radius_mm": 60.0,
   "configuration": "BiotSavart1",
   "current_scale": 1.0,
   "energised": [
@@ -34,5 +34,5 @@
       ]
     }
   },
-  "notes": "designA, nfp=2: four modular coils (C1-C4) and two planar (C5, C6). One coil powered for the first run on 2026-08-25. The winding radius is still the 20 mm placeholder -- measure the conductor and correct it. The pose is NOT measured yet: set it before trusting any clearance number."
+  "notes": "designA, nfp=2: four modular coils (C1-C4) and two planar (C5, C6). One coil powered for the first run on 2026-08-25. The winding radius is 60 mm, the pack this rig is being built around -- still to be checked against the real conductor. The pose is NOT measured yet: set it before trusting any clearance number."
 }

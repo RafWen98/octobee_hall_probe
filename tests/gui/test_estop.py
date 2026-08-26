@@ -140,6 +140,16 @@ def test_gui_estop(app, workdir):
         check("motion controls are live before the stop",
               win.tab_stages.stage_rows["x"]["target"].isEnabled()
               and win.tab_stages.btn_scan_start.isEnabled())
+        # The right-hand jog pane is a second set of buttons onto the same
+        # three axes. It is gated by the same call, and that is the only
+        # reason it is safe: a second panel with its own idea of when a move
+        # is allowed would be a second panel that can drive a latched machine.
+        pane = win.tab_stages.jog_pane
+        check("the right-hand jog pane is live before the stop too",
+              pane.rows["x"]["target"].isEnabled())
+        check("and it offers nothing for an axis that is not connected",
+              not pane.rows["z"]["target"].isEnabled(),
+              "z is not in this FakeSet")
 
         win.on_estop()
         check("the stop reaches every axis",
@@ -150,6 +160,12 @@ def test_gui_estop(app, workdir):
         check("motion controls go dead while latched",
               not win.tab_stages.stage_rows["x"]["target"].isEnabled()
               and not win.tab_stages.btn_scan_start.isEnabled())
+        check("and so does the right-hand jog pane",
+              not pane.rows["x"]["target"].isEnabled()
+              and not pane.btn_home.isEnabled(),
+              "a stop that only disables one of two panels is not a stop")
+        check("but its stop button stays live, like the tab's",
+              pane.btn_stop.isEnabled())
         try:
             stages.interlock.require_clear("a move")
             ok = False

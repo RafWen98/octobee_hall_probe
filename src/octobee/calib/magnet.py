@@ -209,6 +209,48 @@ MIN_DITHER_CONTRAST = 0.02
 # was nowhere near the magnet. Reported, not used.
 FALLOFF_BAND = (1.0, 6.0)
 
+# ---- when to say the sixteen chips are not turned the same way ------------
+# MagnetRun.orientation_check() compares the sixteen peak VECTORS after the
+# pose is undone. Under the geometry file being right they are sixteen looks
+# at one physical vector and should agree to within the noise on a peak, which
+# on this rig is a fraction of a degree.
+#
+# The two thresholds are deliberately different quantities and not two
+# sensitivities of the same one:
+#
+#   POSE   a whole face off together is the head not having been indexed a
+#          true quarter turn. Four chips do not turn together by accident. It
+#          does not touch the trim -- the trim is a magnitude -- so this is
+#          reported rather than refused, and 3 deg is comfortably past the
+#          couple of degrees a V-block or a scribed line actually repeats to.
+#   SENSOR one chip off on its own, after its own face's offset is taken out,
+#          is that chip: mounted turned, or its axis_signs wrong. 5 deg is
+#          about where a mounting error stops being plausible as fit noise on
+#          a peak and starts being a board seated wrong.
+ORIENT_POSE_WARN_DEG = 3.0
+ORIENT_SENSOR_WARN_DEG = 5.0
+
+# How tightly the sixteen unit vectors must cluster before the routine will
+# claim to have worked out which way the head was turned. The mean of sixteen
+# agreeing unit vectors has length ~1; sixteen scattered ones average toward
+# 0. Below this, neither turn direction explains the data and saying which one
+# "won" would be reading a coin flip as a measurement.
+ORIENT_CLUSTER_MIN = 0.90
+
+# ---- when to say a channel ran out of range -------------------------------
+# MagnetRun.range_check(). The sensor's analogue output clips at its own full
+# scale, and the failure is silent and asymmetric: a clipped peak reads LOW,
+# so the trim compensates by turning that sensor UP. 80 % leaves room for the
+# pose-to-pose variation a real run has without crying wolf, and is well
+# inside the SENM3Dx's own linearity spec.
+#
+# RANGE_TARGET_OF_WARN is what "far enough away" means when the report
+# suggests a distance: aim for three quarters of the warning line rather than
+# the line itself, so the suggested move does not land the next run one per
+# cent inside the same warning.
+RANGE_WARN_FRACTION = 0.80
+RANGE_TARGET_OF_WARN = 0.75
+
 # Dither half-span as a fraction of the standoff being measured, and how many
 # points to put across it. The temptation is to dither by a hair, on the
 # reasoning that a small perturbation is a clean one. It is exactly wrong here:
@@ -236,6 +278,39 @@ FALLOFF_BAND = (1.0, 6.0)
 # loss, so it is the one to have.
 DITHER_FRACTION = 0.25
 DITHER_POINTS = 7
+
+
+def _robust_direction(u):
+    """(n, 3) unit vectors -> the direction they agree on, ignoring one rebel.
+
+    A plain mean is the wrong centre for this, and not by a little. The whole
+    point of comparing sixteen chips is to find the one that is turned wrong,
+    and that chip is inside the mean it is being compared against: turning one
+    of four sensors by 30 degrees drags their mean by about 8, so its three
+    innocent siblings then read 8 degrees out and the culprit reads 22. Every
+    sensor on the face looks guilty and the actual answer is buried.
+
+    So the worst-agreeing member is dropped and the centre recomputed without
+    it. One outlier is what this can survive, which for four sensors on a face
+    is the honest limit -- two chips turned the same wrong way on one face are
+    indistinguishable from the other two being turned, and no amount of
+    statistics on four vectors fixes that.
+    """
+    u = np.asarray(u, float)
+    if len(u) == 0:
+        return None
+    m = np.mean(u, axis=0)
+    n = np.linalg.norm(m)
+    if n <= 0:
+        return None
+    m = m / n
+    if len(u) < 4:
+        return m
+    keep = np.ones(len(u), bool)
+    keep[int(np.argmin(u @ m))] = False
+    m2 = np.mean(u[keep], axis=0)
+    n2 = np.linalg.norm(m2)
+    return m if n2 <= 0 else m2 / n2
 
 
 def peak_response(b_mt):
@@ -521,6 +596,25 @@ class PoseSweep:
         return self.along[peak_response(self.b_mt)[1]]
 
     @property
+    def peak_vector(self):
+        """(16, 3) the field VECTOR at each sensor's own peak, chip frame, mT.
+
+        Everything else in this module works on |B|, because a magnitude is
+        rotation-invariant and that is the whole reason sixteen differently
+        turned chips can be compared at all. This is the one place the three
+        components are kept, and it is kept for the opposite reason: what a
+        magnitude throws away is precisely the orientation information, and at
+        the top of the plane peak the magnet is in a known place relative to
+        the chip, so the direction of this vector in the chip's own frame is a
+        measurement of how that chip is turned.
+
+        Taken at the same index peaks and peak_at_mm use, so the three always
+        describe the same point of the sweep.
+        """
+        idx = peak_response(self.b_mt)[1]
+        return self.b_mt[idx, np.arange(N_SENSORS), :]
+
+    @property
     def peak_across_mm(self):
         """(16,) transverse position of each sensor's peak, or None.
 
@@ -611,12 +705,20 @@ class MagnetRun:
     """
 
     def __init__(self, sweeps=(), magnet_note="", axis="y", across=None,
-                 normal=None):
+                 normal=None, ranges_mt=None):
         self.sweeps = list(sweeps)
         self.magnet_note = magnet_note
         self.axis = axis
         self.across = across
         self.normal = normal
+        # The full scale each sensor was on when this was measured. Recorded
+        # with the run rather than looked up at analysis time for the same
+        # reason a capture records its ADC range: the calibration on disk will
+        # have moved on by the time anyone reads this back, and "did this run
+        # clip" is a question about the day it was taken. None means an older
+        # run that predates the check; range_check() is simply not run on it.
+        self.ranges_mt = (None if ranges_mt is None else
+                          np.asarray(ranges_mt, float).reshape(N_SENSORS))
 
     def add(self, sweep):
         self.sweeps.append(sweep)
@@ -841,6 +943,280 @@ class MagnetRun:
                 out[i] = col[i]
                 any_found = True
         return out if any_found else None
+
+    def peak_vectors(self):
+        """(16, 3) each sensor's field vector at its own peak, chip frame, mT.
+
+        The three components the rest of the routine deliberately throws away.
+        Taken in each sensor's BEST pose -- the one that turned its face to the
+        magnet -- so all sixteen are vectors of the same magnet seen from the
+        same nominal place, and the only thing that can make two of them point
+        differently is how the two chips are turned.
+
+        Stored rather than consumed. This module does not solve for
+        orientation; orientation_check() says how far the sixteen disagree,
+        and the Earth-field roll sweep is what turns that into a matrix.
+        """
+        best = self.best_pose()
+        out = np.full((N_SENSORS, 3), np.nan)
+        for i in range(N_SENSORS):
+            out[i] = self.sweeps[best[i]].peak_vector[i]
+        return out
+
+    def placement(self):
+        """(16, 3) where each chip actually was, as (along, across, standoff) mm.
+
+        The three passes each measure one component of the same displacement,
+        and until now each was read off a different method and none was kept.
+        Gathering them here is what makes them storable: `along` and `across`
+        are stage coordinates of the peak (so their SPREAD across a face is the
+        placement error, not their absolute value), and `standoff` is an
+        absolute distance from the dither fit, nan where pass C did not run or
+        did not converge.
+        """
+        out = np.full((N_SENSORS, 3), np.nan)
+        out[:, 0] = self.peak_positions()
+        across = self.across_positions()
+        if across is not None:
+            out[:, 1] = across
+        out[:, 2] = self.standoffs()
+        return out
+
+    def presented_vectors(self, geom=None):
+        """Every sensor's peak vector rotated into ONE common frame.
+
+        Returns (unit vectors (16,3), roll sign, note).
+
+        The argument is the same one the trim rests on. At its own peak each
+        sensor sits at the same place relative to the magnet as every other
+        sensor does at its peak -- that is what the four poses buy. So the
+        field VECTOR at those sixteen points is sixteen looks at one physical
+        vector, and once the pose is undone they must all agree. Whatever is
+        left over is the chips being turned differently from what
+        probe_geometry.json says.
+
+        Undoing the pose is a rotation about the tube axis by 90 degrees per
+        pose index, and the SIGN of that rotation is which way the operator
+        turned the head, which nothing in the file records. Rather than assume
+        it, both signs are tried and the one that clusters the sixteen vectors
+        is taken -- with sixteen vectors voting, that choice is not a close
+        call, and it is reported rather than hidden. If neither sign clusters
+        them, that is itself the answer and the note says so.
+
+        Note what this CANNOT see: a chip rotated about its own board normal
+        by psi leaves a vector that points along that normal unchanged, and at
+        the top of the peak the field is mostly along the normal. So the tilt
+        is measured well and `chip_rot_deg` is measured weakly or not at all,
+        depending on how much transverse field there is at the peak. Read
+        orientation_check()'s per-sensor angles as a lower bound on the
+        disagreement, never as a full orientation solve.
+        """
+        v = self.peak_vectors()
+        best = self.best_pose()
+        R = (geom or pgeom.Geometry.load_or_default()).rotations()
+
+        def unroll(sign):
+            out = np.full((N_SENSORS, 3), np.nan)
+            for i in range(N_SENSORS):
+                if not np.isfinite(v[i]).all():
+                    continue
+                th = sign * np.deg2rad(90.0 * int(best[i]))
+                c, s = np.cos(th), np.sin(th)
+                # About the tube axis, which is tube +Z.
+                rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+                w = rz @ (R[i] @ v[i])
+                n = np.linalg.norm(w)
+                if n > 0:
+                    out[i] = w / n
+            return out
+
+        tried = {}
+        for sign in (+1, -1):
+            u = unroll(sign)
+            ok = np.isfinite(u).all(axis=1)
+            if ok.sum() < 2:
+                continue
+            # How tightly the unit vectors cluster: the length of their mean is
+            # 1 for perfect agreement and falls toward 0 as they scatter. No
+            # reference direction is needed, which matters because the magnet's
+            # own direction is unknown and never enters any of this.
+            tried[sign] = (u, float(np.linalg.norm(np.mean(u[ok], axis=0))))
+        if not tried:
+            return np.full((N_SENSORS, 3), np.nan), +1, "no usable peak vectors"
+        best_sign = max(tried, key=lambda s: tried[s][1])
+        best_u, best_score = tried[best_sign]
+        other = tried.get(-best_sign, (None, float("nan")))[1]
+        note = (f"the head was turned {'+' if best_sign > 0 else '-'}90 deg "
+                f"per pose about the tube axis (chosen from the data, "
+                f"clustering {best_score:.3f} against {other:.3f} the other "
+                f"way)")
+        if best_score < ORIENT_CLUSTER_MIN:
+            note = (f"neither turn direction lines the sixteen vectors up "
+                    f"(best clustering {best_score:.3f}). Either the head did "
+                    f"not turn about its own axis, or the chip rotations in "
+                    f"probe_geometry.json are wrong by more than a nudge")
+        return best_u, best_sign, note
+
+    def orientation_check(self, geom=None):
+        """How far the sixteen chips disagree about which way the field points.
+
+        -> dict with per-sensor angles in degrees from the common direction,
+        the same broken down per pose, and notes.
+
+        This is a RELATIVE measurement and says so: it compares the sixteen
+        chips against each other, not against the lab, because the magnet's
+        own direction never enters. That is exactly the question worth asking
+        of a probe whose sixteen sensors are supposed to be interchangeable.
+
+        A whole pose sitting off on its own is an indexing error -- the head
+        was not turned a true quarter -- and is reported separately from a
+        single chip sitting off on its own, which is that chip. The two look
+        identical in a bare per-sensor list, which is why they are split here.
+        """
+        u, sign, note = self.presented_vectors(geom)
+        best = self.best_pose()
+        ok = np.isfinite(u).all(axis=1)
+        out = {"sign": sign, "n": int(ok.sum()), "per_sensor_deg":
+               np.full(N_SENSORS, np.nan),
+               "within_pose_deg": np.full(N_SENSORS, np.nan),
+               "per_pose_deg": {},
+               "median_deg": float("nan"), "max_deg": float("nan"),
+               "notes": [], "turn_note": note}
+        if ok.sum() < 3:
+            out["notes"].append(
+                f"only {int(ok.sum())} sensors returned a usable peak vector, "
+                f"which is not enough to compare orientations")
+            return out
+
+        ref = _robust_direction(u[ok])
+        if ref is None:
+            out["notes"].append("the peak vectors cancel rather than agreeing, "
+                                "which is not a probe pointing anywhere")
+            return out
+        ang = np.degrees(np.arccos(np.clip(u[ok] @ ref, -1.0, 1.0)))
+        out["per_sensor_deg"][ok] = ang
+        out["median_deg"] = float(np.median(ang))
+        out["max_deg"] = float(np.max(ang))
+
+        # Per pose: the mean direction of one face's four sensors against the
+        # same reference. Four chips cannot all be turned the same way by
+        # accident, so a whole face off together is the index, not the chips.
+        #
+        # And per sensor WITHIN its own pose, which is the degeneracy-free
+        # number: those four sensors were measured with the head in one
+        # position, so no un-rolling was involved in comparing them and the
+        # index error cancels exactly. It is the right test for "is this one
+        # chip mounted wrong", where the global angle is not -- the global
+        # angle carries its whole face's indexing error along with it, and
+        # subtracting one from the other is not how angles in three dimensions
+        # behave.
+        for p in sorted({int(b) for b in best}):
+            sel = ok & (best == p)
+            if sel.sum() < 2:
+                continue
+            m = _robust_direction(u[sel])
+            if m is None:
+                continue
+            out["per_pose_deg"][p] = float(np.degrees(
+                np.arccos(np.clip(float(m @ ref), -1.0, 1.0))))
+            out["within_pose_deg"][sel] = np.degrees(np.arccos(
+                np.clip(u[sel] @ m, -1.0, 1.0)))
+
+        worst_pose = max(out["per_pose_deg"].items(),
+                         key=lambda kv: kv[1], default=None)
+        if worst_pose and worst_pose[1] > ORIENT_POSE_WARN_DEG:
+            out["notes"].append(
+                f"every sensor of {POSE_NAMES[worst_pose[0]]} points "
+                f"{worst_pose[1]:.1f} deg away from the other twelve. Four "
+                f"chips do not turn together by accident -- that is the head "
+                f"not having been indexed a true quarter turn for that pose, "
+                f"and it does not affect the trim")
+        odd = [f"S{i + 1} ({out['within_pose_deg'][i]:.1f} deg)"
+               for i in range(N_SENSORS)
+               if np.isfinite(out["within_pose_deg"][i])
+               and out["within_pose_deg"][i] > ORIENT_SENSOR_WARN_DEG]
+        if odd:
+            out["notes"].append(
+                f"these chips point somewhere the other three on their own "
+                f"face do not: {', '.join(odd)}. Those four were measured in "
+                f"one head position, so no indexing error is involved -- "
+                f"either they are mounted turned from what "
+                f"probe_geometry.json says, or their axis_signs are wrong. "
+                f"The Earth-field roll sweep is what settles which")
+        return out
+
+    def range_check(self, ranges_mt, headroom=RANGE_WARN_FRACTION):
+        """Did any channel run out of range? -> dict, with `usable`.
+
+        The sensor's analogue output clips at its configured full scale, and a
+        clipped peak does not look like an error -- it looks like a slightly
+        smaller peak, taken at a flat top, on a sensor that will then be
+        trimmed UP to compensate. That is the one failure in this routine that
+        makes the calibration worse in a way no later check can see.
+
+        Checked per AXIS, not on |B|. The chip has three independent outputs
+        and each clips on its own, so a sensor can be well inside range on
+        magnitude while one of its three components is on the rail -- which is
+        the case that produces a plausible |B| out of nonsense.
+
+        The dither is included, and it is usually what trips this: pass C
+        deliberately visits points CLOSER to the magnet than the peak, and at
+        a dither of a quarter of the standoff the near end sees about 2.4x the
+        peak field. A run sized against the peak alone can still clip there.
+
+        The fix is distance, and the report says how much: at 1/r^n, backing
+        off by (worst/target)^(1/n) brings the whole run inside. Moving the
+        magnet is better than raising the range, because raising the range
+        costs resolution everywhere and this only needs a few millimetres.
+        """
+        fs = np.asarray(ranges_mt, float).reshape(N_SENSORS)
+        worst = np.zeros(N_SENSORS)
+        for s in self.sweeps:
+            blocks = [s.b_mt] + [d.b_mt for d in s.dithers]
+            for b in blocks:
+                if len(b):
+                    worst = np.maximum(worst, np.nanmax(np.abs(b), axis=(0, 2)))
+        frac = np.divide(worst, fs, out=np.zeros(N_SENSORS), where=fs > 0)
+        out = {"worst_mt": worst, "full_scale_mt": fs, "fraction": frac,
+               "over": [], "near": [], "usable": True, "notes": [],
+               "back_off_factor": 1.0}
+        for i in range(N_SENSORS):
+            if frac[i] >= 1.0:
+                out["over"].append(i + 1)
+            elif frac[i] >= headroom:
+                out["near"].append(i + 1)
+        if not out["over"] and not out["near"]:
+            return out
+
+        n = self.falloffs()
+        n_ref = float(np.nanmedian(n)) if np.isfinite(n).any() else 3.0
+        n_ref = min(max(n_ref, FALLOFF_BAND[0]), FALLOFF_BAND[1])
+        target = headroom * RANGE_TARGET_OF_WARN
+        out["back_off_factor"] = float((frac.max() / target) ** (1.0 / n_ref))
+        d = self.standoffs()
+        d_ref = float(np.nanmedian(d)) if np.isfinite(d).any() else float("nan")
+        move = ("" if not np.isfinite(d_ref) else
+                f" -- from the {d_ref:.0f} mm this run measured, that is "
+                f"about {d_ref * out['back_off_factor']:.0f} mm")
+        if out["over"]:
+            out["usable"] = False
+            out["notes"].append(
+                f"{len(out['over'])} sensors reached full scale: "
+                f"{', '.join('S' + str(s) for s in out['over'])}, worst "
+                f"{100 * frac.max():.0f} % of +/-{fs.max():g} mT. A clipped "
+                f"peak reads LOW and flat, so those sensors would be trimmed "
+                f"up to compensate and the error would be baked in. Move the "
+                f"magnet {out['back_off_factor']:.2f}x further away{move}, or "
+                f"use a weaker one, and run again")
+        elif out["near"]:
+            out["notes"].append(
+                f"{', '.join('S' + str(s) for s in out['near'])} came within "
+                f"{100 * (1 - headroom):.0f} % of full scale (worst "
+                f"{100 * frac.max():.0f} %). Nothing clipped, but there is no "
+                f"headroom left for a stronger pose or a longer dither -- "
+                f"{out['back_off_factor']:.2f}x further away would restore it"
+                f"{move}")
+        return out
 
     def trim(self, use_dither=True):
         """(16,) the multiplicative gain trim this run implies, 1.0 = neutral.
@@ -1133,12 +1509,60 @@ class MagnetRun:
             lines.append(
                 f"largest standoff correction applied: {100 * worst:.1f}% "
                 f"(this much of the old trim was distance, not gain)")
+            # The report is written after every pose and read long afterwards,
+            # so it must not present a degenerate fit as a measurement. The
+            # trim columns above are the A+B+C view whatever the fit did; this
+            # is the line that says whether to believe them.
+            q = self.dither_quality()
+            if not q["usable"]:
+                lines.append(
+                    f"  BUT pass C did not converge -- corr(d,n) "
+                    f"{q['corr_d_n']:+.3f}, median n {q['median_n']:.2f}, "
+                    f"median distance {q['median_mm']:.0f} mm. The standoff "
+                    f"column and that correction are a fit sliding along a "
+                    f"valley, not sixteen measurements, and the trim to "
+                    f"believe is the A+B one:")
+                for note in q["notes"]:
+                    lines.append(f"    - {note}")
         elif self.sweeps and not any(s.dithers for s in self.sweeps):
             lines.append(
                 "no standoff dither in this run, so each chip's distance from "
                 "the magnet is still assumed rather than measured -- a "
                 "millimetre of that is ~15% of trim at a 20 mm standoff")
         lines.append("")
+        return lines
+
+    def _orientation_lines(self, geom=None):
+        """What the peak VECTORS say about how the chips are turned.
+
+        Printed even when it is boring, and especially then: "the sixteen
+        agree to a fraction of a degree" is the evidence that the rotation
+        matrices in probe_geometry.json are right, and until this existed
+        there was none either way.
+        """
+        o = self.orientation_check(geom)
+        if o["n"] < 3:
+            return []
+        lines = ["",
+                 f"orientation, from the peak vectors ({o['n']} of "
+                 f"{N_SENSORS} sensors, relative to each other -- the "
+                 f"magnet's own direction never enters):",
+                 f"  the sixteen agree to {o['median_deg']:.2f} deg median, "
+                 f"{o['max_deg']:.2f} deg worst",
+                 f"  within a face, where the index cannot reach: "
+                 f"{np.nanmedian(o['within_pose_deg']):.2f} deg median, "
+                 f"{np.nanmax(o['within_pose_deg']):.2f} deg worst",
+                 f"  {o['turn_note']}"]
+        if o["per_pose_deg"]:
+            lines.append("  per pose (a whole face off together is the index, "
+                         "not the chips):")
+            for p, deg in sorted(o["per_pose_deg"].items()):
+                lines.append(
+                    f"    {POSE_NAMES[p] if p < len(POSE_NAMES) else p}: "
+                    f"{deg:5.2f} deg")
+        lines.append("  this measures TILT well and rotation about each "
+                     "board's own normal weakly -- the roll sweep is what "
+                     "settles chip_rot_deg")
         return lines
 
     def report(self, geom=None):
@@ -1206,7 +1630,17 @@ class MagnetRun:
         quiet = self.quiet_sensors()
         if quiet:
             lines.append(f"no usable response, left untrimmed: {', '.join(quiet)}")
+        lines += self._orientation_lines(geom)
+        rng = self.range_check(self.ranges_mt) if self.ranges_mt is not None \
+            else None
+        if rng is not None and (rng["over"] or rng["near"]):
+            lines.append("")
+            lines.append(f"range: worst channel reached "
+                         f"{100 * rng['fraction'].max():.0f} % of full scale")
         notes = self.check_geometry(geom) + self.face_balance(geom)["notes"]
+        if rng is not None:
+            notes = rng["notes"] + notes
+        notes += self.orientation_check(geom)["notes"]
         lines.append("")
         lines += (["nothing to report: the file agrees with what the magnet "
                    "did, and the head was concentric"] if not notes
@@ -1254,9 +1688,53 @@ class MagnetRun:
             lambda fh: (json.dump(
                 {"magnet_note": self.magnet_note, "axis": self.axis,
                  "across": self.across, "normal": self.normal,
+                 "ranges_mt": (None if self.ranges_mt is None
+                               else self.ranges_mt.tolist()),
                  "n_poses": len(self.sweeps), "poses": poses,
+                 "sensors": self._sensor_records(),
                  "report": self.report()}, fh, indent=2), fh.write("\n")))
         return base + ".npz"
+
+    def _sensor_records(self):
+        """Per-sensor measurements, for the sidecar -- what the run FOUND.
+
+        The arrays in the .npz are the evidence and this is the finding, and
+        the finding is worth writing down separately: reading a peak vector
+        back out of the raw sweep means knowing which pose was best and which
+        row was the peak, which is the whole of best_pose() and
+        peak_response(). Anything downstream that wants "where is S7 and which
+        way is it turned" should be able to open one JSON file and read it.
+
+        Kept to what was MEASURED. No trim, no correction -- those depend on
+        choices (use_dither, which reference) that belong to whoever applies
+        the run, not to the run.
+        """
+        if not self.sweeps:
+            return []
+        best = self.best_pose()
+        place = self.placement()
+        vec = self.peak_vectors()
+        peaks = self.peak_table()[best, np.arange(N_SENSORS)]
+        fall = self.falloffs()
+        sig = self.standoff_sigmas()
+
+        def num(x):
+            return None if not np.isfinite(x) else round(float(x), 6)
+
+        out = []
+        for i in range(N_SENSORS):
+            out.append({
+                "id": i + 1,
+                "pose": int(best[i]),
+                "peak_mt": num(peaks[i]),
+                f"{self.axis}_mm": num(place[i, 0]),
+                f"{self.across or 'across'}_mm": num(place[i, 1]),
+                "standoff_mm": num(place[i, 2]),
+                "standoff_sigma_mm": num(sig[i]),
+                "falloff_n": num(fall[i]),
+                "peak_vector_mt": [num(c) for c in vec[i]],
+            })
+        return out
 
     @classmethod
     def load(cls, path):
@@ -1290,7 +1768,8 @@ class MagnetRun:
                         axes=tuple(spec.get("axes") or (axis,)),
                         dithers=dithers, note=spec.get("note", "")))
         return cls(sweeps, magnet_note=side.get("magnet_note", ""), axis=axis,
-                   across=across, normal=normal)
+                   across=across, normal=normal,
+                   ranges_mt=side.get("ranges_mt"))
 
 
 # The standardized run: what the wizard opens with, so that two runs a month

@@ -364,3 +364,192 @@ def test_magnet_incremental_save(workdir):
           not os.path.exists(base + ".npz.part")
           and not os.path.exists(base + ".json.part"),
           str(sorted(os.listdir(workdir))))
+
+
+def test_dither_quality():
+    """Pass C must be caught when it measures nothing.
+
+    This is the check that was missing on 2026-08-25. A run entered at a 20 mm
+    standoff against a real one nearer 50 gave a dither a tenth of the
+    distance instead of a quarter; every sensor returned a finite distance,
+    the residuals were small, and the correction multiplied the gain trim's
+    spread from 1.30x to 5.89x. Nothing about it looked wrong.
+
+    The failure needs NOISE to reproduce -- a noiseless fit recovers the right
+    distance even from a badly sized dither, and it is noise sliding d and n
+    along their shared valley that produces the confident wrong answer. So
+    these runs carry 3 uT/point, which is about what a real average at one
+    point leaves.
+    """
+    print("\nguided magnet calibration -- is pass C worth believing")
+    g = pgeom.Geometry()
+    rng = np.random.default_rng(23)
+    gain = rng.normal(1.0, 0.05, 16)
+    jitter = (1.0, 1.0, 1.0)
+
+    def run_at(real_mm, sized_mm, noise_ut=3.0, seed=4):
+        magnet = np.array([0.0, 200.0, g.fsv_radius_mm + real_mm])
+        return _synth_magnet_passes(g, gain, magnet, jitter,
+                                    standoff_mm=sized_mm, noise_ut=noise_ut,
+                                    seed=seed)
+
+    # ---- a dither sized for the distance it is actually at
+    good = run_at(25.0, 25.0)
+    q = good.dither_quality(expect_mm=25.0)
+    check("a correctly sized dither is believed", q["usable"], str(q["notes"]))
+    check("and it measures the distance it was set at",
+          abs(q["median_mm"] - 25.0) < 0.3 * 25.0,
+          f"fitted {q['median_mm']:.1f} mm against 25 entered")
+    check("and agrees the field falls like a dipole",
+          abs(q["median_n"] - 3.0) <= omag.DITHER_N_TOLERANCE,
+          f"1/r^{q['median_n']:.2f}")
+    check("its sixteen distances do not correlate with its sixteen exponents",
+          abs(q["corr_d_n"]) < omag.DITHER_DEGENERACY_R,
+          f"corr(d,n) = {q['corr_d_n']:+.3f}")
+
+    # The gate must not be trigger-happy: dropping a GOOD pass C costs real
+    # accuracy, which is the whole reason it is not simply always dropped.
+    e_full = _trim_error_pct(good, gain)
+    prod = good.trim(use_dither=False) * gain
+    e_plane = 100.0 * float(np.std(prod / np.median(prod)))
+    check("throwing away a good pass C would cost accuracy",
+          e_full < 0.5 * e_plane,
+          f"A+B+C {e_full:.2f} % against A+B {e_plane:.2f} %")
+
+    # ---- the 2026-08-25 failure: sized for 20, driven against 50 and 75
+    for real in (50.0, 75.0):
+        bad = run_at(real, 20.0)
+        q = bad.dither_quality(expect_mm=20.0)
+        check(f"a dither sized for 20 mm at a real {real:.0f} mm is refused",
+              not q["usable"], str(q["notes"])[:100])
+        check("  and the correlation is what catches it",
+              abs(q["corr_d_n"]) > omag.DITHER_DEGENERACY_R,
+              f"corr(d,n) = {q['corr_d_n']:+.3f}, against the +0.994 the real "
+              f"run of 2026-08-25 returned")
+        check("  and the fitted distance disagrees with what was entered",
+              any("entered on the panel" in n for n in q["notes"]),
+              str(q["notes"])[:100])
+
+    # ---- dropping pass C is a real fallback, not a no-op
+    with_c, _ = good.response(use_dither=True)
+    without_c, _ = good.response(use_dither=False)
+    check("dropping pass C returns a different, plane-only answer",
+          not np.allclose(with_c, without_c),
+          f"max change {100 * np.max(np.abs(with_c / without_c - 1)):.1f} %")
+    check("and the plane-only answer is the bare peaks",
+          np.allclose(without_c,
+                      good.peak_table()[good.best_pose(), np.arange(16)]))
+
+    # And the belt to the gate's braces, worth pinning because it is what
+    # stopped the synthetic bench ever reproducing the 2026-08-25 damage:
+    # standoff_correction() already shrinks a displacement toward zero by how
+    # much of it survives the fit's own noise, so a dither this degenerate
+    # collapses to the identity on its own. The gate exists for the case where
+    # it does not -- a fit that is confidently wrong rather than obviously
+    # noisy, which is what the real run returned.
+    bad = run_at(50.0, 20.0)
+    check("a degenerate dither is also shrunk toward doing nothing",
+          np.max(np.abs(bad.standoff_correction() - 1.0)) < 0.05,
+          f"largest correction {100 * np.max(np.abs(bad.standoff_correction() - 1)):.2f} %")
+
+    # ---- a run with no pass C at all must not claim one
+    none = _synth_magnet_passes(g, gain,
+                                np.array([0.0, 200.0, g.fsv_radius_mm + 25.0]),
+                                jitter, dither=False)
+    q = none.dither_quality()
+    check("a run with no dither says there is nothing to apply",
+          not q["usable"] and q["n_fitted"] == 0, str(q["notes"])[:100])
+
+
+def test_magnet_peak_vectors():
+    """The three components must be kept, and must say how the chips are turned."""
+    print("\nguided magnet calibration -- the peak vectors")
+    g = pgeom.Geometry()
+    rng = np.random.default_rng(5)
+    gain = rng.normal(1.0, 0.06, 16)
+    magnet = np.array([0.0, 200.0, g.fsv_radius_mm + 25.0])
+    # A finer step than the other tests use: they only need each ring PLACED,
+    # and a 4 mm grid does that. This one reads a DIRECTION off the peak, and
+    # a peak sampled 2 mm off its top tips the vector by a degree or two of
+    # pure sampling error -- which would sit on top of every orientation
+    # number here and be indistinguishable from a chip being turned.
+    run = _synth_magnet_run(g, gain, magnet, step_mm=1.0)
+
+    v = run.peak_vectors()
+    check("every sensor returns a peak vector", np.isfinite(v).all(),
+          f"{int(np.isfinite(v).all(axis=1).sum())} of 16")
+    check("and its magnitude is the peak the trim was built on",
+          np.allclose(np.linalg.norm(v, axis=1),
+                      run.peak_table()[run.best_pose(), np.arange(16)]))
+
+    # The run is synthesised THROUGH the same rotations the check reads back,
+    # so a correct geometry file must come back as sixteen chips agreeing.
+    o = run.orientation_check(g)
+    check("on a probe built to the file, the sixteen chips agree",
+          o["median_deg"] < 1.0,
+          f"median {o['median_deg']:.3f} deg, worst {o['max_deg']:.3f} deg")
+    check("and no chip is called out", not o["notes"], str(o["notes"])[:120])
+
+    # Turn one chip 30 degrees about its own board normal and the check must
+    # see it -- and must see it WITHIN its own face, where no indexing error
+    # can be blamed for it.
+    bent = pgeom.Geometry()
+    bent.sensors[6]["chip_rot_deg"] = 30.0
+    o2 = run.orientation_check(bent)
+    check("a chip turned 30 deg from the file is caught",
+          o2["within_pose_deg"][6] > omag.ORIENT_SENSOR_WARN_DEG,
+          f"S7 reads {o2['within_pose_deg'][6]:.1f} deg from its own face")
+    check("and it is named", any("S7 " in n for n in o2["notes"]),
+          str(o2["notes"])[:160])
+    others = np.delete(o2["within_pose_deg"], 6)
+    check("without dragging the other fifteen with it",
+          np.nanmax(others) < omag.ORIENT_SENSOR_WARN_DEG,
+          f"worst of the rest {np.nanmax(others):.2f} deg")
+
+    # The measured placement is the thing the run used to print and throw away.
+    p = run.placement()
+    check("placement carries one row per sensor and three columns",
+          p.shape == (16, 3))
+    check("and its axial column is where each sensor peaked",
+          np.allclose(p[:, 0], run.peak_positions()))
+
+
+def test_magnet_range_check():
+    """Clipping must be caught before it becomes a trim."""
+    print("\nguided magnet calibration -- running out of range")
+    g = pgeom.Geometry()
+    gain = np.ones(16)
+    magnet = np.array([0.0, 200.0, g.fsv_radius_mm + 25.0])
+    run = _synth_magnet_passes(g, gain, magnet, (0.0, 0.0, 0.0))
+    peak = float(np.max(np.abs(run.peak_vectors())))
+
+    roomy = run.range_check(np.full(16, 20.0 * peak))
+    check("a run with headroom is not complained about",
+          roomy["usable"] and not roomy["notes"], str(roomy["notes"])[:120])
+
+    tight = run.range_check(np.full(16, peak * 0.5))
+    check("a channel over full scale is caught", not tight["usable"],
+          str(tight["notes"])[:120])
+    check("and the sensors that did it are named", len(tight["over"]) > 0,
+          f"over: {tight['over']}")
+    check("and it says how much further away to move the magnet",
+          tight["back_off_factor"] > 1.0,
+          f"{tight['back_off_factor']:.2f}x further")
+
+    # Per AXIS, not on |B|: a sensor can be inside range on magnitude while
+    # one of its three outputs is on the rail, and that is the case that
+    # produces a plausible-looking |B| out of a clipped channel.
+    one_axis = float(np.max(np.abs(run.peak_vectors()[:, 0])))
+    mags = float(np.max(np.linalg.norm(run.peak_vectors(), axis=1)))
+    fs = np.full(16, one_axis * 0.9)
+    check("clipping is judged per axis, so |B| under full scale is no defence",
+          not run.range_check(fs)["usable"] and mags > one_axis,
+          f"worst axis {one_axis:.3f} mT against |B| {mags:.3f} mT at "
+          f"+/-{fs[0]:.3f} mT full scale")
+
+    # The dither goes CLOSER than the peak, so it is usually what trips this.
+    near = run.range_check(np.full(16, peak * 1.5))
+    check("the dither's near end counts toward the range, not just the peak",
+          near["fraction"].max() > 1.0 / 1.5,
+          f"the worst point is "
+          f"{near['fraction'].max() / (1 / 1.5):.2f}x the peak field")

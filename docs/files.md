@@ -49,11 +49,13 @@ entirely reasonable and are uniformly wrong.
 | `octobee stage` | PC | Thorlabs LTS300C control over the Kinesis C API — no Kinesis app, no pythonnet |
 | `octobee scan` | PC | motorised field map: move, settle, average at full rate, repeat |
 | `octobee machine` | PC | reads a simsopt coil set, sweeps it into a keep-out volume, and places the probe in it |
-| `octobee/gui/widgets/machine3d.py` | PC | the 3D machine widget: coils, stage envelope, and the probe among them |
+| `octobee/motion/sweep.py` | PC | mapping a volume by sweeping it: the box, the path through it, and the log that comes off |
+| `octobee/motion/encoder.py` | PC | the quadrature counts acq1001_695 puts in the sample stream: unwrapping, scaling, and which column is which axis |
+| `octobee/gui/widgets/machine3d.py` | PC | the 3D machine widget: coils, stage envelope, the probe among them, the drag handle on its zero point, and the volume to be mapped |
 | `octobee/profile.py` | PC | span timing, event-loop lag and GL renderer detection behind `--profile` |
 | `octobee_launch.pyw` | PC | what the desktop icon runs: no console, but startup failures still reported in a native dialog |
 | `octobee.ico` | PC | application icon |
-| `tests/` | PC | end-to-end verification, offline or against the hardware. 41 tests, 458 checks; the quality gate |
+| `tests/` | PC | end-to-end verification, offline or against the hardware. 63 tests, 626 checks; the quality gate |
 | `pyproject.toml` | PC | packaging and the ruff lint configuration, with a reason beside every rule that is switched off |
 | `.github/workflows/checks.yml` | CI | runs `ruff check` and `pytest` on every push |
 

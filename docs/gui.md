@@ -100,6 +100,23 @@ diagnostics, exports — and the right half always shows the probe head in 3D
 with a peak-|B| bar chart underneath, so the state of all 16 sensors is visible
 whatever tab you are on.
 
+Underneath those sits a small **x / y / z panel**: a live position readout, a
+jog step with − and +, and a move-to box with **Go**, for each axis. It is
+there because moving the head and watching the field answer is one action, and
+having the buttons on the Stages tab meant doing it with the plot on a page you
+could not see. The panel is a second set of buttons onto the *same* methods the
+Stages tab calls — the emergency-stop latch, the one-move-at-a-time guard and
+the refusal to move an unreferenced axis absolutely are written once and apply
+identically from either place. The readout goes amber while an axis is moving
+and red while its counter cannot be believed.
+
+The **peak bars** tick beside the 3D controls turns the bar chart off and gives
+its height back to the head and the stage panel. The bars answer "are the
+spikes the same height", which is not the question you are asking while driving
+the rig somewhere. Nothing else changes: acquisition, recording and the health
+check are untouched, and the computation stops with the widget, so the space is
+not the only thing you get back.
+
 ![The Live tab against the real carriers](images/gui-live-hardware.png)
 
 *Live, both carriers, no magnet. S16 is excluded automatically and dropped from
@@ -194,6 +211,18 @@ compared between sensors. Unticked, each chip's Bx/By/Bz are its own and only
 |B| is comparable.
 
 Everything is written under `--out-dir` (default `captures/`).
+
+**Record shows a red dot while a file is actually open**, and stopping puts up
+a box naming the files it wrote, the folder they are in and how big they are,
+with a button that opens that folder. Both of those exist because the path was
+already in two places nobody was looking: the Log, and the Data output tab you
+were not on. The dot follows the recorders rather than the button, so pressing
+Record with nothing ticked here — which puts the button down for as long as it
+takes to find that out — does not light it, and the four other things that stop
+a recording (a field map starting, a snapshot, Disconnect, closing the window)
+each get the indicator right without doing anything. Closing the window is the
+one stop that does not raise the box: a modal put up during teardown is a
+window that will not close.
 
 **Changing the calibration while recording rolls the CSV over.** The header is
 written once, at open, and carries `calibration_id` plus the whole conversion

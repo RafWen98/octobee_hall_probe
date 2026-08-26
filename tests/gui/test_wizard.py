@@ -13,6 +13,7 @@ from octobee.gui.dialogs.magnet import MagnetWizard
 from octobee.motion import stage as ostage
 from octobee.calib import geometry as pgeom
 from tests.helpers import (
+    _synth_magnet_passes,
     _synth_magnet_run,
     check,
 )
@@ -336,4 +337,107 @@ def test_magnet_wizard_standard_run(app, workdir):
         wiz._finished = True
         wiz.close()
     finally:
+        win.close()
+
+
+def test_magnet_wizard_refuses_a_degenerate_dither(app, workdir):
+    """The WIZARD must drop a pass C that measured nothing, not just the CLI.
+
+    The bug this pins is a gap between two code paths that both looked right.
+    `octobee magnet apply` had run dither_quality() and refused a degenerate
+    fit since the check existed; MagnetWizard.finish() called response() on
+    its default and applied whatever came back. The wizard is the path an
+    operator actually uses, and on 2026-08-25 it wrote a 5.89x trim into
+    calibration.json from a dither whose fitted distances correlated with its
+    fitted exponents at +0.994 -- sixteen numbers sliding along one valley,
+    not sixteen measurements.
+
+    Checked against the FILE and against the A+B answer, because the failure
+    mode is not a crash: it is a plausible number, and the only way to tell it
+    from the right one is to know which passes it came from.
+    """
+    print("\nguided magnet wizard, degenerate pass C")
+    cal_path = os.path.join(workdir, "gate_cal.json")
+    geom_path = os.path.join(workdir, "gate_geom.json")
+    pgeom.Geometry().save(geom_path)
+    ocal.Calibration().save(cal_path)
+
+    ns = argparse.Namespace(
+        uut=None, demo=True, replay=None, geometry=geom_path,
+        calibration=cal_path, machine=os.path.join(workdir, "gate_machine.json"),
+        out_dir=os.path.join(workdir, "gatecaps"),
+        screenshot=None, screenshot_tab=0, screenshot_warmup=0,
+        no_connect=True)
+    win = gui.MainWindow(ns)
+
+    real_warn, real_exec = QtWidgets.QMessageBox.warning, QtWidgets.QMessageBox.exec
+    QtWidgets.QMessageBox.warning = staticmethod(lambda *a, **k: None)
+    QtWidgets.QMessageBox.exec = lambda self: 0
+    try:
+        g = win.session.geom
+        rng = np.random.default_rng(23)
+        gain = rng.normal(1.0, 0.05, 16)
+
+        # Sized for a 20 mm standoff, driven against a real 50 -- the dither
+        # is then a tenth of the distance instead of a quarter and cannot see
+        # the curvature it exists to measure. 3 uT/point, because a noiseless
+        # fit recovers the right answer even from a dither this short.
+        bad = _synth_magnet_passes(
+            g, gain, np.array([0.0, 200.0, g.fsv_radius_mm + 50.0]),
+            (1.0, 1.0, 1.0), standoff_mm=20.0, noise_ut=3.0)
+
+        wiz = MagnetWizard(win)
+        wiz.spin_standoff.setValue(20.0)
+        for sweep in bad.sweeps:
+            wiz.run.add(sweep)
+        check("the run really is degenerate, or this test proves nothing",
+              not wiz.run.dither_quality(expect_mm=20.0)["usable"],
+              f"corr(d,n) = "
+              f"{wiz.run.dither_quality(expect_mm=20.0)['corr_d_n']:+.3f}")
+
+        wiz.chk_apply.setChecked(True)
+        wiz.finish()
+
+        after = ocal.Calibration.load(cal_path)
+        want = bad.trim(use_dither=False)
+        check("the wizard applies the A+B trim, not the A+B+C one",
+              np.allclose(after.gain_corr[:, 0], want, rtol=1e-6),
+              f"file {after.gain_corr[:3, 0].round(4).tolist()} against "
+              f"A+B {want[:3].round(4).tolist()}")
+        check("and the calibration says pass C was dropped",
+              "DROPPED" in (after.notes or ""), after.notes or "")
+        check("and the log says why, and how to get it back",
+              "octobee magnet apply" in win.log_pane.toPlainText()
+              and "NOT usable" in win.log_pane.toPlainText())
+        wiz.close()
+
+        # The other half of the gate: a dither that DID work must survive it.
+        # A check that refuses everything passes the test above and is useless.
+        ocal.Calibration().save(cal_path)
+        win.session.cal = ocal.Calibration.load(cal_path)
+        good = _synth_magnet_passes(
+            g, gain, np.array([0.0, 200.0, g.fsv_radius_mm + 25.0]),
+            (1.0, 1.0, 1.0), standoff_mm=25.0, noise_ut=3.0)
+        wiz2 = MagnetWizard(win)
+        wiz2.spin_standoff.setValue(25.0)
+        for sweep in good.sweeps:
+            wiz2.run.add(sweep)
+        wiz2.chk_apply.setChecked(True)
+        wiz2.finish()
+
+        after = ocal.Calibration.load(cal_path)
+        check("a dither that worked is kept",
+              np.allclose(after.gain_corr[:, 0], good.trim(use_dither=True),
+                          rtol=1e-6)
+              and not np.allclose(after.gain_corr[:, 0],
+                                  good.trim(use_dither=False), rtol=1e-6),
+              f"A+B+C and A+B differ by up to "
+              f"{100 * np.max(np.abs(good.trim(True) / good.trim(False) - 1)):.1f} %")
+        check("and the calibration records all three passes",
+              "standoff dither" in (after.notes or "")
+              and "DROPPED" not in (after.notes or ""), after.notes or "")
+        wiz2.close()
+    finally:
+        QtWidgets.QMessageBox.warning = real_warn
+        QtWidgets.QMessageBox.exec = real_exec
         win.close()

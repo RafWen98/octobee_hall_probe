@@ -24,6 +24,16 @@ class SourceBase:
     volt_offset = ()
     fs_hz = 20000.0
     live = False
+    # Quadrature encoder counts for the samples the last read() returned, as
+    # (n, columns) raw uint32, or None where the source has no encoders. Left
+    # beside read() rather than returned from it because only one carrier has
+    # them and every existing caller wants the analogue channels; what matters
+    # is that these rows are the SAME rows, trimmed identically, so a position
+    # and a field sample with the same index really were converted together.
+    enc = None
+    enc_columns = 0
+    enc_host = None
+    enc_sites = ()
 
     def read(self):
         return None
@@ -53,6 +63,23 @@ class LiveSource(SourceBase):
         self._pending = {h: deque() for h in self.hosts}
         self._n = dict.fromkeys(self.hosts, 0)
         self._temp = {h: np.zeros(8, dtype=np.uint32) for h in self.hosts}
+        # Which box the positions come from. Decided on what the carriers say
+        # about themselves -- how many of their quadrature modules are actually
+        # counting -- and NOT on whether a box contributes a longword between
+        # the analogue channels and the scratchpad. Both of these carriers do:
+        # acq1001_694 aggregates a quadrature module in site 2 with phaseA_en
+        # off, so it emits a column that never moves, and choosing by "has some
+        # encoder longwords" picks it over the 695, which has three that count.
+        # That would have logged a constant as the probe's position.
+        scored = [(len(getattr(lay, "counting_sites", ())), h, lay)
+                  for h, lay in zip(self.hosts, self.layouts)]
+        best = max(scored, key=lambda item: item[0], default=(0, None, None))
+        self._enc_host = best[1] if best[0] else None
+        self.enc_columns = (0 if self._enc_host is None
+                            else int(best[2].n_site2_lw))
+        self.enc_sites = (() if self._enc_host is None
+                          else tuple(sorted(best[2].encoder_columns)))
+        self._enc_pending = deque()
         self.gaps = 0
         self.lost = 0
         self.error = None
@@ -91,6 +118,8 @@ class LiveSource(SourceBase):
                     continue
                 self._pending[h].append(blk["ai"])
                 self._n[h] += blk["ai"].shape[0]
+                if h == self._enc_host and blk.get("enc") is not None:
+                    self._enc_pending.append(blk["enc"])
                 if "temp_raw" in blk:
                     self._temp[h] = blk["temp_raw"]
                 gaps, lost = ob.check_continuity(blk["sam_cnt"])
@@ -98,6 +127,7 @@ class LiveSource(SourceBase):
                 self.lost += lost
         n = min(self._n.values()) if self._n else 0
         if n <= 0:
+            self.enc = None
             return None
         out = []
         for h in self.hosts:
@@ -108,7 +138,37 @@ class LiveSource(SourceBase):
             if rest.shape[0]:
                 self._pending[h].append(rest)
             self._n[h] = rest.shape[0]
+        self.enc = self._take_enc(n)
         return out
+
+    @property
+    def enc_host(self):
+        """Which carrier the encoder counts come from, or None."""
+        return self._enc_host
+
+    def _take_enc(self, n):
+        """The encoder rows belonging to the n analogue rows just handed out.
+
+        Trimmed by exactly the same n, from a buffer fed by exactly the same
+        blocks, so row i of the counts and row i of the field are the same
+        sample. If the two ever disagree in length the counts are dropped
+        rather than shifted into line: a position column that is silently off
+        by a few samples is worse than one that is absent, because nothing
+        downstream can tell.
+        """
+        if not self._enc_pending:
+            return None
+        buf = np.concatenate(self._enc_pending, axis=0)
+        self._enc_pending.clear()
+        if buf.shape[0] < n:
+            self.error = self.error or (
+                f"{self._enc_host}: {buf.shape[0]} encoder rows against {n} "
+                f"analogue rows -- encoder positions dropped for this block")
+            return None
+        rest = buf[n:]
+        if rest.shape[0]:
+            self._enc_pending.append(rest)
+        return buf[:n]
 
     def temperatures(self):
         return ocal.temperatures_c([self._temp[h] for h in self.hosts])
