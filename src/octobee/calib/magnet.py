@@ -137,11 +137,15 @@ complementary: run this first, because knowing which sensor is on which face
 makes the roll solve's per-face report readable.
 """
 
+import argparse
+import contextlib
 import json
 import os
 
 import numpy as np
 
+from octobee import paths
+from octobee.calib import convert as ocal
 from octobee.calib import geometry as pgeom
 
 N_SENSORS = pgeom.N_SENSORS
@@ -163,6 +167,28 @@ DEAD_FRACTION = 0.02
 # is a few tenths of a millimetre: tight enough to be worth reporting, loose
 # enough not to cry wolf about a well-set-up run.
 FACE_IMBALANCE_WARN = 0.05
+
+# When to disbelieve pass C, for MagnetRun.dither_quality(). All three of these
+# were set from the run of 2026-08-25, which was sized for a 20 mm standoff and
+# driven against a real ~50 mm one: the dither was then a tenth of the distance
+# instead of a quarter, and the fit went degenerate without failing.
+#
+# It did not look broken from the outside. Every sensor returned a finite
+# distance, the residuals were small, and the correction sailed into the trim
+# and multiplied its spread from 1.30x to 5.9x. What DID show it was these:
+#
+#   - the exponent. It is a property of the magnet, so all sixteen sensors must
+#     agree on it, and a dipole gives 3. That run returned 1.85 to 4.98.
+#   - the correlation between fitted distance and fitted exponent, ACROSS the
+#     sixteen. Real measurements of sixteen chip positions have no reason to
+#     correlate with anything; a fit sliding along a degenerate valley
+#     correlates near 1. That run: 0.994.
+#
+# The correlation is the sharper of the two and the one to trust: it needs no
+# idea of what the magnet is, only that the sensors are independent.
+DITHER_N_TOLERANCE = 0.8         # |median n - 3| worth refusing over
+DITHER_DEGENERACY_R = 0.9        # |corr(d, n)| above this is one fit, not 16
+DITHER_STANDOFF_TOLERANCE = 0.3  # fitted vs entered standoff, as a fraction
 
 # The standoff fit searches for the magnet between these distances from the
 # dither centre, in millimetres. The lower bound is not a guess about the rig:
@@ -549,6 +575,33 @@ class PoseSweep:
         return self._dither_fit(3)
 
 
+def _replace_via_temp(path, mode, write):
+    """Write `path` through a temporary file and rename it into place.
+
+    The rename is the whole point: a half-written file never appears under the
+    real name, so an interrupted write leaves the previous contents intact
+    instead of a truncated replacement. Used by MagnetRun.save, which is
+    called after every pose and therefore has something to lose every time
+    after the first.
+
+    A file object is handed to `write` rather than a path because
+    np.savez_compressed appends '.npz' to any path that does not already end
+    in it -- given a temporary name it would helpfully write somewhere else.
+    """
+    tmp = path + ".part"
+    kw = {} if "b" in mode else {"encoding": "utf-8"}
+    try:
+        with open(tmp, mode, **kw) as fh:
+            write(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
 class MagnetRun:
     """A complete guided run: N_POSES sweeps of the same magnet.
 
@@ -686,7 +739,7 @@ class MagnetRun:
         corr[ok] = (1.0 + weight * delta / d_ref) ** n_ref
         return corr
 
-    def response(self):
+    def response(self, use_dither=True):
         """(16,) each sensor's corrected peak in its best pose, and that pose.
 
         The best pose is the one where the sensor's face was turned toward the
@@ -694,11 +747,76 @@ class MagnetRun:
         scaling it to a common standoff is what makes the 16 numbers
         comparable -- same distance and same angle by measurement rather than
         by assuming the arms are identical.
+
+        use_dither=False drops pass C and returns the bare peaks. That is the
+        right call when the dither did not converge, because the standoff
+        correction MULTIPLIES into the trim: a fit that failed does not degrade
+        the answer a little, it replaces it. On the run of 2026-08-25 it turned
+        a 1.30x spread into a 5.9x one. dither_quality() is the check for
+        whether it converged; do not guess.
         """
         table = self.peak_table()
         best = self.best_pose()
         raw = table[best, np.arange(N_SENSORS)]
+        if not use_dither:
+            return raw, best
         return raw * self.standoff_correction(), best
+
+    def dither_quality(self, expect_mm=None):
+        """Did pass C actually measure anything? -> dict, with `usable`.
+
+        Three things have to hold, and on a run where the standoff was entered
+        wrongly none of them do:
+
+        * enough sensors returned a finite distance at all;
+        * the exponent came back near 3. It is a property of the MAGNET, not of
+          the sensor, so all sixteen should agree; scatter in it is the fit
+          failing, not sixteen different measurements;
+        * the fitted distance and the fitted exponent are not locked together.
+          Over too short a dither the two trade off almost exactly -- 41 mm
+          with n=1.9 fits the same five points as 91 mm with n=5.0 -- and the
+          give-away is their correlation across the sixteen sensors. Genuine
+          measurements have no reason to correlate; a degenerate fit slides
+          along that valley and correlates near 1.
+
+        `expect_mm` is the standoff you believe you clamped, if you want the
+        fitted distances checked against it as well.
+        """
+        d, n = self.standoffs(), self.falloffs()
+        ok = np.isfinite(d) & np.isfinite(n)
+        out = {"n_fitted": int(ok.sum()), "median_mm": float("nan"),
+               "median_n": float("nan"), "corr_d_n": float("nan"),
+               "usable": False, "notes": []}
+        if ok.sum() < 4:
+            out["notes"].append(
+                f"only {int(ok.sum())} of {N_SENSORS} sensors returned a "
+                f"standoff at all -- there is nothing to apply")
+            return out
+        out["median_mm"] = float(np.median(d[ok]))
+        out["median_n"] = float(np.median(n[ok]))
+        r = float(np.corrcoef(d[ok], n[ok])[0, 1]) if ok.sum() > 2 else np.nan
+        out["corr_d_n"] = r
+        if abs(out["median_n"] - 3.0) > DITHER_N_TOLERANCE:
+            out["notes"].append(
+                f"the falloff exponent came back at {out['median_n']:.2f}, "
+                f"not the 3 a dipole gives. The fit is not describing the "
+                f"magnet")
+        if np.isfinite(r) and abs(r) > DITHER_DEGENERACY_R:
+            out["notes"].append(
+                f"fitted distance and fitted exponent correlate at "
+                f"{r:.3f} across the sensors. They have no physical reason to "
+                f"-- this is one under-determined fit sliding along a valley, "
+                f"not {int(ok.sum())} measurements. The dither is too short "
+                f"for the real standoff: it wants about a quarter of it")
+        if expect_mm and out["median_mm"] > 0:
+            off = abs(out["median_mm"] - expect_mm) / expect_mm
+            if off > DITHER_STANDOFF_TOLERANCE:
+                out["notes"].append(
+                    f"the fits average {out['median_mm']:.0f} mm against the "
+                    f"{expect_mm:g} mm entered on the panel. Whichever is "
+                    f"right, the passes were sized from the wrong one")
+        out["usable"] = not out["notes"]
+        return out
 
     def peak_positions(self):
         """(16,) the axis position of each sensor's peak, in its best pose."""
@@ -724,21 +842,21 @@ class MagnetRun:
                 any_found = True
         return out if any_found else None
 
-    def trim(self):
+    def trim(self, use_dither=True):
         """(16,) the multiplicative gain trim this run implies, 1.0 = neutral.
 
         Returned rather than applied: what to do with it is the caller's
         decision, and Calibration.cross_calibrate() is the thing that owns how
         a trim is folded in.
         """
-        resp, _ = self.response()
+        resp, _ = self.response(use_dither=use_dither)
         ok = resp > DEAD_FRACTION * np.median(resp)
         ref = np.median(resp[ok]) if ok.any() else 1.0
         return np.where(ok & (resp > 0), ref / np.where(resp > 0, resp, 1.0), 1.0)
 
-    def quiet_sensors(self):
+    def quiet_sensors(self, use_dither=True):
         """Sensors that never really answered, as S-labels."""
-        resp, _ = self.response()
+        resp, _ = self.response(use_dither=use_dither)
         thresh = DEAD_FRACTION * np.median(resp)
         return [f"S{i + 1}" for i in range(N_SENSORS) if resp[i] <= thresh]
 
@@ -814,7 +932,7 @@ class MagnetRun:
                 out[int(sid)] = int(slot)
         return out
 
-    def face_balance(self, geom=None):
+    def face_balance(self, geom=None, use_dither=True):
         """Per-face mean response, and what opposite faces say about the setup.
 
         The whole routine rests on the head turning about its OWN axis, so that
@@ -835,7 +953,12 @@ class MagnetRun:
                  "notes": [...]}
         """
         g = geom or pgeom.Geometry.load_or_default()
-        resp, _ = self.response()
+        # Same use_dither as the trim being judged. Run on dither-corrected
+        # response when the dither failed, this check reports the fit's own
+        # scatter as a head that is not concentric -- which is exactly what it
+        # did on 2026-08-25: 10.2 % off-centre from a head that is within
+        # 1.4 %, sending an operator to re-centre a cradle that was fine.
+        resp, _ = self.response(use_dither=use_dither)
         means = {}
         for f in range(pgeom.N_FACES):
             ids = [i for i in range(N_SENSORS) if g.face(i + 1) == f]
@@ -1112,13 +1235,27 @@ class MagnetRun:
                           "note": s.note,
                           "n_dithers": len(s.dithers),
                           "dither_at_mm": [d.at_mm for d in s.dithers]})
-        np.savez_compressed(base + ".npz", **arrays)
-        with open(base + ".json", "w", encoding="utf-8") as fh:
-            json.dump({"magnet_note": self.magnet_note, "axis": self.axis,
-                       "across": self.across, "normal": self.normal,
-                       "n_poses": len(self.sweeps), "poses": poses,
-                       "report": self.report()}, fh, indent=2)
-            fh.write("\n")
+        # Written to one side and renamed into place, because this is now
+        # called after every pose rather than once at the end: a crash during
+        # the write would otherwise take out the three good poses already on
+        # disk along with the fourth, which is the exact loss saving early was
+        # meant to prevent. os.replace is atomic on both platforms this runs
+        # on, so a reader sees the old pair or the new one.
+        #
+        # Arrays first, then the sidecar. load() takes its pose list from the
+        # JSON and the data from the NPZ, so a crash between the two renames
+        # leaves an NPZ holding one pose more than the JSON admits to -- which
+        # reads back cleanly as the earlier run. The other order would leave a
+        # JSON promising a pose whose arrays are not there, and that raises.
+        _replace_via_temp(base + ".npz", "wb",
+                          lambda fh: np.savez_compressed(fh, **arrays))
+        _replace_via_temp(
+            base + ".json", "w",
+            lambda fh: (json.dump(
+                {"magnet_note": self.magnet_note, "axis": self.axis,
+                 "across": self.across, "normal": self.normal,
+                 "n_poses": len(self.sweeps), "poses": poses,
+                 "report": self.report()}, fh, indent=2), fh.write("\n")))
         return base + ".npz"
 
     @classmethod
@@ -1154,6 +1291,51 @@ class MagnetRun:
                         dithers=dithers, note=spec.get("note", "")))
         return cls(sweeps, magnet_note=side.get("magnet_note", ""), axis=axis,
                    across=across, normal=normal)
+
+
+# The standardized run: what the wizard opens with, so that two runs a month
+# apart are the same measurement and their trims can be compared rather than
+# just believed one at a time. The suggested_* helpers below still derive a
+# sizing from the geometry and the standoff, and they are still what answers
+# when an operator moves the standoff off the standard -- but a value derived
+# from a geometry file is not a constant, and the point of a standard is that
+# it does not move when probe_geometry.json does.
+#
+# Where this differs from what the helpers derive, and what it costs:
+#
+#   sweep 140 mm, not the derived 179.  At the 33 mm plate pitch the four
+#     rings span 99 mm, so this is 20.5 mm of lead-in at each end instead of
+#     40. The outermost peak is about one standoff wide, so at a 20 mm
+#     standoff it still closes inside the sweep -- but only just. Raise this
+#     if the standoff goes up, or the end rings peak at the edge of the data.
+#   step 3.5 mm, not 8.25.  Finer than pass A needs (it only has to say WHERE
+#     each ring is), and the reason the locate pass costs 41 points.
+#   cut half-span 10 mm at a 20 mm standoff, not 20.  Half the span the
+#     physics argument in suggested_plane() asks for, at the same 21 points --
+#     the same cost spent closer in around the peak. Its own docstring puts
+#     +-10 mm inside what works at a 10-20 mm standoff; it is NOT enough at 40,
+#     so this pairs with the 20 mm standoff and does not survive without it.
+#   dither 5 points, not the DITHER_POINTS=7 the bench measured as best. By
+#     the table at DITHER_FRACTION this is 4.2 % residual trim error against
+#     2.1 % -- the standard buys 8 moves per pose with half the standoff
+#     accuracy. DITHER_POINTS stays 7 because that is still what the
+#     measurement says; this is the operational choice, and the two are
+#     deliberately separate numbers.
+#   2.0 s per point, not 1.0.  The dither reads a curvature out of 5 points
+#     and is where averaging actually pays; with 5 rather than 7 points it
+#     pays more.
+#
+# 145 points a pose, about 10.9 min each, 44 min for all four.
+STANDARD_RUN = {
+    "sweep_mm": 140.0,
+    "step_mm": 3.5,
+    "seconds_per_point": 2.0,
+    "standoff_mm": 20.0,
+    "cut_half_span_mm": 10.0,
+    "cut_step_mm": 1.0,
+    "dither_half_span_mm": 5.0,
+    "dither_points": 5,
+}
 
 
 def suggested_sweep(geom=None, clearance_mm=40.0):
@@ -1220,3 +1402,118 @@ def ring_positions(sweep, n_rings=pgeom.SENSORS_PER_FACE):
     peaks = sweep.peaks
     loud = np.argsort(peaks)[-int(n_rings):]
     return np.sort(sweep.peak_at_mm[loud])
+
+
+# --------------------------------------------------------------------------
+# re-deriving a trim from a run already on disk
+# --------------------------------------------------------------------------
+
+def apply_run(run, cal, use_dither=True, replacing=None, geom=None):
+    """Fold a saved run's trim into `cal`. Returns a list of report lines.
+
+    Every capture is converted through the calibration that was live when it
+    was taken, so a run's peaks already carry whatever trim was in force. That
+    is why Calibration.cross_calibrate MULTIPLIES rather than assigns, and it
+    is also why re-deriving from a run you have already applied needs
+    `replacing`: hand it the run whose trim is currently folded in and that
+    factor is divided back out first, putting the calibration into the state
+    it was in when the measurement was made. Without it the same run gets
+    counted twice and every sensor is trimmed by the square of its factor.
+
+    `replacing` is usually the same run -- that is the shape of "apply this
+    one again, differently", which is what a failed pass C leaves you needing.
+    """
+    lines = []
+    if replacing is not None:
+        undo = replacing.trim()
+        cal.gain_corr = cal.gain_corr / undo[:, None]
+        lines.append(f"divided out the trim already applied from that run "
+                     f"({undo.min():.3f}..{undo.max():.3f}, "
+                     f"{undo.max() / undo.min():.2f}x spread)")
+    resp, _best = run.response(use_dither=use_dither)
+    _corr, skipped = cal.cross_calibrate(resp)
+    t = run.trim(use_dither=use_dither)
+    lines.append(f"applied the {'A+B+C' if use_dither else 'A+B'} trim "
+                 f"({t.min():.3f}..{t.max():.3f}, "
+                 f"{t.max() / t.min():.2f}x spread)")
+    if skipped:
+        lines.append(f"kept the previous trim for {', '.join(skipped)}")
+    bal = run.face_balance(geom, use_dither=use_dither)
+    for note in bal["notes"]:
+        lines.append(note)
+    return lines
+
+
+def _cmd_apply(a):
+    run = MagnetRun.load(a.run)
+    q = run.dither_quality(expect_mm=a.standoff)
+    print(f"{os.path.basename(a.run)}: {len(run)} poses, "
+          f"axis={run.axis} across={run.across} normal={run.normal}")
+    print(f"  pass C: {q['n_fitted']}/{N_SENSORS} fitted, median "
+          f"{q['median_mm']:.1f} mm, median n {q['median_n']:.2f}, "
+          f"corr(d,n) {q['corr_d_n']:+.3f} -- "
+          f"{'usable' if q['usable'] else 'NOT usable'}")
+    for note in q["notes"]:
+        print(f"    - {note}")
+
+    use_dither = not a.no_dither
+    if use_dither and not q["usable"]:
+        print("  refusing to apply pass C. Re-run with --no-dither to take "
+              "the plane answer, or fix the standoff and measure again.")
+        return 1
+
+    cal = ocal.Calibration.load(a.calibration)
+    before = cal.gain_corr[:, 0].copy()
+    prev = MagnetRun.load(a.replacing) if a.replacing else None
+    for line in apply_run(run, cal, use_dither=use_dither, replacing=prev):
+        print(f"  {line}")
+    after = cal.gain_corr[:, 0]
+    print(f"  gain {before.min():.3f}..{before.max():.3f} "
+          f"({before.max() / before.min():.2f}x) -> "
+          f"{after.min():.3f}..{after.max():.3f} "
+          f"({after.max() / after.min():.2f}x)")
+    if a.dry_run:
+        print("  --dry-run: nothing written")
+        return 0
+    cal.notes = (
+        f"gain trim re-derived from {os.path.basename(a.run)} using passes "
+        f"{'A+B+C' if use_dither else 'A+B (pass C dropped)'}"
+        + ("" if use_dither else
+           f"; the dither fit was degenerate -- corr(d,n) {q['corr_d_n']:+.3f}, "
+           f"median n {q['median_n']:.2f}, median distance "
+           f"{q['median_mm']:.0f} mm"))
+    path = cal.save(a.calibration)
+    print(f"  wrote {path}")
+    if cal.archived_to:
+        print(f"  archived as {os.path.basename(cal.archived_to)}")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        description="Re-derive a gain trim from a guided magnet run on disk.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    ap = sub.add_parser("apply", help="fold a saved run's trim into a calibration")
+    ap.add_argument("run", help="captures/magcal_*.npz")
+    ap.add_argument("--calibration", default=None,
+                    help="calibration.json to update (default: the config one)")
+    ap.add_argument("--no-dither", action="store_true",
+                    help="ignore pass C and trim on the plane peaks alone")
+    ap.add_argument("--replacing", default=None, metavar="RUN.npz",
+                    help="a run whose trim is already folded into that "
+                         "calibration; its factor is divided out first. Pass "
+                         "the same run to re-apply it differently.")
+    ap.add_argument("--standoff", type=float, default=None,
+                    help="the standoff you believe you clamped, in mm, to "
+                         "check the dither fits against")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would change and write nothing")
+    ap.set_defaults(func=_cmd_apply)
+    a = p.parse_args(argv)
+    if a.calibration is None:
+        a.calibration = paths.config(ocal.CONFIG_NAME)
+    return a.func(a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

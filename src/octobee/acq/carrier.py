@@ -206,6 +206,43 @@ class Uut:
         self._sockets.clear()
 
 
+def read_freq_hz(u, knob, site=0):
+    """Read a SIG:...:FREQ knob as a number, or say why it is not one.
+
+    A box answers an unknown knob with `ERROR:<knob>" not found`, and the
+    plain `float(reply.split()[-1])` this replaces turned that into
+
+        ValueError: could not convert string to float: 'found'
+
+    which names neither the box, nor the knob, nor the fact that the reply was
+    the carrier refusing rather than a bad number. It reached an operator
+    through the Connect dialog in exactly that form.
+
+    The knob really can be missing on a box that pings and accepts the
+    connection: the command port on 4220 answers before the site scan has
+    finished populating /etc/acq400, so a Connect in the first minute after a
+    carrier reboots sees this with nothing else wrong. Hence the wait, rather
+    than a hardware fault, in the message.
+    """
+    reply = u.value(knob, site=site)
+    try:
+        return float(reply.split()[-1])
+    except (ValueError, IndexError):
+        pass
+    if not reply:
+        raise RuntimeError(
+            f"{u.host}: asked for {knob} and got no reply at all. The command "
+            f"port accepted the connection but said nothing.")
+    if "not found" in reply:
+        raise RuntimeError(
+            f"{u.host}: {knob} does not exist on this box yet -- it replied "
+            f"{reply!r}. Its command port is up before its site knobs are, so "
+            f"if this carrier has just rebooted, give it a minute and press "
+            f"Connect again.")
+    raise RuntimeError(
+        f"{u.host}: {knob} replied {reply!r}, which is not a frequency.")
+
+
 class Layout:
     """Stream frame geometry for one carrier, read back from the box."""
 
@@ -251,7 +288,7 @@ def probe_uut(host):
             raise RuntimeError(f"{host}: data32=1, this decoder assumes packed 16-bit")
         spad = u.value("spad").split(",")          # e.g. '1,7,0'
         spad_lw = int(spad[1]) if len(spad) > 1 and spad[0] != "0" else 0
-        fs = float(u.value("SIG:CLK_S1:FREQ").split()[-1])
+        fs = read_freq_hz(u, "SIG:CLK_S1:FREQ")
         nchan_ai = int(u.value("NCHAN", site=1))
         rng = u.value("GAIN:ALL", site=1).strip()
         if rng not in ADC_RANGES:
@@ -294,11 +331,20 @@ def decode(buf, layout):
     bytes -> dict of arrays. Trailing partial frames are discarded.
     Returns None if the buffer holds less than one whole frame.
     """
-    i16 = np.frombuffer(buf, dtype="<i2")
-    n = len(i16) // layout.n_i16
-    if n == 0:
+    # Trim to whole frames FIRST. np.frombuffer refuses a byte count that is
+    # not a multiple of the item size, and a truncated stream is exactly where
+    # an odd one comes from: capture_one accumulates whatever recv() returns,
+    # and TCP promises nothing about alignment. A box rebooting mid-word used
+    # to turn the whole capture into "ValueError: buffer size must be a
+    # multiple of element size", which discards the data that was collected and
+    # tells the operator nothing. The docstring above already promised that a
+    # trailing partial frame is dropped; this makes it true for every length.
+    usable = (len(buf) // layout.ssb) * layout.ssb
+    if usable == 0:
         return None
-    i16 = i16[:n * layout.n_i16].reshape(n, layout.n_i16)
+    i16 = np.frombuffer(buf, dtype="<i2", count=usable // 2)
+    n = usable // layout.ssb
+    i16 = i16.reshape(n, layout.n_i16)
     u32 = i16.view("<u4").reshape(n, layout.n_lw)
 
     out = {
@@ -548,7 +594,7 @@ def _cmd_rate(hosts, fs_hz):
         for h in hosts:
             u = Uut(h)
             try:
-                clk_mb = float(u.value("SIG:CLK_MB:FREQ").split()[-1])
+                clk_mb = read_freq_hz(u, "SIG:CLK_MB:FREQ")
                 u.cmd(f"clkdiv {max(1, int(round(clk_mb / fs_hz)))}", site=1)
             finally:
                 u.close()
@@ -556,7 +602,7 @@ def _cmd_rate(hosts, fs_hz):
     for h in hosts:
         u = Uut(h)
         try:
-            fs = float(u.value("SIG:CLK_S1:FREQ").split()[-1])
+            fs = read_freq_hz(u, "SIG:CLK_S1:FREQ")
             ssb = int(u.value("ssb"))
             div = u.value("clkdiv", site=1)
             pen = alias_penalty(fs)
@@ -579,7 +625,7 @@ def _cmd_restore(hosts, fs_hz):
     for h in hosts:
         u = Uut(h)
         try:
-            clk_mb = float(u.value("SIG:CLK_MB:FREQ").split()[-1])
+            clk_mb = read_freq_hz(u, "SIG:CLK_MB:FREQ")
             div = max(1, int(round(clk_mb / fs_hz)))
             u.cmd(f"clkdiv {div}", site=1)
         finally:
@@ -589,7 +635,7 @@ def _cmd_restore(hosts, fs_hz):
         u = Uut(h)
         try:
             print(f"{h}: clkdiv {u.value('clkdiv', 1)}, "
-                  f"{u.value('SIG:CLK_S1:FREQ').split()[-1]} Hz")
+                  f"{read_freq_hz(u, 'SIG:CLK_S1:FREQ'):.0f} Hz")
         finally:
             u.close()
 

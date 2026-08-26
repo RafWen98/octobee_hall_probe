@@ -98,13 +98,13 @@ def main():
     if a.screenshot:
         def shoot():
             win.tabs.setCurrentIndex(a.screenshot_tab)
-            if win.source is None:
+            if win.session.source is None:
                 win.on_connect()
                 deadline = time.time() + 60
-                while win.source is None and time.time() < deadline:
+                while win.session.source is None and time.time() < deadline:
                     app.processEvents()
                     time.sleep(0.05)
-                if win.source is None:
+                if win.session.source is None:
                     print("could not connect", file=sys.stderr)
             t_end = time.time() + a.screenshot_warmup
             while time.time() < t_end:
@@ -126,3 +126,11 @@ def main():
         QtCore.QTimer.singleShot(1200, shoot)
 
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    # Every other entry point in the package has this, and without it
+    # `python -m octobee.gui.app` imports the module, runs nothing, and exits
+    # 0 -- which looks exactly like the application starting and closing
+    # immediately. Not even --help worked.
+    main()

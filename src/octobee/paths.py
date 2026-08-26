@@ -99,11 +99,25 @@ def _user_config_dir():
     return pathlib.Path(base) / "octobee"
 
 
+def _from_env(name):
+    """An overridden directory, made absolute, or None if unset.
+
+    expanduser and resolve are not decoration. Taken verbatim, a "~" is a
+    literal directory of that name, and a relative value is relative to the
+    working directory -- which puts back exactly the bug this module exists to
+    remove, through its own override.
+    """
+    value = os.environ.get(name)
+    if not value:
+        return None
+    return pathlib.Path(value).expanduser().resolve()
+
+
 def config_dir():
     """The directory holding calibration.json and its neighbours."""
-    override = os.environ.get(CONFIG_DIR_ENV)
-    if override:
-        return pathlib.Path(override)
+    override = _from_env(CONFIG_DIR_ENV)
+    if override is not None:
+        return override
     root = repo_root()
     if root is not None:
         return root / CONFIG_SUBDIR
@@ -126,9 +140,9 @@ def captures_dir():
     checkout: captured data is the output of a run, and a tool that produces
     data should put it where the run happened, not somewhere central.
     """
-    override = os.environ.get(CAPTURES_DIR_ENV)
-    if override:
-        return str(pathlib.Path(override))
+    override = _from_env(CAPTURES_DIR_ENV)
+    if override is not None:
+        return str(override)
     root = repo_root()
     if root is not None:
         return str(root / CAPTURES_SUBDIR)

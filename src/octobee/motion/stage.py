@@ -821,7 +821,11 @@ class Stage:
         d = dll()
         self.enforce_profile()
         d.ISC_ClearMessageQueue(self._sb)
-        here = self.position_mm
+        # Only when this call is the one that waits. With wait=False the
+        # caller is StageSet.move_to, which has already read the position to
+        # size its own group wait, and this would be a second DLL round trip
+        # per axis per point of a raster for a number nothing reads.
+        here = self.position_mm if wait else None
         _check(d.ISC_MoveToPosition(self._sb, self._to_du(dev)),
                f"move {self.name} to {mm:g} mm")
         if wait:
@@ -915,6 +919,17 @@ class Stage:
         needs every message consumed in order and one missed event hangs
         forever, whereas the status word is level-triggered and self-correcting.
         """
+        if timeout_s is None:
+            # Everywhere else in this class None means "work it out from the
+            # distance". wait() does not know the distance, so here it means
+            # nothing -- and the arithmetic below turned that into a TypeError
+            # about 'float' and 'NoneType' that named neither the axis nor the
+            # timeout. Size it with _timeout_for() at the caller.
+            raise StageError(
+                f"{self.name}: wait() was given no timeout. None means 'work "
+                f"it out from the distance' to the movers in this class, and "
+                f"wait() cannot -- size it with _timeout_for() before "
+                f"commanding the move.")
         self._require_open()
         deadline = time.monotonic() + timeout_s
         # The controller does not raise the moving bit instantly, so a poll
@@ -1164,8 +1179,29 @@ class StageSet:
             for name, mm in coords.items():
                 if mm is None:
                     continue
-                self.axes[name].move_to(mm, wait=False)
-                moving.append(self.axes[name])
+                st = self.axes[name]
+                # Sized HERE, before the axis is commanded, and per axis.
+                #
+                # timeout_s=None means "work it out from how far it has to
+                # go" -- the convention Stage.move_to and move_by both follow
+                # through _timeout_for. This method took that default without
+                # ever working it out, and passed the None on to wait(), where
+                # `time.monotonic() + timeout_s` raised
+                #
+                #   TypeError: unsupported operand type(s) for +:
+                #              'float' and 'NoneType'
+                #
+                # every time, before anything had moved. run_scan logs a
+                # failed point and carries on, so a field map or a guided
+                # calibration pass failed all of its points and gave up after
+                # three, with nothing in the message to say it was the stages.
+                #
+                # Before the move because the distance is the difference from
+                # where the axis IS, and an axis already travelling no longer
+                # says where it began.
+                wait_s = st._timeout_for(mm - st.position_mm, timeout_s)
+                st.move_to(mm, wait=False)
+                moving.append((st, wait_s))
         except Exception:
             # Whatever refused the second axis -- out of limits, a latched
             # interlock, a DLL error -- the first one is already travelling,
@@ -1173,12 +1209,12 @@ class StageSet:
             # this exception, records a failed point and commands the NEXT
             # move, so without this the machine would be part way through a
             # move nobody is tracking while a new one is issued on top.
-            for st in moving:
+            for st, _ in moving:
                 with contextlib.suppress(Exception):
                     st.stop()
             raise
-        for st in moving:
-            st.wait(timeout_s=timeout_s, what="move")
+        for st, wait_s in moving:
+            st.wait(timeout_s=wait_s, what="move")
         if settle_s:
             # One settle for the whole group, after the last axis stops. The
             # stages ring mechanically after a move and the probe is on the end

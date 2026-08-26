@@ -206,3 +206,105 @@ def test_health():
     check("railed sensor is called dead", v[8][0] == "dead", v[8][1])
     check("healthy sensor is called ok", v[1][0] == "ok")
     check("suggest_dead picks it up", "S8" in ocal.suggest_dead(rows))
+
+
+def test_clock_knob_errors():
+    """A carrier refusing a knob must say so, not fail on the word 'found'.
+
+    What an operator actually saw, in a Connect dialog:
+
+        RuntimeError: acq1001_695: ValueError: could not convert string
+        to float: 'found'
+
+    A box answers an unknown knob with `ERROR:<knob>" not found`, and
+    float(reply.split()[-1]) turned the tail of that sentence into a number
+    that would not parse. The error named neither the box, nor the knob, nor
+    the fact that the reply was a refusal -- and the knob really can be
+    missing on a carrier that is up and answering, because the command port
+    comes back before the site knobs are populated.
+    """
+    print("\nclock knob replies")
+
+    class FakeUut:
+        def __init__(self, reply):
+            self.host, self._reply = "acq1001_695", reply
+
+        def value(self, _knob, site=0):
+            return self._reply
+
+    got = ob.read_freq_hz(FakeUut("SIG:CLK_S1:FREQ 199999.000"),
+                          "SIG:CLK_S1:FREQ")
+    check("a normal reply still reads as a frequency", got == 199999.0)
+    check("and so does a bare number", ob.read_freq_hz(FakeUut("200001"), "k")
+          == 200001.0)
+
+    for reply in ('ERROR:SIG:CLK_S1:FREQ" not found', "", "BUSY"):
+        try:
+            ob.read_freq_hz(FakeUut(reply), "SIG:CLK_S1:FREQ")
+            check(f"{reply!r} is refused", False)
+        except RuntimeError as e:
+            msg = str(e)
+            check(f"{reply or '<empty>'} names the box and the knob",
+                  "acq1001_695" in msg and "SIG:CLK_S1:FREQ" in msg, msg)
+            check(f"{reply or '<empty>'} does not blame the word 'found'",
+                  "could not convert" not in msg and "'found'" not in msg, msg)
+        except ValueError as e:                     # the bug itself
+            check(f"{reply!r} is refused with something readable", False, str(e))
+    try:
+        ob.read_freq_hz(FakeUut('ERROR:SIG:CLK_S1:FREQ" not found'), "SIG:CLK_S1:FREQ")
+    except RuntimeError as e:
+        check("a missing knob says what to do about it -- wait, not debug",
+              "rebooted" in str(e) and "minute" in str(e), str(e))
+
+
+def test_calibration_archives_each_save(workdir):
+    """Saving a calibration must leave a dated copy behind.
+
+    config/calibration.json is one file that every save overwrites, and a
+    calibration is an hour of stage time. A run that turns out to have been
+    mis-set takes the previous good trim with it and there is nothing to go
+    back to -- which is exactly what happened on 2026-08-25, when a guided run
+    with the standoff typed in at 20 mm against a real ~50 mm replaced a good
+    trim with one carrying a failed standoff fit.
+    """
+    print("\ncalibration archives")
+    path = os.path.join(workdir, "calibration.json")
+
+    cal = ocal.Calibration()
+    cal.notes = "first"
+    cal.save(path)
+    first = cal.archived_to
+    check("a save leaves a dated copy beside the live file",
+          first and os.path.exists(first), str(first))
+    check("and the live file is still the plain name",
+          os.path.exists(path))
+    check("the copy is dated, not just numbered",
+          os.path.basename(first).startswith("calibration_20"),
+          os.path.basename(first))
+
+    # Saving the same content again must not pile up identical copies.
+    cal.save(path)
+    check("saving unchanged content archives nothing new",
+          cal.archived_to is None, str(cal.archived_to))
+
+    # A real change does get its own copy, and the old one is untouched.
+    cal.gain_corr = cal.gain_corr * 1.5
+    cal.notes = "second"
+    cal.save(path)
+    check("a changed calibration gets its own copy",
+          cal.archived_to and cal.archived_to != first, str(cal.archived_to))
+    check("and the earlier copy still holds the earlier numbers",
+          np.allclose(ocal.Calibration.load(first).gain_corr, 1.0)
+          and np.allclose(ocal.Calibration.load(cal.archived_to).gain_corr, 1.5))
+
+    # A hand-named copy beside them is history to a person, not to this code:
+    # it must be neither read as the newest archive nor overwritten.
+    mine = os.path.join(workdir, "calibration_raffi_tue_25_08_2026.json")
+    ocal.Calibration().save(mine, archive=False)
+    cal.notes = "third"
+    cal.save(path)
+    check("a hand-named copy is left alone",
+          np.allclose(ocal.Calibration.load(mine).gain_corr, 1.0))
+    check("and does not stop the next archive being written",
+          cal.archived_to and "raffi" not in cal.archived_to,
+          str(cal.archived_to))

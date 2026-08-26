@@ -549,11 +549,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     "everything that does not need the carriers still works, "
                     "and Connect will try again")
             else:
+                # This hint used to be appended to EVERY connect failure,
+                # which is how a carrier answering "no such knob" a minute
+                # after a reboot sent an operator hunting for a Phoebus
+                # capture that was not running. A hint shown unconditionally
+                # carries no information and costs the reader time. The other
+                # two stream failures name port 4210 in their own message; a
+                # stream that closed on open is the one that does not.
+                hint = ("\n\nThe stream closed as soon as it opened, so "
+                        "something else owns port 4210 on that box -- "
+                        "usually a Phoebus 'Streaming Capture' left running."
+                        if "stream closed" in error else "")
                 QtWidgets.QMessageBox.critical(
-                    self, "Connect failed",
-                    f"{error}\n\nIf this says the stream closed immediately, "
-                    f"something else owns port 4210 -- usually a Phoebus "
-                    f"'Streaming Capture' still running on that box.")
+                    self, "Connect failed", f"{error}{hint}")
             for h, p in (prev or {}).items():
                 with contextlib.suppress(Exception):
                     olive.restore_rate(h, p)
@@ -604,6 +612,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _reset_buffers(self):
         self.session.roll = Rolling(max(4, int(self.session.out_rate * self.window_s)))
+        # The carry belongs to the old stream. Keeping it would splice
+        # samples from two different sample rates into one output row.
+        self.session.new_decimator()
         self.raw_hist = None
         self.raw_hist_n = 0
         self._last_health_t = 0.0
@@ -648,7 +659,8 @@ class MainWindow(QtWidgets.QMainWindow):
             meta={"hosts": ",".join(self.session.source.hosts) if self.session.source else "",
                   "stream_rate_hz": self.session.source.fs_hz if self.session.source else 0.0,
                   "continues": os.path.basename(old.path),
-                  "rolled_over_because": f"{what} changed"})
+                  "rolled_over_because": f"{what} changed"},
+            samples_per_row=self.session.decim())
         self.session.log(
             f"{what} changed while recording: closed {os.path.basename(old.path)} "
             f"at {rows} rows and started {os.path.basename(path)}, so each file "
@@ -680,7 +692,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                         self.session.source.volt_offset)  # (n,16,4) V
                 b = self.session.cal.to_mt(grouped)                        # (n,16,3) mT
             with self.session.prof.time("  decimate + buffer"):
-                bd = ocal.decimate(b, self.session.decim())
+                bd = self.session.decimator.push(b)
                 if bd.shape[0] == 0:
                     return
                 self.session.roll.push(bd.astype(np.float32))
@@ -860,7 +872,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     p, self.session.out_rate, self.session.cal, self.session.geom,
                     tube_frame=self.tab_export.tube_frame(),
                     meta={"hosts": ",".join(self.session.source.hosts),
-                          "stream_rate_hz": self.session.source.fs_hz})
+                          "stream_rate_hz": self.session.source.fs_hz},
+                    samples_per_row=self.session.decim())
                 self.session.log(f"recording CSV to {p} at {self.session.out_rate:g} Hz")
             if self.tab_export.raw_enabled():
                 p = orec.default_name("octobee", "bin", self.session.out_dir)
@@ -947,6 +960,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_out_rate(self):
         self.session.out_rate = float(self.cmb_out.currentData())
         self.session.roll.resize(max(4, int(self.session.out_rate * self.window_s)))
+        self.session.new_decimator()
         self.session.log(f"output rate {self.session.out_rate:g} Hz "
                      f"(decimation {self.session.decim()}x from the stream)")
 

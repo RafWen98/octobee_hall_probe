@@ -227,15 +227,44 @@ is for — that is most of the point of it.
 
 **Calibration tab → Guided magnet calibration (motorised, 4 poses).** The
 wizard drives each pass, averages at every point at the full 200 kSPS, and
-stops between poses to ask you to index the tube. Tell it roughly how far the
-magnet is from the chips: nothing is measured with that number, but both B and
-C have to be *sized* from it — the cut wants a half-span of about one standoff,
-because that is the width of the peak it is hunting, and the dither wants a
-quarter of one, because curvature is second order and a ±1 mm dither buries it
-under the slope. When it finishes it **writes
-the trim to `calibration.json`** as well as applying it, and saves the run
-itself beside it — an hour of measurement that lives only in memory until
-somebody remembers to press *Save calibration* is an hour waiting to be lost.
+stops between poses to ask you to index the tube.
+
+It opens on the **standard run** — 145 points a pose, about 11 minutes each and
+44 minutes for all four:
+
+| | | | |
+|---|---|---|---|
+| sweep | 140 mm | cut half-span | 10 mm |
+| step | 3.5 mm | cut step | 1 mm |
+| per point | 2.0 s | dither half-span | 5 mm |
+| settle | 0.5 s | dither points | 5 |
+| standoff | 20 mm | | |
+
+Those numbers are fixed on purpose (`magnet.STANDARD_RUN`), so that two runs a
+month apart are the same measurement and their trims can be compared rather
+than each believed on its own. They are not the only defensible ones, and two
+are worth knowing you are choosing:
+
+* **five dither points, not seven.** Seven is what the bench measured as best —
+  on a probe misplaced by 1 mm the residual trim error is 2.1 % at seven points
+  against 4.2 % at five. The standard buys back eight moves a pose at half the
+  standoff accuracy. Raise it for a run whose trim you intend to keep.
+* **a 10 mm cut half-span at a 20 mm standoff**, which is half of what the
+  sizing rule below asks for, at the same 21 points — the same cost spent
+  closer in around the peak.
+
+Change the *standoff* box and both of the other passes resize themselves from
+it, because nothing is measured with that number but B and C both have to be
+*sized* from it: the cut wants a half-span of about one standoff, because that
+is the width of the peak it is hunting, and the dither wants a quarter of one,
+because curvature is second order and a ±1 mm dither buries it under the slope.
+That hands the run back to the rule and takes it off the standard, which is the
+intended direction — a non-standard standoff has no standard sizing.
+
+**Every pose is written to disk as it lands**, to one growing pair of
+`captures/magcal_*.npz` / `.json` files, so a crash or a closed window after
+pose 3 costs the poses you have not driven yet and nothing else. When the run
+finishes it **writes the trim to `calibration.json`** as well as applying it.
 Untick the box and it applies nothing, and says where the run is so it can be
 applied later without repeating it. Two conditions, which are why
 it is guided rather than a button:

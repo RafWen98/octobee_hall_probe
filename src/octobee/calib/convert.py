@@ -30,8 +30,10 @@ unit-tested and replayed against saved captures.
 """
 
 import argparse
+import glob
 import json
 import os
+import time
 
 import numpy as np
 
@@ -92,7 +94,11 @@ def assemble(ai_by_box, vpc_by_box=None, offset_by_box=None):
 
 
 def decimate(x, factor):
-    """Block-average along axis 0. factor <= 1 is a no-op."""
+    """Block-average along axis 0. factor <= 1 is a no-op.
+
+    Right for a whole array, which is what the offline export hands it. Across
+    a STREAM it is not enough on its own -- see Decimator below.
+    """
     factor = int(factor)
     if factor <= 1:
         return x
@@ -100,6 +106,67 @@ def decimate(x, factor):
     if n == 0:
         return x[:0]
     return x[:n].reshape(n // factor, factor, *x.shape[1:]).mean(axis=1)
+
+
+class Decimator:
+    """decimate() across a stream of blocks, keeping the leftover.
+
+    Why this exists
+    ---------------
+    decimate() keeps whole groups and drops the remainder, which is correct for
+    one array and wrong once per block for a stream. Blocks do not arrive in
+    multiples of the factor -- the acquisition tick hands over whatever has
+    accumulated in 50 ms -- so calling decimate() on each one independently
+    threw away the tail of every block. That is samples that were measured,
+    converted, and then discarded.
+
+    It was not a rounding error. At the default 500 Hz output it lost 1.96% of
+    every recording; at 100 Hz, which is what you would choose for an
+    unattended overnight run, it lost 9.9%. And because the recorder stamps
+    rows at exactly 1/fs_out apart, the missing samples did not leave a visible
+    gap -- they made the time column run slow, by 47 minutes over an eight-hour
+    night at 100 Hz.
+
+    Carrying the remainder into the next block fixes both at once: no sample is
+    dropped, so the row count and the elapsed time agree again by construction.
+
+    Not thread-safe, and does not need to be: one instance per source, driven
+    from the acquisition tick on the GUI thread.
+    """
+
+    def __init__(self, factor):
+        self.factor = max(1, int(factor))
+        self.samples_in = 0
+        self.rows_out = 0
+        self._carry = None
+
+    def reset(self):
+        """Drop the carry. For a new source, or a changed output rate."""
+        self._carry = None
+        self.samples_in = 0
+        self.rows_out = 0
+
+    @property
+    def pending(self):
+        """Samples held back, waiting for the rest of their group."""
+        return 0 if self._carry is None else int(self._carry.shape[0])
+
+    def push(self, x):
+        """Feed one block; get back whole averaged rows, possibly none."""
+        self.samples_in += int(x.shape[0])
+        if self.factor <= 1:
+            self.rows_out += int(x.shape[0])
+            return x
+        if self._carry is not None and self._carry.shape[0]:
+            x = np.concatenate([self._carry, x], axis=0)
+        n = (x.shape[0] // self.factor) * self.factor
+        # The tail is kept, not dropped. It is the first part of the next row.
+        self._carry = x[n:] if n < x.shape[0] else None
+        if n == 0:
+            return x[:0]
+        out = decimate(x[:n], self.factor)
+        self.rows_out += int(out.shape[0])
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -160,6 +227,7 @@ class Calibration:
         self.subtract_vcm = bool(subtract_vcm)
         self.dead = set(dead or ())
         self.notes = notes
+        self.archived_to = None       # dated copy the last save() left, if any
 
         if version is None and np.any(self.zero_mt):
             # A v1 file: its zero was stored post-gain. Convert it so the new
@@ -183,11 +251,60 @@ class Calibration:
                 "dead": sorted(self.dead),
                 "notes": self.notes}
 
-    def save(self, path=None):
+    def save(self, path=None, archive=True):
+        """Write the calibration, and keep a dated copy of it beside itself.
+
+        `calibration.json` is one file that every save overwrites, and a
+        calibration is an hour of stage time. A run that turns out to have
+        been mis-set -- a standoff typed in wrong, a magnet that moved --
+        takes the previous good trim with it when it lands, and there is
+        nothing left to go back to. The dated copy is what makes that
+        recoverable, and it costs about 7 kB.
+
+        The archive is skipped when the content is identical to the newest
+        one already there, so pressing Save twice does not fill the directory
+        with copies of the same calibration. `self.archived_to` is the file
+        written, or None when there was nothing new to write.
+
+        Only stamped names -- calibration_20260825_175910.json -- count as
+        archives. A hand-named copy beside them is left alone, neither read as
+        history nor overwritten.
+        """
         path = path or paths.config(CONFIG_NAME)
+        text = json.dumps(self.to_dict(), indent=2)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2)
+            f.write(text)
+        self.archived_to = self._archive(path, text) if archive else None
         return path
+
+    @staticmethod
+    def _archive(path, text):
+        base, ext = os.path.splitext(path)
+        prev = sorted(glob.glob(f"{base}_[0-9]" + "[0-9]" * 7 + f"_[0-9]*{ext}"))
+        if prev:
+            try:
+                with open(prev[-1], encoding="utf-8") as f:
+                    if f.read() == text:
+                        return None
+            except OSError:
+                pass                      # unreadable history is not a reason
+        # Never overwrite an archive. The stamp resolves to the second, and
+        # two different calibrations inside one second would otherwise leave
+        # only the later -- silently losing a version, which is the whole
+        # failure this exists to prevent. Rare, but the cheap fix is a suffix.
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        dated = f"{base}_{stamp}{ext}"
+        n = 2
+        while os.path.exists(dated):
+            dated, n = f"{base}_{stamp}_{n}{ext}", n + 1
+        try:
+            with open(dated, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            # The live file is already written. Losing the archive is worth
+            # saying, but it is not worth failing the save that succeeded.
+            return None
+        return dated
 
     # Keys to_dict() does not write are ignored on load rather than fatal.
     # cls(**json.load(f)) meant that adding an "operator" or "site" field by

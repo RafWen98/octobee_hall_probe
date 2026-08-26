@@ -7,6 +7,7 @@ import numpy as np
 from PyQt6 import QtWidgets
 
 from octobee.calib import convert as ocal
+from octobee.calib import magnet as omag
 from octobee.gui import window as gui
 from octobee.gui.dialogs.magnet import MagnetWizard
 from octobee.motion import stage as ostage
@@ -118,9 +119,21 @@ def test_magnet_wizard_reopens(app, workdir):
         try:
             wiz.close()
             app.processEvents()
-            check("closing on unsaved poses asks before discarding them",
-                  bool(asked) and "not saved" in asked[0])
+            check("closing an unfinished run asks before abandoning it",
+                  bool(asked) and "2 of 4 poses" in asked[0])
             check("and cancelling keeps the window open", wiz.isVisible())
+            # The prompt used to say the poses existed only in the window.
+            # They are written as they land now, so saying that would talk an
+            # operator out of a close that costs nothing -- and, worse, teach
+            # them to distrust the warning that matters.
+            asked.clear()
+            wiz._save_base = os.path.join(str(workdir), "magcal_partial")
+            wiz.close()
+            app.processEvents()
+            check("and says where the measured poses already are, rather "
+                  "than threatening a loss that is not real",
+                  bool(asked) and "magcal_partial.npz" in asked[0]
+                  and "only in this window" not in asked[0])
         finally:
             QtWidgets.QMessageBox.question = real_q
         wiz._finished = True          # pretend it was applied, so it can go
@@ -205,4 +218,122 @@ def test_magnet_wizard_saves(app, workdir):
     finally:
         QtWidgets.QMessageBox.warning = real_warn
         QtWidgets.QMessageBox.exec = real_exec
+        win.close()
+
+
+def test_magnet_wizard_standard_run(app, workdir):
+    """The wizard opens on the standard, and every pose reaches the disk.
+
+    Two things that were previously only true in someone's head. The Sweep box
+    was sized from probe_geometry.json and the standoff, so editing the
+    geometry silently changed what "the calibration run" meant and two runs a
+    month apart were not the same measurement. And the run was written once,
+    by finish(), so anything that ended the program before the fourth pose --
+    a crash, a closed window -- threw away the three already driven, about
+    half an hour of stage time each.
+    """
+    print("\nguided magnet wizard, the standard run")
+
+    class FakeStage:
+        def __init__(self, name):
+            self.name, self.serial, self.model = name, "45000000", "LTS300C"
+            self.homed, self.invert = True, False
+            self.travel_mm = self.limit_mm = (0.0, 300.0)
+            self.limit_declared = True
+            self.position_trusted, self.distrust_reason = True, None
+
+        @property
+        def position_mm(self):
+            return 10.0
+
+        @property
+        def vel_params(self):
+            return (6.0, 10.0)
+
+    class FakeSet:
+        def __init__(self, axes):
+            self.axes, self.names = axes, list(axes)
+            self.interlock = ostage.MotionInterlock()
+
+        def __getitem__(self, k):
+            return self.axes[k]
+
+        def __iter__(self):
+            return iter(self.axes.values())
+
+        def home_sequence(self):
+            return list(self.axes)
+
+        def untrusted(self):
+            return []
+
+        def close(self):
+            pass
+
+    ns = argparse.Namespace(
+        uut=None, demo=True, replay=None, no_connect=True,
+        geometry=os.path.join(workdir, "std_geom.json"),
+        calibration=os.path.join(workdir, "std_cal.json"),
+        machine=os.path.join(workdir, "std_machine.json"),
+        out_dir=os.path.join(workdir, "stdcaps"),
+        screenshot=None, screenshot_tab=0, screenshot_warmup=0)
+    win = gui.MainWindow(ns)
+    win.session.stages = FakeSet({"x": FakeStage("x"), "y": FakeStage("y"),
+                                  "z": FakeStage("z")})
+    try:
+        # A geometry deliberately unlike the bench's, to prove the standard
+        # does not follow it. The derived sweep here would be 230 mm.
+        win.session.geom = pgeom.Geometry(plate_pitch_mm=50.0)
+        wiz = MagnetWizard(win)
+        std = omag.STANDARD_RUN
+        got = {
+            "sweep_mm": wiz.spin_span.value(),
+            "step_mm": wiz.spin_step.value(),
+            "seconds_per_point": wiz.spin_secs.value(),
+            "standoff_mm": wiz.spin_standoff.value(),
+            "cut_half_span_mm": wiz.spin_across_half.value(),
+            "cut_step_mm": wiz.spin_across_step.value(),
+            "dither_half_span_mm": wiz.spin_dither_half.value(),
+            "dither_points": wiz.spin_dither_pts.value(),
+        }
+        for k, want in std.items():
+            check(f"the wizard opens on the standard {k} of {want:g}",
+                  abs(got[k] - want) < 1e-9, f"got {got[k]:g}")
+        check("and the standard does not move when the geometry does",
+              wiz.spin_span.value() == std["sweep_mm"],
+              f"a 50 mm plate pitch would derive "
+              f"{omag.suggested_sweep(win.session.geom)[0]:g} mm")
+        check("which is the 145-point pose the panel promises",
+              "= 145 points per pose" in wiz.lbl_points.text(),
+              wiz.lbl_points.text())
+
+        # Touching the standoff is what hands the sizing back to the physics
+        # rule -- and it must not do so before it is touched.
+        wiz.spin_standoff.setValue(40.0)
+        check("moving the standoff re-derives the cut it no longer sizes",
+              wiz.spin_across_half.value() == 40.0
+              and wiz.spin_dither_half.value() == 10.0,
+              f"cut {wiz.spin_across_half.value():g}, "
+              f"dither {wiz.spin_dither_half.value():g}")
+
+        # ---- and each pose is on disk as it lands
+        g = win.session.geom
+        run = _synth_magnet_run(g, np.ones(16),
+                                np.array([0.0, 200.0, g.fsv_radius_mm + 25.0]))
+        bases = set()
+        for n, sweep in enumerate(run.sweeps, start=1):
+            wiz._pending = sweep
+            wiz._finish_pose()
+            app.processEvents()
+            bases.add(wiz._save_base)
+            back = omag.MagnetRun.load(wiz._save_base + ".npz")
+            check(f"pose {n} is on disk before pose {n + 1} is driven",
+                  len(back) == n, f"loaded {len(back)}")
+        check("all four went to ONE pair of files, not four",
+              len(bases) == 1, str(bases))
+        check("and the log says so as it goes",
+              "4 of 4 poses saved to" in win.log_pane.toPlainText())
+        wiz._finished = True
+        wiz.close()
+    finally:
         win.close()

@@ -82,9 +82,10 @@ class CsvRecorder:
     """
 
     def __init__(self, path, fs_out, cal, geom=None, tube_frame=False,
-                 include_mag=True, meta=None):
+                 include_mag=True, meta=None, samples_per_row=None):
         self.path = path
         self.fs_out = float(fs_out)
+        self.samples_per_row = samples_per_row
         self.cal = cal
         self.geom = geom
         self.tube_frame = bool(tube_frame and geom is not None)
@@ -111,6 +112,19 @@ class CsvRecorder:
                 # even after calibration.json has moved on.
                 "calibration_id": calibration_id(self.cal),
                 "excluded": sorted(self.cal.dead)}
+        # What a row actually is, stated rather than left to be inferred.
+        #
+        # Files written before 2026-08-26 do not carry these two lines, and for
+        # those the inference was wrong: the live recorder decimated each
+        # arriving block on its own and dropped the remainder, so rows were
+        # contiguous in the file and not in time -- t_s ran slow by the
+        # discarded fraction, up to 9.9% at 100 Hz. A file that says
+        # "timebase: contiguous" was written after the carry was added and its
+        # t_s is real elapsed time. A file without the field cannot promise it.
+        if self.samples_per_row:
+            info["samples_per_row"] = int(self.samples_per_row)
+        info["timebase"] = ("contiguous -- every stream sample contributes to "
+                            "exactly one row, so t_s is real elapsed time")
         info.update(meta)
         for k, v in info.items():
             self._f.write(f"# {k}: {v}\n")
@@ -412,7 +426,8 @@ def main(argv=None):
     b = ocal.decimate(b, dec)
     out = a.out or default_name("export", "csv")
     with CsvRecorder(out, cap["fs_hz"][0] / dec, cal, geom, a.tube_frame,
-                     meta={"source": a.capture}) as rec:
+                     meta={"source": a.capture},
+                     samples_per_row=dec) as rec:
         rec.write(b)
     print(f"wrote {out}: {b.shape[0]} rows at {cap['fs_hz'][0]/dec:g} Hz, "
           f"{os.path.getsize(out)/1e6:.2f} MB")

@@ -61,11 +61,11 @@ def set_rate(host, fs_hz, settle=3.0):
     u = ob.Uut(host)
     try:
         prev = u.value("clkdiv", site=1)
-        clk_mb = float(u.value("SIG:CLK_MB:FREQ").split()[-1])
+        clk_mb = ob.read_freq_hz(u, "SIG:CLK_MB:FREQ")
         div = max(1, int(round(clk_mb / fs_hz)))
         u.cmd(f"clkdiv {div}", site=1)
         time.sleep(settle)
-        actual = float(u.value("SIG:CLK_S1:FREQ").split()[-1])
+        actual = ob.read_freq_hz(u, "SIG:CLK_S1:FREQ")
         return prev, actual
     finally:
         u.close()

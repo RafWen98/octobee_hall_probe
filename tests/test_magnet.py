@@ -320,3 +320,47 @@ def test_survey_pairing():
     except ValueError:
         ok = True
     check("an odd pose count is refused rather than mispaired", ok)
+
+
+def test_magnet_incremental_save(workdir):
+    """Saving repeatedly to one base must never destroy the last good copy.
+
+    The wizard writes after every pose now, so save() is routinely called with
+    an earlier version of itself already under that name. A write that dies
+    part way -- a full disk, a killed process -- would otherwise take the
+    poses already on disk with it, which is the exact loss that saving early
+    was added to prevent. The temp-file rename is what stops that, and the
+    only way to check it is to make a write fail.
+    """
+    print("\nguided magnet calibration -- saving as the run goes")
+    g = pgeom.Geometry()
+    rng = np.random.default_rng(37)
+    full = _synth_magnet_run(g, rng.normal(1.0, 0.05, 16),
+                             np.array([0.0, 200.0, g.fsv_radius_mm + 25.0]))
+    base = os.path.join(workdir, "magcal_growing")
+
+    part = omag.MagnetRun(axis=full.axis)
+    for n, sweep in enumerate(full.sweeps, start=1):
+        part.add(sweep)
+        part.save(base)
+        check(f"a {n}-pose run reads back with {n} pose(s)",
+              len(omag.MagnetRun.load(base + ".npz")) == n)
+
+    def explode(*_a, **_k):
+        raise OSError("no space left on device")
+
+    real, omag.np.savez_compressed = omag.np.savez_compressed, explode
+    try:
+        omag.MagnetRun(full.sweeps[:1], axis=full.axis).save(base)
+        check("a failed write is reported, not swallowed", False)
+    except OSError:
+        check("a failed write is reported, not swallowed", True)
+    finally:
+        omag.np.savez_compressed = real
+
+    check("and the four poses already saved are still there",
+          len(omag.MagnetRun.load(base + ".npz")) == omag.N_POSES)
+    check("with no half-written temporary left behind",
+          not os.path.exists(base + ".npz.part")
+          and not os.path.exists(base + ".json.part"),
+          str(sorted(os.listdir(workdir))))

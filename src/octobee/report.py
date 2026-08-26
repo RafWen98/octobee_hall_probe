@@ -50,6 +50,11 @@ def load_npz(path):
             "pwr_good": int(z[f"pwr_good_{bi}"]),
             "fs_hz": float(z[f"fs_hz_{bi}"]),
             "vpc": float(z[f"vpc_{bi}"]),
+            # Volts at ADC count 0. Zero on the bipolar ranges, 5.0 on 0-10V
+            # and 2.5 on 0-5V. Captures written before this key existed were
+            # all taken on +/-10V, where it is zero.
+            "volt_offset": (float(z[f"volt_offset_{bi}"])
+                            if f"volt_offset_{bi}" in z else 0.0),
             "adc_range": str(z[f"adc_range_{bi}"]),
             "sam_cnt": z[f"sam_cnt_{bi}"],
         })
@@ -68,6 +73,7 @@ def live(hosts, seconds):
             "pwr_good": d.get("pwr_good", 0),
             "fs_hz": lay.fs_hz,
             "vpc": lay.volts_per_count,
+            "volt_offset": lay.volt_offset,
             "adc_range": lay.adc_range,
             "sam_cnt": d["sam_cnt"],
         })
@@ -241,10 +247,14 @@ def report(boxes, ranges, do_plot, plot_path):
         ai = bx["ai"]
         vpc = bx["vpc"]
         v_per_t = bx["v_per_t"]
+        v_offset = bx.get("volt_offset", 0.0)
         temps = ob.temp_c(bx["temp_raw"])
         for s in range(ob.SENSORS_PER_BOX):
             gs = bi * ob.SENSORS_PER_BOX + s + 1          # global sensor number
-            vcm_v = ai[:, s * 4 + 3].mean() * vpc
+            # + the pedestal: on a unipolar range count 0 is not 0 V, and
+            # without it a healthy 2.5 V VCM reads -2.5 V, which is outside
+            # the plausible window and reports all 16 chips as broken.
+            vcm_v = ai[:, s * 4 + 3].mean() * vpc + v_offset
             offs, noise = [], []
             for a in range(3):
                 x = (ai[:, s * 4 + a].astype(np.float64) - ai[:, s * 4 + 3]) * vpc

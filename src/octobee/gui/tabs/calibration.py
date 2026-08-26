@@ -685,7 +685,10 @@ class CalibrationTab(QtWidgets.QWidget):
         if path:
             self.session.cal.notes = f"saved from octobee_gui {time.strftime('%Y-%m-%d %H:%M')}"
             self.session.cal.save(path)
-            self.session.log(f"calibration written to {path}")
+            kept = self.session.cal.archived_to
+            self.session.log(
+                f"calibration written to {path}"
+                + (f", archived as {os.path.basename(kept)}" if kept else ""))
 
     def on_load_cal(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(

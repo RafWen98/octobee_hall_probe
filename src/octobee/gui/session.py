@@ -79,6 +79,9 @@ class Session:
 
         # ---- the instrument ------------------------------------------------
         self.source = None
+        # Rebuilt whenever the source or the output rate changes; it holds
+        # the tail of the last block, which belongs to the next row.
+        self.decimator = ocal.Decimator(1)
         self.prev_clkdiv = {}
         self.out_rate = 500.0
 
@@ -114,6 +117,17 @@ class Session:
         if self.source is None:
             return 1
         return max(1, int(round(self.source.fs_hz / self.out_rate)))
+
+    def new_decimator(self):
+        """A fresh stream decimator for the current source and output rate.
+
+        Held here rather than built per tick because it carries state: the tail
+        of each block that has not yet completed a row. Rebuild it -- do not
+        reuse it -- whenever the source or the output rate changes, since the
+        samples it is holding were taken under the old one.
+        """
+        self.decimator = ocal.Decimator(self.decim())
+        return self.decimator
 
     # ---- logging ----------------------------------------------------------
     #

@@ -220,3 +220,97 @@ def test_fieldmap_roundtrip(workdir):
           "that difference is the only way a stalled point is visible later")
     check("the field map writes a provenance sidecar",
           os.path.exists(os.path.splitext(path)[0] + ".json"))
+
+
+def test_group_move_sizes_its_own_wait():
+    """A grouped move must size its wait, not hand None to it.
+
+    The bug this pins, seen on the bench as every point of a guided
+    calibration pass failing in the same second:
+
+        point 1/41 at y=3.5 x=40 z=220 FAILED (TypeError: unsupported
+        operand type(s) for +: 'float' and 'NoneType') -- skipping it
+
+    StageSet.move_to's timeout default became None, meaning "work it out from
+    the distance" -- the convention Stage.move_to and move_by follow through
+    _timeout_for -- but nothing then worked it out. The None went into
+    Stage.wait, where `time.monotonic() + timeout_s` raised before the axis
+    had moved. run_scan records a failed point and carries on, so every field
+    map and every calibration pass lost all of its points and stopped after
+    three in a row, with nothing in the message about stages at all.
+
+    Checked through the REAL Stage._timeout_for, because a fake that sizes the
+    wait itself would pass whether or not move_to ever asked for one.
+    """
+    print("\ngrouped moves size their own wait")
+
+    class FakeAxis:
+        """Enough of a Stage for move_to, with the real timeout arithmetic."""
+
+        def __init__(self, name, at):
+            self.name, self._at = name, at
+            self._vel_cfg, self._accel_cfg = 6.0, 10.0
+            self.waited = self.moved = None
+            self.stopped = False
+
+        @property
+        def position_mm(self):
+            return self._at
+
+        def _timeout_for(self, distance_mm, timeout_s):
+            return ostage.Stage._timeout_for(self, distance_mm, timeout_s)
+
+        def move_to(self, mm, wait=True):
+            self.moved = mm
+
+        def wait(self, timeout_s=180.0, what="move"):
+            # Exactly what the real one does with a None it cannot use.
+            if timeout_s is None:
+                raise ostage.StageError(f"{self.name}: wait() with no timeout")
+            self.waited = timeout_s
+
+        def stop(self):
+            self.stopped = True
+
+    axes = {"y": FakeAxis("y", 0.0), "x": FakeAxis("x", 40.0)}
+    ss = ostage.StageSet.__new__(ostage.StageSet)
+    ss.axes = axes
+
+    ss.move_to(y=143.5, x=40.0)
+    check("a grouped move with no timeout still waits",
+          all(a.waited is not None for a in axes.values()),
+          str({n: a.waited for n, a in axes.items()}))
+    check("and the wait is sized from how far that axis goes",
+          axes["y"].waited == ostage.move_timeout_s(143.5, 6.0, 10.0)
+          and axes["y"].waited > axes["x"].waited,
+          f"y {axes['y'].waited:.2f} s over 143.5 mm, "
+          f"x {axes['x'].waited:.2f} s standing still")
+
+    # An explicit timeout still wins -- that is what the argument is for.
+    for a in axes.values():
+        a.waited = None
+    ss.move_to(timeout_s=42.0, y=0.0)
+    check("an explicit timeout is passed through untouched",
+          axes["y"].waited == 42.0, str(axes["y"].waited))
+
+    # And the distance is read BEFORE the move: an axis already travelling no
+    # longer says where it started, so sizing after the fact reads ~zero.
+    check("the distance is taken before the axis is commanded",
+          axes["y"].moved == 0.0)
+
+
+def test_wait_without_a_timeout_says_so():
+    """wait(None) must name the axis, not fail inside arithmetic."""
+    print("\nwait with no timeout")
+
+    class Stub:
+        name = "y"
+
+    try:
+        ostage.Stage.wait(Stub(), timeout_s=None)
+        check("wait() with no timeout is refused", False)
+    except ostage.StageError as e:
+        check("wait() with no timeout is refused, by name",
+              "y" in str(e) and "_timeout_for" in str(e), str(e))
+    except TypeError as e:
+        check("wait() with no timeout is refused readably", False, str(e))

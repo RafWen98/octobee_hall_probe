@@ -99,6 +99,8 @@ class MagnetWizard(QtWidgets.QDialog):
         self._pending = None     # the PoseSweep the passes are building up
         self._rings = None       # where pass A found this pose's four rings
         self._released = False   # have the carriers been taken off live yet
+        self._save_base = None   # where the poses are being written as they land
+        self._wrapped_up = False  # has the once-per-run finishing work been done
 
         lay = QtWidgets.QVBoxLayout(self)
         self.lbl_step = QtWidgets.QLabel()
@@ -145,24 +147,39 @@ class MagnetWizard(QtWidgets.QDialog):
             "The axis the tube lies along. The whole argument for this "
             "routine is that every sensor passes the magnet at the same "
             "approach, which is only true along the tube axis.")
+        # The standardized run, not a sizing derived from this probe's
+        # geometry file -- see omag.STANDARD_RUN for what each number is and
+        # what it gave up. The derived numbers are still shown, in the tooltip
+        # and by the standoff box, because they are what this particular probe
+        # would ask for and the operator is the one who gets to decide.
+        std = omag.STANDARD_RUN
         span, step = omag.suggested_sweep(win.session.geom)
         self.spin_span = QtWidgets.QDoubleSpinBox()
         self.spin_span.setRange(10.0, 300.0)
-        self.spin_span.setValue(span)
+        self.spin_span.setValue(std["sweep_mm"])
         self.spin_span.setSuffix(" mm")
         self.spin_span.setToolTip(
             "How far to drive from where the head is parked now. Long enough "
-            "to carry every ring past the magnet and out the other side.")
+            "to carry every ring past the magnet and out the other side.\n\n"
+            f"The standard run is {std['sweep_mm']:g} mm. This probe's "
+            f"geometry — four rings {win.session.geom.plate_pitch_mm:g} mm "
+            f"apart — would ask for {span:g} mm, which is the same rings with "
+            f"40 mm of lead-in at each end instead of "
+            f"{(std['sweep_mm'] - (pgeom.SENSORS_PER_FACE - 1) * win.session.geom.plate_pitch_mm) / 2:.1f} mm. "
+            f"If the end rings peak at the very edge of the sweep, this is "
+            f"the number to raise.")
         self.spin_step = QtWidgets.QDoubleSpinBox()
         self.spin_step.setRange(0.1, 50.0)
-        self.spin_step.setValue(step)
+        self.spin_step.setValue(std["step_mm"])
         self.spin_step.setSuffix(" mm")
         self.spin_step.setToolTip(
             "Coarse on purpose. This pass only has to find WHERE the four "
-            "rings are; the transverse cut below is what measures them.")
+            "rings are; the transverse cut below is what measures them.\n\n"
+            f"The standard run is {std['step_mm']:g} mm; a quarter of the "
+            f"plate pitch, {step:g} mm, is all this pass needs.")
         self.spin_secs = QtWidgets.QDoubleSpinBox()
         self.spin_secs.setRange(0.2, 30.0)
-        self.spin_secs.setValue(1.0)
+        self.spin_secs.setValue(std["seconds_per_point"])
         self.spin_secs.setSuffix(" s")
         self.spin_secs.setToolTip(
             "Averaging time per point. The peak needs little, but the "
@@ -177,7 +194,7 @@ class MagnetWizard(QtWidgets.QDialog):
         # ---- the standoff, which sizes both of the other passes
         self.spin_standoff = QtWidgets.QDoubleSpinBox()
         self.spin_standoff.setRange(3.0, 200.0)
-        self.spin_standoff.setValue(20.0)
+        self.spin_standoff.setValue(std["standoff_mm"])
         self.spin_standoff.setSuffix(" mm")
         self.spin_standoff.setToolTip(
             "Roughly how far the magnet is from the chips. Nothing is "
@@ -190,8 +207,12 @@ class MagnetWizard(QtWidgets.QDialog):
             "more and the extra points buy nothing.\n"
             "  - the dither needs a quarter of it, for the same reason in "
             "reverse.\n\n"
-            "Within a factor of two is close enough. Changing it resizes "
-            "both.")
+            "Within a factor of two is close enough.\n\n"
+            "The standard run pairs a 20 mm standoff with a 10 mm cut "
+            "half-span -- half of what the rule above asks for, at the same "
+            "21 points, so the cut is spent closer in around the peak. "
+            "Moving this box hands both passes back to the rule and they "
+            "resize; it will not put the standard back.")
 
         for col, (lbl, wdg) in enumerate((("tube axis", self.cmb_axis),
                                           ("standoff ~", self.spin_standoff),
@@ -250,11 +271,17 @@ class MagnetWizard(QtWidgets.QDialog):
             "dither clips and the fit reads a flat top.")
         self.spin_dither_pts = QtWidgets.QSpinBox()
         self.spin_dither_pts.setRange(3, 21)
-        self.spin_dither_pts.setValue(omag.DITHER_POINTS)
+        self.spin_dither_pts.setValue(std["dither_points"])
         self.spin_dither_pts.setToolTip(
             "Three is the minimum that can separate a slope from a curvature, "
-            "and it leaves nothing over to judge the fit by. Seven is where "
-            "the bench stopped improving.")
+            "and it leaves nothing over to judge the fit by.\n\n"
+            f"The standard run uses {std['dither_points']}. The bench measured "
+            f"{omag.DITHER_POINTS} as the best available: on a probe misplaced "
+            f"by 1 mm the residual trim error is 4.2 % at five points against "
+            f"2.1 % at seven, for eight more moves per pose. Raise it to "
+            f"{omag.DITHER_POINTS} if the standoff column comes back with "
+            f"'--' in it, or if this run is the one the trim will be kept "
+            f"from.")
 
         for col, (lbl, wdg) in enumerate(
                 (("transverse axis", self.cmb_across),
@@ -266,7 +293,13 @@ class MagnetWizard(QtWidgets.QDialog):
             gl.addWidget(QtWidgets.QLabel(lbl), 2, col)
             gl.addWidget(wdg, 3, col)
 
-        self._resize_passes()
+        # Seeded from the standard, and only THEN wired to the standoff.
+        # _resize_passes is the answer for a standoff that is not the standard
+        # one, so it takes over the moment that box is moved and not before --
+        # calling it here would derive over the standard on the way in.
+        self.spin_across_half.setValue(std["cut_half_span_mm"])
+        self.spin_across_step.setValue(std["cut_step_mm"])
+        self.spin_dither_half.setValue(std["dither_half_span_mm"])
         self.spin_standoff.valueChanged.connect(self._resize_passes)
 
         self.lbl_points = QtWidgets.QLabel("")
@@ -447,6 +480,12 @@ class MagnetWizard(QtWidgets.QDialog):
         out of the air is how a run comes back with a flat cut and an
         unfittable dither. They stay editable; this only moves them when the
         standoff changes.
+
+        Which is also what takes a run off the standard: the boxes open at
+        omag.STANDARD_RUN, and this replaces them with the derived sizing the
+        moment the standoff is no longer the one the standard was chosen for.
+        That is the intended direction -- a non-standard standoff has no
+        standard sizing, and the rule is the better answer there.
         """
         d = self.spin_standoff.value()
         half, step = omag.suggested_plane(d)
@@ -815,6 +854,41 @@ class MagnetWizard(QtWidgets.QDialog):
             return
         self._finish_pose()
 
+    def _save_progress(self):
+        """Write the run to disk now, with however many poses it has.
+
+        The run used to reach the disk exactly once, in finish(), after all
+        four poses. Four poses is about 44 minutes with a person turning the
+        head between them, and anything that ended the process before the last
+        one -- a crash, a closed window, a latched E-stop nobody reset -- threw
+        away every pose already measured. MagnetRun has always been able to
+        save a partial run ("a run abandoned after two poses still reports what
+        those two established"); nothing was calling it until the end.
+
+        The same base path every time, so this is one pair of files growing a
+        pose at a time and finish() completes it rather than writing a fifth
+        copy. Returns the path, or None if it could not be written.
+        """
+        if self._save_base is None:
+            self._save_base = os.path.join(
+                self.win.session.out_dir,
+                time.strftime("magcal_%Y%m%d_%H%M%S"))
+        try:
+            path = self.run.save(self._save_base)
+        except OSError as e:
+            # A failed write must not end the run. The poses are in memory and
+            # the next one can still be measured, which is worth more than
+            # this save was -- so it is reported and the routine carries on.
+            self.win.session.log(
+                f"guided magnet calibration: pose {len(self.run)} could NOT "
+                f"be saved -- {type(e).__name__}: {e}. The run continues; the "
+                f"poses are still in memory.")
+            return None
+        self.win.session.log(
+            f"guided magnet calibration: {len(self.run)} of {omag.N_POSES} "
+            f"poses saved to {path}")
+        return path
+
     def _finish_pose(self):
         self.run.across = self._across_name()
         self.run.normal = self._normal_name()
@@ -831,16 +905,39 @@ class MagnetWizard(QtWidgets.QDialog):
         self.win.session.log(
             f"guided magnet calibration: pose {len(self.run)} done, loudest "
             f"S{loud} at {peaks.max():.3f} mT{extra}")
+        # Before the report and the button state, so the measurement is on
+        # disk the instant it exists rather than after the widgets have been
+        # asked to redraw it.
+        self._save_progress()
         self.report.setPlainText(self.run.report(self.win.session.geom))
         self._refresh()
 
     # ---- finishing -------------------------------------------------------
     def finish(self):
         win = self.win
-        base = os.path.join(win.session.out_dir,
-                            time.strftime("magcal_%Y%m%d_%H%M%S"))
-        path = self.run.save(base)
-        win.session.log(f"guided magnet calibration: saved {path}")
+        # The per-pose saves have been writing to this base since pose 1, so
+        # this completes that pair of files rather than starting a new one --
+        # two copies of the same run under two timestamps is how the wrong one
+        # gets analysed later.
+        path = self._save_progress()
+        saved = path is not None
+        if not saved:
+            QtWidgets.QMessageBox.warning(
+                self, "Guided magnet calibration",
+                "This run could not be written to disk — see the log for "
+                "why.\n\nThe trim below is still computed from the poses in "
+                "memory and can still be applied, but the measurement behind "
+                "it is not saved. Clear the problem and press Apply and save "
+                "again before closing this window, or the hour is gone.")
+            path = (self._save_base or "magcal") + ".npz"
+        if self._wrapped_up:
+            # Reached only by pressing the button again after a failed save.
+            # Everything below this is once-per-run and must not be repeated:
+            # cross_calibrate MULTIPLIES into the existing correction, so a
+            # second pass would trim an already-trimmed probe by the same
+            # factor again. The retry saves, and does nothing else.
+            self._settle_finished(saved)
+            return
         # Said before the trim is touched, because it decides what the trim
         # is worth: opposite faces that disagree mean part of it is geometry.
         balance = self.run.face_balance(win.session.geom)
@@ -863,9 +960,12 @@ class MagnetWizard(QtWidgets.QDialog):
                              f"{', '.join(passes)}; no geometry weighting -- "
                              f"every sensor was measured at its own peak")
             cal_path = win.session.cal.save(win.session.args.calibration)
+            kept = win.session.cal.archived_to
             win.session.log(f"gain trim applied from the guided run "
                         f"(no geometry weighting needed); {note} -> "
-                        f"{cal_path}")
+                        f"{cal_path}"
+                        + (f", archived as {os.path.basename(kept)}"
+                           if kept else ""))
             win.tab_calib.calibration_changed.emit("the gain trim")
             win.tab_calib.refresh_cal_report()
             if balance["notes"]:
@@ -878,18 +978,39 @@ class MagnetWizard(QtWidgets.QDialog):
                       "four sensors never moved relative to each other. It is "
                       "the face-to-face part of the trim that is carrying "
                       "geometry as well as gain.")
-        else:
+        elif saved:
             win.session.log(f"gain trim NOT applied. The run is on disk at {path} "
                         f"and nothing about it is lost -- it can be applied "
                         f"later without repeating the measurement.")
+        else:
+            # The reassuring version of this line is only true because the
+            # file exists. Without it, "nothing is lost" is exactly wrong.
+            win.session.log("gain trim NOT applied, and the run is NOT on "
+                        "disk. It exists only in this window -- clear "
+                        "whatever stopped the save and press Apply and save "
+                        "before closing it.")
+        self._wrapped_up = True
         notes = self.run.check_geometry(win.session.geom)
         if notes:
             self.offer_geometry_update(notes)
         win.session.log("guided magnet calibration: the carriers are still off "
                     "the live stream — press Connect to go back to live.")
-        self._finished = True
-        self.btn_primary.setEnabled(False)
-        self.lbl_step.setText("Finished")
+        self._settle_finished(saved)
+
+    def _settle_finished(self, saved):
+        """Close the run out — unless it is not on disk, in which case do not.
+
+        A run whose files were never written is not finished, and greying the
+        button out is the difference between an operator who can retry the
+        save and one who watches the only copy of an hour's measurement go
+        when the window closes.
+        """
+        self._finished = saved
+        self.btn_primary.setEnabled(not saved)
+        self.btn_primary.setText("Apply and save")
+        self.lbl_step.setText(
+            "Finished" if saved
+            else "Finished — but NOT saved. Press Apply and save again.")
 
     def offer_geometry_update(self, notes):
         """Report what the run disagrees with, and offer to write it down.
@@ -973,21 +1094,36 @@ class MagnetWizard(QtWidgets.QDialog):
             self._worker.abort()
             self._worker.wait(30000)
         if self.run.sweeps and not self._finished:
-            # Poses recorded but never applied: closing here throws away the
-            # only copy, since the run is written to disk by finish().
+            # Poses recorded but the run never finished. This used to warn
+            # that closing threw away the only copy, which was true when the
+            # run reached the disk once, in finish(). Each pose is now written
+            # as it lands, so what is actually at stake is the trim and the
+            # remaining poses -- and telling an operator they are about to
+            # lose measurements that are safely on disk is its own way of
+            # making a wrong decision look like the careful one.
+            on_disk = (f"The {len(self.run)} pose(s) already measured are "
+                       f"saved to {os.path.basename(self._save_base)}.npz and "
+                       f"can be applied later without driving them again."
+                       if self._save_base else
+                       "Nothing has reached the disk — see the log.")
             reply = QtWidgets.QMessageBox.question(
                 self, "Guided magnet calibration",
-                f"{len(self.run)} pose(s) recorded and not saved.\n\n"
-                f"They are only in this window — closing discards them, and "
-                f"the sweeps would have to be driven again. Close anyway?",
+                f"This run is {len(self.run)} of {omag.N_POSES} poses, and the "
+                f"gain trim has not been applied.\n\n{on_disk}\n\nThe magnet "
+                f"and the cradle have to stay exactly as they are for the "
+                f"remaining poses to belong to this run, so closing here "
+                f"generally means starting over. Close anyway?",
                 QtWidgets.QMessageBox.StandardButton.Discard
                 | QtWidgets.QMessageBox.StandardButton.Cancel,
                 QtWidgets.QMessageBox.StandardButton.Cancel)
             if reply != QtWidgets.QMessageBox.StandardButton.Discard:
                 event.ignore()
                 return
-            self.win.session.log(f"guided magnet calibration: {len(self.run)} "
-                             f"unsaved pose(s) discarded")
+            self.win.session.log(
+                f"guided magnet calibration: abandoned at {len(self.run)} of "
+                f"{omag.N_POSES} poses; no trim applied"
+                + (f". The measurement is on disk at {self._save_base}.npz"
+                   if self._save_base else ""))
         super().closeEvent(event)
 
 
