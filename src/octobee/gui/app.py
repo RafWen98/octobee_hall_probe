@@ -14,6 +14,7 @@ from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee import machine as omach
 from octobee.calib import geometry as pgeom
+from octobee.motion import encoder as oenc
 from octobee.gui.crash import CrashHandler
 from octobee.gui.window import MainWindow
 
@@ -53,6 +54,10 @@ def main():
     p.add_argument("--replay", help="play back a saved .npz capture")
     p.add_argument("--geometry", default=paths.config(pgeom.CONFIG_NAME))
     p.add_argument("--calibration", default=paths.config(ocal.CONFIG_NAME))
+    p.add_argument("--stages", default=paths.config(oenc.AXIS_CONFIG),
+                   help="the axis map, soft limits, motion profile and "
+                        "measured encoder scales "
+                        f"(default: {oenc.AXIS_CONFIG})")
     p.add_argument("--machine", default=paths.config(omach.CONFIG_NAME),
                    help="where the coil set, the energised coils and the "
                         "probe's placement in the machine are remembered "

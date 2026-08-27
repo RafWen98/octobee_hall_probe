@@ -63,6 +63,7 @@ def test_autoconnect(app, workdir):
     def build(**over):
         ns = argparse.Namespace(
             uut=None, demo=False, replay=None,
+            stages=os.path.join(workdir, "stages.json"),
             geometry=os.path.join(workdir, "probe_geometry.json"),
             calibration=os.path.join(workdir, "calibration.json"),
             machine=os.path.join(workdir, "machine.json"),
@@ -148,6 +149,7 @@ def test_close_is_clean(app, workdir):
     print("\nclean shutdown")
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, no_connect=True,
+        stages=os.path.join(workdir, "stages.json"),
         geometry=os.path.join(workdir, "close_geom.json"),
         calibration=os.path.join(workdir, "close_cal.json"),
         machine=os.path.join(workdir, "close_machine.json"),
@@ -184,6 +186,7 @@ def test_machine_tab(app, workdir):
 
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, no_connect=True,
+        stages=os.path.join(workdir, "stages.json"),
         geometry=os.path.join(workdir, "tab_geom.json"),
         calibration=os.path.join(workdir, "tab_cal.json"),
         machine=cfg_path,
@@ -303,7 +306,49 @@ def _check_machine_ring(win):
     check("the drawing follows the pose, not the other way round",
           np.allclose(view._placement.rotation(),
                       omach.rotation_matrix(now), atol=1e-12))
+
+    # The point of the rotation: it says how the assembly is MOUNTED relative
+    # to the coils, so the probe's own axes have to turn with it. A handle that
+    # stayed square to the machine would be drawing an orientation the rig does
+    # not have, and the mounting angle would be invisible.
     tab.machine_pose_spins["rot_z_deg"].setValue(0.0)
+    square = view._gizmo_dirs.copy()
+    check("with nothing mounted at an angle the probe's axes are the machine's",
+          np.allclose(square, np.eye(3), atol=1e-12), str(square.round(3)))
+
+    tab.machine_pose_spins["rot_z_deg"].setValue(90.0)
+    turned = view._gizmo_dirs.copy()
+    check("turning the mounting angle turns the probe's own axes with it",
+          np.allclose(turned[:, 0], [0.0, 1.0, 0.0], atol=1e-9)
+          and np.allclose(turned[:, 1], [-1.0, 0.0, 0.0], atol=1e-9),
+          f"rig x now points {turned[:, 0].round(3)}, rig y {turned[:, 1].round(3)}")
+    check("and Z is untouched, because Z is what it turned about",
+          np.allclose(turned[:, 2], [0.0, 0.0, 1.0], atol=1e-12),
+          str(turned[:, 2].round(3)))
+    check("the drawn probe turns with them",
+          np.allclose(view._placement.rotation(), turned, atol=1e-12),
+          "the handle and the body would be showing different orientations")
+
+    # And dragging one of those arrows now moves along the RIG axis, which on a
+    # rig turned 90 deg is machine y. Anything else would mean the arrow and
+    # the stage it stands for disagree about which way they go.
+    screen = view._gizmo_screen()
+    was = np.array([win.session.machine.pose.x_mm, win.session.machine.pose.y_mm,
+                    win.session.machine.pose.z_mm])
+    step = screen[1] - screen[0]                    # the rig x arrow
+    push = 40.0
+    want = push / float(np.hypot(*step)) * view._gizmo_len_mm
+    _drag(view, 0.5 * (screen[0] + screen[1]),
+          0.5 * (screen[0] + screen[1]) + push * step / np.hypot(*step))
+    now = np.array([win.session.machine.pose.x_mm, win.session.machine.pose.y_mm,
+                    win.session.machine.pose.z_mm])
+    check("dragging the rig's x arrow on a rig turned 90 deg moves machine y",
+          abs((now - was)[1] - want) < 0.06 and abs((now - was)[0]) < 0.06,
+          f"moved {(now - was).round(2)}, wanted {want:.2f} mm along machine y")
+
+    tab.machine_pose_spins["rot_z_deg"].setValue(0.0)
+    for attr, value in zip(("x_mm", "y_mm", "z_mm"), was):
+        tab.machine_pose_spins[attr].setValue(float(value))
 
 
 def _check_machine_volume(win, app):
@@ -474,6 +519,7 @@ def test_app(app, args, workdir):
     print(f"\napplication ({kind})")
     ns = argparse.Namespace(
         uut=None, demo=not (args.replay or args.live), replay=args.replay,
+        stages=os.path.join(workdir, "stages.json"),
         geometry=os.path.join(workdir, "probe_geometry.json"),
         calibration=os.path.join(workdir, "calibration.json"),
         machine=os.path.join(workdir, "machine.json"),

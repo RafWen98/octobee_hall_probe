@@ -7,15 +7,24 @@
   "frame": {
     "x": {
       "invert": false,
-      "limit_mm": [0.0, 300.0]
+      "limit_mm": [
+        0.0,
+        300.0
+      ]
     },
     "z": {
       "invert": true,
-      "limit_mm": [0.0, 300.0]
+      "limit_mm": [
+        0.0,
+        300.0
+      ]
     },
     "y": {
       "invert": false,
-      "limit_mm": [0.0, 300.0]
+      "limit_mm": [
+        0.0,
+        300.0
+      ]
     }
   },
   "home_order": [
@@ -26,5 +35,22 @@
   "motion": {
     "velocity_mm_s": 6.0,
     "accel_mm_s2": 10.0
+  },
+  "encoders": {
+    "axes": {
+      "x": {
+        "column": 0,
+        "counts_per_mm": 14332.090909090906
+      },
+      "y": {
+        "column": 1,
+        "counts_per_mm": 14392.764545454545
+      },
+      "z": {
+        "column": 2,
+        "counts_per_mm": -14385.513181818187
+      }
+    },
+    "note": "multi-point fit against the controller's measured position; x: +14,332.1 c/mm, 100 mm x 11 pts, residual 15.1 um, out/back 302 ppm, out/back agree to 60.7 um; y: +14,392.8 c/mm, 100 mm x 11 pts, residual 26.7 um, out/back 2 ppm, out/back agree to 88.4 um; z: -14,385.5 c/mm, 100 mm x 11 pts, residual 0.3 um, out/back 2001 ppm, out/back agree to 99.2 um"
   }
 }

@@ -96,6 +96,10 @@ class _Stages:
 def _window(workdir, **over):
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, no_connect=True,
+        # Its own, like every other config here. Without it the session loads
+        # whatever this bench last measured, and a real calibration on the rig
+        # changes what these tests see.
+        stages=os.path.join(workdir, "stages.json"),
         calibration=os.path.join(workdir, "cal.json"),
         geometry=os.path.join(workdir, "geom.json"),
         machine=os.path.join(workdir, "machine.json"),

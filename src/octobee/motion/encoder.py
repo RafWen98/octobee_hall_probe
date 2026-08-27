@@ -49,12 +49,53 @@ thing actually responsible for them.
 
 The scale is measured, not typed
 --------------------------------
-`fit_scale` drives an axis a known distance under the controller and fits the
-counts against it. That identifies which longword belongs to which axis as
+`fit_axis` steps an axis along a span under the controller, reading the
+counts and the controller's own position at each standstill, and regresses one
+against the other. That identifies which longword belongs to which axis as
 well, empirically, rather than trusting the site order in a comment -- and it
 is a check that can be re-run, which is the half worth having. A typed-in
 counts-per-mm that is wrong by a factor rescales every position in every map
 and looks entirely plausible doing it.
+
+What it fits against is the controller's MEASURED displacement, not the
+distance the move was asked for. Those are not the same number, and the
+difference goes straight into the scale: the first calibration run on this rig
+fitted x at 14,341 counts/mm against a commanded 20 mm while y and z came back
+at 14,400 within seven parts per million of each other. Three identical
+stages do not have different gearing -- x had undershot its commanded move by
+81 um, and dividing by 20 instead of by 19.919 put 0.41% into the scale, which
+is 1.2 mm across the 300 mm axis in a column labelled X_mm.
+
+Fitting against the controller is also the only thing that is being asked
+here. The encoder is on the motor and the controller counts the same
+leadscrew, so what is wanted is counts per CONTROLLER millimetre -- a gearing
+ratio. Whatever the leadscrew's own pitch error is, both sides inherit it and
+it cancels out of the ratio; it is not something this could measure and not
+something it needs to.
+
+Why more than two points
+------------------------
+Two points always fit a line perfectly, so a two-point fit has no residual and
+therefore no way to say whether it worked. Ten points across a long span give
+one: a fit whose residual is a micrometre is measuring the gearing, and a fit
+whose residual is fifty is measuring something else -- a stage that stalled
+partway, a column that belongs to another axis, a counter that dropped edges.
+That number is the difference between a calibration and a number that came
+back from a calibration.
+
+Running it in both directions gives a second check for free, and it is worth
+being clear about what that check is and is not. It is NOT backlash: the
+encoder and the controller's own counter are both on the motor, so slack in
+the leadscrew nut moves the carriage relative to both of them equally and
+neither can see it. Nothing on this bench can measure that, and this does not
+pretend to.
+
+What the two directions do check is that the two counters agree with each
+other about the same place regardless of how it was approached. They are
+geared together, so they should, exactly -- and `direction_offset_um` being
+anything other than about zero means a reading was taken while an axis was
+still moving, or the quadrature counter is dropping edges at speed. It is a
+symptom, not a property of the rig.
 """
 
 import json
@@ -72,10 +113,17 @@ AXES = ("x", "y", "z")
 # exactly why it has to be handled here rather than discovered in a map.
 WRAP = 1 << 32
 
-# How far `fit_scale` drives an axis. Long enough that the fit is not dominated
-# by the ends of the move, short enough to be safe to run from wherever the rig
-# happens to be parked.
-CALIBRATION_MM = 20.0
+# How far a calibration run spans by default, and how many standstills it
+# takes along it. The span is the lever on every fixed error in the fit -- a
+# stage that ends 80 um short of each target puts that 80 um into the scale
+# divided by the span, so 100 mm is five times better than 20 for free. It is
+# only a default: the run clamps it to whatever room the axis actually has,
+# and the operator can ask for more or less.
+CALIBRATION_SPAN_MM = 100.0
+CALIBRATION_POINTS = 11
+
+# Under this there is no span worth fitting over, whatever was asked for.
+MIN_CALIBRATION_SPAN_MM = 5.0
 
 # Below this the axis did not really move and the fit means nothing.
 MIN_CALIBRATION_COUNTS = 100
@@ -231,19 +279,241 @@ class EncoderMap:
         return path
 
 
+class AxisFit:
+    """What one calibration run measured about one axis.
+
+    Falsy when the run did not identify a column, in which case `why` says
+    what stopped it. A truthy fit carries the numbers that say how good it is
+    as well as the number that gets used, because a counts/mm on its own
+    cannot be told apart from a wrong counts/mm.
+    """
+
+    def __init__(self, column=None, counts_per_mm=0.0, intercept=0.0,
+                 span_mm=0.0, centre_mm=0.0, n_points=0, residual_um=None,
+                 worst_um=None, runner_up=None, why=""):
+        self.column = column
+        self.counts_per_mm = float(counts_per_mm)
+        self.intercept = float(intercept)
+        self.span_mm = float(span_mm)
+        self.centre_mm = float(centre_mm)
+        self.n_points = int(n_points)
+        # None where it cannot be measured -- two points always fit a line
+        # perfectly, and reporting that as a residual of zero would read as a
+        # perfect fit rather than as no information.
+        self.residual_um = residual_um
+        self.worst_um = worst_um
+        self.runner_up = runner_up
+        self.why = why
+
+    def __bool__(self):
+        return self.column is not None
+
+    def counts_at(self, mm):
+        """What this fit says the counter reads at a given position."""
+        return self.counts_per_mm * float(mm) + self.intercept
+
+    def to_spec(self):
+        """The two numbers EncoderMap stores, or None."""
+        if not self:
+            return None
+        return {"column": int(self.column),
+                "counts_per_mm": float(self.counts_per_mm)}
+
+    def describe(self):
+        if not self:
+            return self.why
+        out = (f"column {self.column}, {self.counts_per_mm:+,.1f} counts/mm "
+               f"over {self.span_mm:g} mm from {self.n_points} points")
+        if self.residual_um is None:
+            out += " -- two points, so the fit has no residual to check it by"
+        else:
+            out += (f", residual {self.residual_um:.1f} um rms "
+                    f"({self.worst_um:.1f} um worst)")
+        return out
+
+
+def datum_from(counts, encoders, stages, on_error=None):
+    """Pair the counts arriving now with the controllers, axis by axis.
+
+    Returns {axis: (counts_at_datum, mm_at_datum)} for every calibrated axis
+    that can be anchored, which is what turns a counter that measures
+    displacement into a column that says where the head is.
+
+    ONE implementation, because there are two callers and they must not drift
+    apart: the live recorder anchors once when Record is pressed, and a volume
+    sweep anchors once per line. A difference between them would show up as
+    two files of the same rig disagreeing about where it was, with nothing in
+    either to say which was right.
+
+    An axis whose counter is not trusted is SKIPPED rather than used. The
+    controller answers position_mm regardless -- steps lost to a stall or an
+    immediate stop leave the homed bit set and the number wrong -- and
+    anchoring to that produces a column that is confidently somewhere the head
+    never was. No anchor at all is a column that is missing, which is the
+    failure that can be seen.
+    """
+    if counts is None or not encoders or stages is None:
+        return {}
+    counts = np.asarray(counts, dtype=float).ravel()
+    out = {}
+    for axis, spec in encoders.axes.items():
+        st = getattr(stages, "axes", {}).get(axis)
+        if st is None or spec["column"] >= len(counts):
+            continue
+        try:
+            if not st.position_trusted:
+                continue
+            out[axis] = (float(counts[spec["column"]]), float(st.position_mm))
+        except Exception as exc:              # a controller that has gone away
+            if on_error is not None:
+                on_error(f"no encoder datum for {axis}: {exc}")
+    return out
+
+
+def fit_axis(positions_mm, counts, min_counts=MIN_CALIBRATION_COUNTS):
+    """Which column follows this axis, and by how many counts per millimetre.
+
+    `positions_mm` is what the controller said its position was at each
+    standstill; `counts` is the (n, columns) block of continuous counts read
+    at those same standstills. Returns an AxisFit.
+
+    The fit is a least squares line through every point, so a stage that
+    stopped short of one target moves the residual rather than moving the
+    slope -- which is the whole reason for taking more than two.
+
+    The column is chosen by which one tracks the axis furthest, and then
+    checked: a second column moving a comparable amount means either two axes
+    were driven at once or the columns are not what they are assumed to be,
+    and quietly picking the larger of two similar numbers is how an axis ends
+    up calibrated against its neighbour.
+    """
+    pos = np.asarray(positions_mm, dtype=float).ravel()
+    c = np.asarray(counts, dtype=float)
+    if c.ndim == 1:
+        c = c.reshape(-1, 1)
+    if c.ndim != 2 or not c.size:
+        return AxisFit(why="no encoder columns in the stream")
+    if len(pos) != len(c):
+        return AxisFit(why=f"{len(pos)} positions against {len(c)} count rows")
+    if len(pos) < 2:
+        return AxisFit(why="a line needs at least two standstills")
+    if not np.isfinite(pos).all() or not np.isfinite(c).all():
+        return AxisFit(why="a position or a count reading was not a number")
+
+    span = float(pos.max() - pos.min())
+    if span < 1e-9:
+        return AxisFit(why="the axis never left where it started")
+
+    # One design matrix, every column solved against it at once.
+    design = np.column_stack([pos, np.ones_like(pos)])
+    sol, *_ = np.linalg.lstsq(design, c, rcond=None)      # (2, columns)
+    slope, intercept = sol[0], sol[1]
+
+    moved = np.abs(slope) * span
+    order = np.argsort(moved)[::-1]
+    best = int(order[0])
+    if moved[best] < min_counts:
+        return AxisFit(why=(
+            f"no column moved more than {moved[best]:.0f} counts over "
+            f"{span:g} mm -- nothing here is wired to this axis"))
+    if len(order) > 1 and moved[order[1]] > 0.2 * moved[best]:
+        return AxisFit(why=(
+            f"columns {best} and {int(order[1])} both moved "
+            f"({moved[best]:.0f} and {moved[order[1]]:.0f} counts), so which "
+            f"belongs to this axis cannot be told apart -- move one axis at a "
+            f"time"))
+
+    resid_counts = c[:, best] - design @ sol[:, best]
+    if len(pos) > 2:
+        # In micrometres of position rather than counts, because that is the
+        # unit the number has to be judged in: 400 counts means nothing until
+        # you know it is 28 um.
+        per_um = abs(slope[best]) / 1000.0
+        residual_um = float(np.sqrt(np.mean(resid_counts ** 2)) / per_um)
+        worst_um = float(np.max(np.abs(resid_counts)) / per_um)
+    else:
+        residual_um = worst_um = None
+
+    return AxisFit(column=best, counts_per_mm=float(slope[best]),
+                   intercept=float(intercept[best]), span_mm=span,
+                   centre_mm=float((pos.max() + pos.min()) / 2.0),
+                   n_points=len(pos), residual_um=residual_um,
+                   worst_um=worst_um,
+                   runner_up=(int(order[1]) if len(order) > 1 else None))
+
+
+def direction_offset_um(forward, back):
+    """How far the outbound and return fits disagree, in micrometres.
+
+    Compares what the two fits say the counter reads at the same place -- the
+    middle of the span, where both are interpolating rather than
+    extrapolating -- and turns the disagreement back into position.
+
+    This is NOT backlash, and it must not be read as it. The quadrature
+    encoder and the controller's own counter are both on the motor, so slack
+    in the leadscrew nut moves the carriage relative to both equally and
+    neither can see it. What this number checks is that two counters which are
+    geared rigidly together agree about the same position whichever way it was
+    approached -- which they should, exactly. A few micrometres is the noise
+    on the standstill readings. Much more than that means a reading was taken
+    while the axis was still moving, or the counter is dropping edges at
+    speed: a symptom, not a property.
+
+    Returns None unless both fits are good and found the same column;
+    comparing two different columns is not a measurement of anything.
+    """
+    if not (forward and back) or forward.column != back.column:
+        return None
+    scale = (abs(forward.counts_per_mm) + abs(back.counts_per_mm)) / 2.0
+    if scale <= 0:
+        return None
+    where = (forward.centre_mm + back.centre_mm) / 2.0
+    return float(abs(forward.counts_at(where) - back.counts_at(where))
+                 / scale * 1000.0)
+
+
+def odd_axis_out(scales, tol=1e-3):
+    """The axis whose scale disagrees with the others, or None.
+
+    `scales` is {axis: counts_per_mm}; the sign is ignored, since an axis
+    wired backwards is a fact about the wiring and not a different gearing.
+    Returns (axis, fraction_from_the_median) for the worst offender past
+    `tol`, or None when they all agree.
+
+    Identical stages on identical leadscrews share a gearing ratio, which
+    makes the axes each other's check -- and on this bench the only one
+    available, because nothing else here measures millimetres. It is what
+    caught the 0.41% on x: y and z agreed to seven parts per million and x did
+    not, which is not something three of the same stage do.
+
+    Needs three axes to have a median worth comparing against. With two, a
+    disagreement says one of them is wrong and not which.
+    """
+    good = {a: abs(float(v)) for a, v in (scales or {}).items() if v}
+    if len(good) < 3:
+        return None
+    median = sorted(good.values())[len(good) // 2]
+    if median <= 0:
+        return None
+    off = {a: (v - median) / median for a, v in good.items()
+           if abs(v - median) / median > tol}
+    if not off:
+        return None
+    worst = max(off, key=lambda a: abs(off[a]))
+    return worst, off[worst]
+
+
 def fit_scale(counts_before, counts_after, moved_mm,
               min_counts=MIN_CALIBRATION_COUNTS):
-    """Which column moved with the axis, and by how many counts per mm.
+    """Two-point form of fit_axis, in the shape its callers expect.
 
-    `counts_before`/`counts_after` are continuous counts for every column,
-    read either side of a move of `moved_mm`. Returns
-    (column, counts_per_mm, report) or (None, 0.0, why-not).
+    Kept because two readings either side of one move is still the right
+    procedure when all that is wanted is which column belongs to which axis --
+    the idmap question rather than the calibration one. For a scale that gets
+    used, prefer fit_axis: two points cannot tell you whether they were any
+    good.
 
-    The column is chosen by which one moved most, and then checked: a second
-    column moving a comparable amount means either two axes were driven at
-    once or the columns are not what they are assumed to be, and quietly
-    picking the larger of two similar numbers is how an axis ends up
-    calibrated against its neighbour.
+    Returns (column, counts_per_mm, report) or (None, 0.0, why-not).
     """
     before = np.asarray(counts_before, dtype=float).ravel()
     after = np.asarray(counts_after, dtype=float).ravel()
@@ -252,19 +522,10 @@ def fit_scale(counts_before, counts_after, moved_mm,
     if abs(moved_mm) < 1e-9:
         return None, 0.0, "the axis was asked to move nowhere"
 
-    delta = np.abs(after - before)
-    order = np.argsort(delta)[::-1]
-    best = int(order[0])
-    if delta[best] < min_counts:
-        return None, 0.0, (
-            f"no column moved more than {delta[best]:.0f} counts over "
-            f"{moved_mm:g} mm -- nothing here is wired to this axis")
-    if len(order) > 1 and delta[order[1]] > 0.2 * delta[best]:
-        return None, 0.0, (
-            f"columns {best} and {int(order[1])} both moved "
-            f"({delta[best]:.0f} and {delta[order[1]]:.0f} counts), so which "
-            f"belongs to this axis cannot be told apart -- move one axis at a "
-            f"time")
-    scale = (after[best] - before[best]) / float(moved_mm)
-    return best, float(scale), (
-        f"column {best}, {scale:+,.1f} counts/mm from {moved_mm:g} mm")
+    fit = fit_axis([0.0, float(moved_mm)], np.vstack([before, after]),
+                   min_counts=min_counts)
+    if not fit:
+        return None, 0.0, fit.why
+    return fit.column, fit.counts_per_mm, (
+        f"column {fit.column}, {fit.counts_per_mm:+,.1f} counts/mm from "
+        f"{moved_mm:g} mm")

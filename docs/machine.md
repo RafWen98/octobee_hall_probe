@@ -96,6 +96,12 @@ the boards count up from — sits in the machine, plus one angle: how far the
 whole assembly is turned **about the machine's Z**, which is the axis of the
 torus.
 
+This angle is what says **how the assembly is mounted relative to the coils**,
+and it turns the probe's whole coordinate system with it: the drawn body, its
+own axes on the drag handle, the green stage envelope and the volume to be
+mapped all follow, because a stage driven along rig *x* on an assembly turned
+90° moves the head along machine *y*.
+
 One angle, because the rig has one. The probe is bolted to a three-axis
 cartesian gantry that cannot tilt it: the tube lies horizontal along the rig's
 Y and the only freedom is which way round the machine the assembly is pointed.
@@ -121,10 +127,16 @@ region this rig can reach without being unbolted and moved.
 ### Dragging the probe into place
 
 The zero point itself is drawn: a pale ball at the flange, with a red, a green
-and a blue arrow along machine *x*, *y* and *z*, and a blue ring round it in
-the machine's XY plane. Drag an arrow and the probe slides along that axis;
-drag the ring and it turns about Z. Either way the *x*, *y*, *z* or *about Z*
-box above follows — it is the same edit, taking the same route through the same
+and a blue arrow and a blue ring round it. **The arrows are the probe's own
+axes, not the machine's** — the rig's *x*, *y* and *z*, the ones the stages
+drive along, turned by whatever *about Z* is set to. That is the whole point of
+them: the machine's axes are already drawn once at the machine's origin, so a
+second set of the same axes at the probe would say nothing the ball does not,
+where the probe's own frame makes the mounting angle visible as the angle
+between the two. Drag an arrow and the probe slides along that rig axis — which
+on an assembly mounted at 90° means driving rig *x* moves it along machine *y*,
+exactly as that stage would; drag the ring and it turns about Z. Either way the
+*x*, *y*, *z* or *about Z* box above follows — it is the same edit, taking the same route through the same
 box, so the clearance number, the drawing and what *Save placement* writes all
 update exactly as if the number had been typed.
 

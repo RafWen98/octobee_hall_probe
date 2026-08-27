@@ -97,11 +97,19 @@ class Session:
         # position fell back to the controllers without saying why -- the same
         # failure the machine placement above is loaded to avoid. It is a
         # measurement of the rig, like the axis map, not a per-session choice.
+        #
+        # Through args like the other three configs, and not from
+        # paths.config() directly. A fixed path here is a path the tests
+        # cannot redirect: they ran against whatever this bench happened to
+        # have measured, so a real calibration on the rig broke two of them
+        # and would have broken them differently tomorrow.
+        self.stages_path = getattr(args, "stages", None) or paths.config(
+            AXIS_CONFIG)
         try:
-            self.encoders = oenc.EncoderMap.load()
+            self.encoders = oenc.EncoderMap.load(self.stages_path)
         except Exception as e:
             self.encoders = oenc.EncoderMap()
-            err(f"{paths.config(AXIS_CONFIG)}: encoder scales not loaded ({e})"
+            err(f"{self.stages_path}: encoder scales not loaded ({e})"
                 f" -- positions will come from the controllers")
         # The last count row to arrive, and what it is measured against. The
         # counts are published here rather than only handed to the Machine tab

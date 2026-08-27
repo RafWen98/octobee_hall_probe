@@ -37,6 +37,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from octobee.calib import convert as ocal
 from octobee import live as olive
 from octobee import record as orec
+from octobee.motion import encoder as oenc
 from octobee.gui.estop import MotionControl, is_running
 from octobee.gui.constants import (
     DEFAULT_VIEW_HZ,
@@ -655,6 +656,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # The carry belongs to the old stream. Keeping it would splice
         # samples from two different sample rates into one output row.
         self.session.new_decimator()
+        # What the position columns of the next map will be made of depends on
+        # the source that has just arrived, and the Machine tab worked it out
+        # at startup when there was none.
+        self.tab_machine.refresh_encoders()
         self.raw_hist = None
         self.raw_hist_n = 0
         self._last_health_t = 0.0
@@ -1021,12 +1026,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_record_dot()
 
     def _encoder_datum(self):
-        """Pair the counts arriving now with the controllers, axis by axis.
-
-        Returns {axis: (counts, mm)} for every calibrated axis that can be
-        anchored, which makes that axis's column in the CSV an absolute
-        position; an axis left out gets travel from the first row instead, and
-        the column name says so.
+        """Where the counts arriving now sit against the controllers.
 
         Taken once, here, and standing still is not guaranteed -- Record can be
         pressed with the rig moving. That is not a reason to refuse a datum:
@@ -1034,29 +1034,12 @@ class MainWindow(QtWidgets.QMainWindow):
         milliseconds of motion, which is a common offset on that axis and not
         a per-sample one. Every sample after it is still spaced by counts.
 
-        An axis whose counter is not trusted is skipped rather than used. The
-        controller will answer position_mm regardless -- steps lost to a stall
-        or an immediate stop leave the homed bit set and the number wrong --
-        and anchoring to that produces a column that is confidently somewhere
-        the head never was.
+        The rule itself lives in octobee/motion/encoder.py, because a volume
+        sweep anchors the same way once per line and the two must not drift.
         """
-        counts = self.session.enc_counts_now
-        stages = self.session.stages
-        if counts is None or not self.session.encoders or stages is None:
-            return {}
-        out = {}
-        for axis, spec in self.session.encoders.axes.items():
-            st = stages.axes.get(axis)
-            if st is None or spec["column"] >= len(counts):
-                continue
-            try:
-                if not st.position_trusted:
-                    continue
-                out[axis] = (float(counts[spec["column"]]),
-                             float(st.position_mm))
-            except Exception as e:      # a controller that has gone away
-                self.session.log(f"no encoder datum for {axis}: {e}")
-        return out
+        return oenc.datum_from(self.session.enc_counts_now,
+                               self.session.encoders, self.session.stages,
+                               on_error=self.session.log)
 
     def _log_encoder_columns(self):
         """Say what the position columns in the new file mean, at open."""

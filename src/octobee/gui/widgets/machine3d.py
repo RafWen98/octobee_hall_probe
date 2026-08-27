@@ -23,13 +23,24 @@ Colour is the whole legend:
     red line     the same, when the probe is inside a coil
 
 The probe's zero point -- its mounting flange, the origin the boards are
-measured from -- carries a drag handle: a ball with three arrows along the
-machine axes. Dragging an arrow slides the probe along that axis and writes the
-number straight into the placement box, because reading a clearance off the
-drawing and then guessing which of six boxes to nudge is how a pose gets typed
-in wrong. The handle is sized in pixels rather than millimetres, so it stays
-the same size on screen whether the camera is framing a three-metre coil set or
-sitting on the head itself.
+measured from -- carries a drag handle: a ball with three arrows and a ring.
+
+The arrows are the PROBE's OWN axes, not the machine's. That is the whole point
+of them. The machine's axes are already drawn, once, at the machine's origin;
+drawing a second set of the same axes at the probe would say nothing that the
+ball alone does not. Turned into the probe's frame they say the one thing the
+picture is for -- the angle the assembly is mounted at relative to the coils --
+because the mounting angle is visible as the angle between the two sets. A
+handle that stayed square to the machine while the probe turned under it was
+reporting an orientation the rig does not have.
+
+So dragging an arrow slides the probe along one of the RIG's axes, which is
+also the axis a stage drives, and the ring turns it about Z. Either writes
+straight into the placement boxes, because reading a clearance off the drawing
+and then guessing which box to nudge is how a pose gets typed in wrong. The
+handle is sized in pixels rather than millimetres, so it stays the same size on
+screen whether the camera is framing a three-metre coil set or sitting on the
+head itself.
 """
 
 import math
@@ -163,6 +174,10 @@ class MachineView3D(gl.GLViewWidget):
         self._gizmo_items = []          # ball, then (shaft, head, label) x 3
         self._gizmo_origin = None       # the zero point, machine mm
         self._gizmo_len_mm = 1.0        # ball to arrow tip, machine mm
+        # The rig's axes as unit vectors in machine mm, one per column. The
+        # identity until a pose says otherwise, which is what makes an
+        # unrotated rig draw exactly as it did before.
+        self._gizmo_dirs = np.eye(3)
         self._gizmo_hot = None          # the axis under the mouse, or dragged
         self._ring = None               # the rotation handle
         self._ring_hot = False
@@ -318,12 +333,19 @@ class MachineView3D(gl.GLViewWidget):
         ball.scale(*((GIZMO_BALL_PX * mm_per_px,) * 3))
         self._gizmo_items[0].setTransform(ball)
 
+        # The probe's frame, not the machine's: the same arrows, turned by
+        # whatever the assembly is mounted at. Composed as "turn about Z, then
+        # the fixed rotation that puts +Z onto this axis", because the rig's
+        # only freedom IS about Z -- so the machine-axis case is this with a
+        # zero in it rather than a separate path.
+        turn = 0.0 if self._placement is None else self._placement.rot_z_deg
         for axis in range(3):
             shaft, head, label = self._gizmo_items[1 + axis * 3:4 + axis * 3]
-            direction = np.eye(3)[axis]
+            direction = self._gizmo_dirs[:, axis]
             shaft.setData(pos=np.array([origin, origin + direction * shaft_mm]))
             tr = pg.Transform3D()
             tr.translate(*origin)
+            tr.rotate(turn, 0.0, 0.0, 1.0)
             tr.rotate(*GIZMO_ROTATION[axis])
             tr.translate(0.0, 0.0, shaft_mm)
             tr.scale(head_mm * 0.34, head_mm * 0.34, head_mm)
@@ -446,7 +468,8 @@ class MachineView3D(gl.GLViewWidget):
         if not self.show_gizmo or self._gizmo_origin is None:
             return None
         pts = np.vstack([self._gizmo_origin,
-                         self._gizmo_origin + np.eye(3) * self._gizmo_len_mm])
+                         self._gizmo_origin
+                         + self._gizmo_dirs.T * self._gizmo_len_mm])
         screen = self._to_screen(pts)
         return None if not np.isfinite(screen).all() else screen
 
@@ -478,7 +501,11 @@ class MachineView3D(gl.GLViewWidget):
                 # it to the other two rather than lurch.
                 if float(step @ step) >= 16.0:
                     self.mousePos = pos
-                    self._drag = (axis, np.array([pos.x(), pos.y()]), step,
+                    # The direction is captured with the grab, not read back
+                    # each move: the pose is about to start changing and the
+                    # axis being dragged must not turn under the pointer.
+                    self._drag = (self._gizmo_dirs[:, axis].copy(),
+                                  np.array([pos.x(), pos.y()]), step,
                                   self._gizmo_len_mm,
                                   np.array([self._placement.x_mm,
                                             self._placement.y_mm,
@@ -504,11 +531,13 @@ class MachineView3D(gl.GLViewWidget):
         """
         pos = ev.position()
         if self._drag is not None:
-            axis, grabbed, step, length, base = self._drag
+            direction, grabbed, step, length, base = self._drag
             moved = np.array([pos.x(), pos.y()]) - grabbed
             along = float(moved @ step) / float(step @ step) * length
-            where = base.copy()
-            where[axis] += along
+            # Along the RIG axis, which is a machine direction once the
+            # mounting angle is applied -- so a drag on a turned rig moves all
+            # three placement boxes, exactly as driving that stage would.
+            where = base + direction * along
             self.mousePos = pos
             self.pose_dragged.emit(*(float(v) for v in where))
             return
@@ -663,6 +692,7 @@ class MachineView3D(gl.GLViewWidget):
         origin = placement.origin_mm(stage_mm)
         self._placement = placement
         self._gizmo_origin = np.asarray(origin, dtype=float)
+        self._gizmo_dirs = np.asarray(rot, dtype=float)
         tr = pg.Transform3D()
         tr.setRow(0, QtGui.QVector4D(rot[0, 0], rot[0, 1], rot[0, 2], origin[0]))
         tr.setRow(1, QtGui.QVector4D(rot[1, 0], rot[1, 1], rot[1, 2], origin[1]))

@@ -569,6 +569,18 @@ class StagesTab(QtWidgets.QWidget):
                 f'"limit_mm" per axis in {ostage.AXIS_CONFIG}.')
         self.session.log("stages: home order "
                      + " → ".join(self.session.stages.home_sequence()))
+        # The ledger is what carries position trust across a restart, and a
+        # ledger that cannot be written fails silently by design -- writing it
+        # must never break an emergency stop. Silent for one run only: if it
+        # did not work, this is where that gets said.
+        broken = [(n, self.session.stages[n].ledger_error)
+                  for n in self.session.stages.names
+                  if self.session.stages[n].ledger_error]
+        for name, err in broken:
+            self.session.log(
+                f"stages: {name}'s position could not be recorded ({err}) — "
+                f"it will ask to be homed at the next start, whatever "
+                f"happens to it in this session")
 
     def _update_peak_label(self):
         """Say what the current profile means for the step sizes in the boxes.
@@ -694,12 +706,28 @@ class StagesTab(QtWidgets.QWidget):
         unhomed = [n for n in self.session.stages.names
                    if not self.session.stages[n].position_trusted]
         if not unhomed:
-            self.session.log("stages: every axis is already referenced")
+            # Which kind of "referenced" matters. An axis homed in this session
+            # was watched into its limit switch; an inherited one was believed
+            # because its counter had not moved since octobee last recorded it,
+            # which is a weaker thing and worth naming as one.
+            carried = [n for n in self.session.stages.names
+                       if self.session.stages[n].trust_origin == "inherited"]
+            note = (f" — {', '.join(carried)} carried over from an earlier "
+                    f"session, counter unchanged since" if carried else "")
+            self.session.log("stages: every axis is already referenced" + note)
             return
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
         box.setWindowTitle("Stages are not referenced")
-        box.setText(f"Axes {', '.join(unhomed)} have not been homed.")
+        # Each axis says why, rather than all of them sharing "not homed".
+        # Since the reason now survives a restart, it is usually the specific
+        # and useful one -- "stopped by an emergency stop", "ended against a
+        # hard limit" -- and that is what tells the operator whether to go and
+        # look at the machine before sending a carriage across its whole travel.
+        box.setText("These axes cannot be believed about where they are:\n\n"
+                    + "\n".join(
+                        f"    {n} — {self.session.stages[n].distrust_reason}"
+                        for n in unhomed))
         box.setInformativeText(
             "Until they are, their position readings are whatever was left in "
             "the counter, absolute moves are refused and a field map has no "

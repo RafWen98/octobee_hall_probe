@@ -266,15 +266,29 @@ class PlanWorker(QtCore.QThread):
 class EncoderCalibrationWorker(QtCore.QThread):
     """Find which stream column is which axis, and its counts per millimetre.
 
-    Drives one axis at a time a known distance and reads the encoder counts
-    either side of the move. The counts themselves arrive on the acquisition
-    tick, so this thread never touches the stream: it asks for a reading
-    through `counts_now`, which the tick keeps fresh, and waits long enough
-    either side for one to have landed.
+    Steps one axis at a time along a span, out and back, standing still at
+    each point long enough to read the counts and the controller's own
+    position together. The counts arrive on the acquisition tick, so this
+    thread never touches the stream: it asks for a reading through
+    `counts_now`, which the tick keeps fresh.
 
     Moving ONE axis at a time is not politeness, it is the whole method -- the
     column that moved is the column that belongs to the axis that moved, and
     two at once makes that unanswerable.
+
+    Two things it does that the two-point version did not, both of which
+    changed a number on this rig:
+
+      * it fits against the position the controller REPORTS at each stop, not
+        the position it was asked for. An axis that ends 80 um short of its
+        target puts that 80 um straight into the scale otherwise -- which is
+        exactly what happened to x, at 0.41%;
+      * it takes more than two points, so the fit has a residual. Two points
+        always fit a line perfectly and therefore cannot say whether they were
+        any good.
+
+    Going out and coming back also costs nothing extra and exposes lost
+    motion, which a single direction folds into the slope silently.
     """
 
     done = QtCore.pyqtSignal(object, str)             # {axis: spec}, error
@@ -286,65 +300,175 @@ class EncoderCalibrationWorker(QtCore.QThread):
     # counting.
     SETTLE_S = 0.6
 
-    def __init__(self, stages, read_counts, distance_mm=None, axes=None):
+    # After the settle, wait for a count row that arrived since -- so what is
+    # fitted was latched at the standstill and not on the way into it.
+    FRESH_TIMEOUT_S = 1.0
+
+    def __init__(self, stages, read_counts, span_mm=None, points=None,
+                 axes=None):
         super().__init__()
         self.stages = stages
         self.read_counts = read_counts
-        self.distance_mm = float(distance_mm or oenc.CALIBRATION_MM)
+        self.span_mm = float(span_mm or oenc.CALIBRATION_SPAN_MM)
+        self.points = max(2, int(points or oenc.CALIBRATION_POINTS))
         self.axes = list(axes or oenc.AXES)
         self._abort = False
+        self._steps_done = 0
+        self._steps_total = len(self.axes) * 2 * self.points
 
     def abort(self):
         self._abort = True
 
-    def _counts(self):
+    # ---- reading -----------------------------------------------------
+    def _fresh_counts(self):
+        """A count row taken after this moment, or the latest if none comes.
+
+        The tick hands over a new array each time, so waiting for the object
+        to change is enough to know the reading is not from during the move.
+        Giving up is safe: the axis is standing still, so a stale row reads
+        the same number -- the wait is belt and braces for the tick that
+        landed mid-deceleration.
+        """
         time.sleep(self.SETTLE_S)
+        was = self.read_counts()
+        deadline = time.monotonic() + self.FRESH_TIMEOUT_S
+        while self.read_counts() is was and time.monotonic() < deadline:
+            time.sleep(0.02)
         return self.read_counts()
 
+    def _stand(self, st):
+        """(position_mm, counts) at a standstill, or None if no counts came.
+
+        Counts first, then the position, both with nothing moving -- the same
+        order the sweep takes its datum in, so the two agree about what a
+        simultaneous reading means.
+        """
+        counts = self._fresh_counts()
+        if counts is None:
+            return None
+        return float(st.position_mm), np.asarray(counts, dtype=float)
+
+    # ---- geometry ----------------------------------------------------
+    def _span_for(self, here, lo, hi):
+        """The longest run of `span_mm` that fits, nearest to where it is.
+
+        Centred on the current position where there is room, slid to fit
+        where there is not, and shortened only when the axis genuinely has
+        less travel than was asked for. A rig parked at the end of its travel
+        calibrates rather than refusing.
+        """
+        span = min(self.span_mm, hi - lo)
+        start = here - span / 2.0
+        if start < lo:
+            start = lo
+        if start + span > hi:
+            start = hi - span
+        return start, start + span
+
+    def _run_axis(self, st, start, stop):
+        """Step from start to stop, returning ([positions], [count rows])."""
+        pos, counts = [], []
+        for target in np.linspace(start, stop, self.points):
+            if self._abort:
+                return None
+            st.move_to(float(target))
+            stand = self._stand(st)
+            self._steps_done += 1
+            self.progress.emit(self._steps_done, self._steps_total)
+            if stand is None:
+                return None
+            pos.append(stand[0])
+            counts.append(stand[1])
+        return pos, counts
+
+    # ---- the run -----------------------------------------------------
     def run(self):
         found, problems = {}, []
         try:
             self.stages.interlock.require_clear("an encoder calibration")
-            for i, axis in enumerate(self.axes):
+            for axis in self.axes:
                 if self._abort:
                     break
-                self.progress.emit(i, len(self.axes))
                 if axis not in self.stages.names:
                     continue
                 st = self.stages[axis]
                 lo, hi = st.limit_mm
                 here = st.position_mm
-                # Away from whichever limit is closer, so a rig parked at the
-                # end of its travel calibrates instead of refusing.
-                step = self.distance_mm
-                if here + step > hi:
-                    step = -self.distance_mm
-                if here + step < lo:
-                    problems.append(f"{axis}: no room to move "
-                                    f"{self.distance_mm:g} mm either way "
-                                    f"inside {lo:g}..{hi:g} mm")
-                    continue
-                before = self._counts()
-                st.move_by(step)
-                after = self._counts()
-                if before is None or after is None:
+                start, stop = self._span_for(here, lo, hi)
+                if stop - start < oenc.MIN_CALIBRATION_SPAN_MM:
                     problems.append(
-                        f"{axis}: no encoder counts arrived -- only "
-                        f"acq1001_695 carries them, and only while the stream "
-                        f"is running")
-                    st.move_by(-step)
+                        f"{axis}: only {stop - start:g} mm of travel inside "
+                        f"{lo:g}..{hi:g} mm, which is too short to fit over")
+                    self._steps_done += 2 * self.points
+                    self.progress.emit(self._steps_done, self._steps_total)
                     continue
-                column, scale, note = oenc.fit_scale(before, after, step)
-                st.move_by(-step)            # put it back where it was found
-                if column is None:
-                    problems.append(f"{axis}: {note}")
+                if stop - start < self.span_mm - 1e-6:
+                    self.message.emit(
+                        f"encoders: {axis} has room for {stop - start:g} mm, "
+                        f"not the {self.span_mm:g} mm asked for -- using it")
+
+                out = self._run_axis(st, start, stop)
+                back = self._run_axis(st, stop, start) if out else None
+                # Back where it was found, whatever happened above.
+                st.move_to(here)
+                if out is None or back is None:
+                    if not self._abort:
+                        problems.append(
+                            f"{axis}: no encoder counts arrived -- only "
+                            f"acq1001_695 carries them, and only while the "
+                            f"stream is running")
                     continue
-                found[axis] = {"column": column, "counts_per_mm": scale}
-                self.message.emit(f"encoders: {axis} -> {note}")
-            self.progress.emit(len(self.axes), len(self.axes))
+
+                fit_out = oenc.fit_axis(out[0], out[1])
+                fit_back = oenc.fit_axis(back[0], back[1])
+                if not fit_out:
+                    problems.append(f"{axis}: {fit_out.why}")
+                    continue
+                if not fit_back:
+                    problems.append(f"{axis}: on the way back, {fit_back.why}")
+                    continue
+                if fit_out.column != fit_back.column:
+                    problems.append(
+                        f"{axis}: followed column {fit_out.column} going out "
+                        f"and {fit_back.column} coming back, so neither can "
+                        f"be believed")
+                    continue
+
+                # The mean of the two directions is the scale that has no
+                # preferred direction in it, which is what a recording needs:
+                # a stage is jogged both ways and neither is special.
+                scale = (fit_out.counts_per_mm + fit_back.counts_per_mm) / 2.0
+                spread = abs(fit_out.counts_per_mm - fit_back.counts_per_mm)
+                offset = oenc.direction_offset_um(fit_out, fit_back)
+                found[axis] = {
+                    "column": int(fit_out.column),
+                    "counts_per_mm": float(scale),
+                    "span_mm": round(fit_out.span_mm, 3),
+                    "points": fit_out.n_points,
+                    "residual_um": _round_or_none(fit_out.residual_um, 2),
+                    "worst_um": _round_or_none(fit_out.worst_um, 2),
+                    "direction_spread_ppm": round(
+                        spread / abs(scale) * 1e6, 1) if scale else None,
+                    "direction_offset_um": _round_or_none(offset, 2),
+                }
+                self.message.emit(f"encoders: {axis} out  -> "
+                                  f"{fit_out.describe()}")
+                self.message.emit(f"encoders: {axis} back -> "
+                                  f"{fit_back.describe()}")
+                self.message.emit(
+                    f"encoders: {axis} = {scale:+,.1f} counts/mm "
+                    f"(the two directions agree to "
+                    f"{spread / abs(scale) * 1e6:.0f} ppm"
+                    + (f", and about the same place to {offset:.1f} um)"
+                       if offset is not None else ")"))
+            self.progress.emit(self._steps_total, self._steps_total)
             self.done.emit(found, "; ".join(problems))
         except Exception as e:
             self.done.emit(found, f"{type(e).__name__}: {e}")
+
+
+def _round_or_none(x, places):
+    return None if x is None else round(float(x), places)
 
 
 class SweepWorker(QtCore.QThread):

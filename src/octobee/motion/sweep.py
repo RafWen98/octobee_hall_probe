@@ -527,15 +527,16 @@ class SweepRunner:
                 self.log.lines.append(line.to_dict())
                 st.set_vel_params(speed, accel)
                 self.line_index = i
-                # Where this line's counting starts from, taken standing still
-                # -- the only moment the controller's USB latency costs
+                # Where this line's counting starts from, taken standing
+                # still -- the only moment the controller's USB latency costs
                 # nothing, and the anchor everything the encoder says after it
-                # is measured against. Counts first, then the position, both
-                # with nothing moving.
-                counts = (self._fresh_counts() if self.log.encoders else None)
-                here = self._poll(i)
-                if here is not None and counts is not None:
-                    self.log.add_datum(i, counts, here)
+                # is measured against. Counts first, then the poll that the
+                # fallback interpolates from, both with nothing moving.
+                if self.log.encoders:
+                    self.log.add_datum(i, oenc.datum_from(
+                        self._fresh_counts(), self.log.encoders, self.stages,
+                        on_error=self.log_fn))
+                self._poll(i)
                 self.logging = True
                 try:
                     st.move_to(line.to_mm, wait=False)
@@ -632,19 +633,22 @@ class SweepLog:
         self._line_of.append(int(line_index))
         self.n_rows += len(b)
 
-    def add_datum(self, line_index, counts, stage_mm):
-        """Where this line started, in counts and in millimetres, standing still.
+    def add_datum(self, line_index, datum):
+        """Where this line's counting started from.
 
-        Both read at the same moment with nothing moving, which is the only
-        moment the USB latency on the controller read costs nothing.
+        `datum` is {axis: (counts, mm)} as encoder.datum_from builds it -- the
+        same rule the live recorder anchors by, including its refusal to
+        anchor an axis whose counter is not trusted. Built by the caller
+        rather than here because it needs the stages, and this module does not
+        otherwise.
+
+        Per line rather than once per sweep. The counter would carry across
+        perfectly well; re-anchoring costs one standstill reading and means a
+        line is still placed correctly if a count is dropped somewhere in the
+        hours before it.
         """
-        if counts is None:
-            return
-        counts = np.asarray(counts, dtype=float).ravel()
-        self.datum[int(line_index)] = {
-            a: (float(counts[spec["column"]]), float(stage_mm[a]))
-            for a, spec in self.encoders.axes.items()
-            if spec["column"] < len(counts) and a in stage_mm}
+        if datum:
+            self.datum[int(line_index)] = dict(datum)
 
     def add_poll(self, t_s, pos_mm, line_index):
         self.poll_t_s.append(float(t_s))

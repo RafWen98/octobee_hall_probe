@@ -41,6 +41,10 @@ def test_gui_estop(app, workdir):
             # An envelope stated is an envelope declared: this double has one,
             # so it must answer the question the window asks at connect.
             self.limit_declared = True
+            # A stage that recorded its position without trouble, which is the
+            # other thing the window asks each axis at connect.
+            self.ledger_error = ""
+            self.trust_origin = "homed"
             self.stopped = 0
 
         @property
@@ -91,6 +95,7 @@ def test_gui_estop(app, workdir):
 
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, no_connect=True,
+        stages=os.path.join(workdir, "stages.json"),
         geometry=os.path.join(workdir, "estop_geom.json"),
         calibration=os.path.join(workdir, "estop_cal.json"),
         machine=os.path.join(workdir, "estop_machine.json"),

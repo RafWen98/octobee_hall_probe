@@ -111,6 +111,14 @@ three properties that make it one:
                     in this file
     it is machine-wide, not per axis
 
+Position trust across runs
+--------------------------
+An unhomed axis reports a number, and so does one that lost steps an hour ago.
+position_trusted is what separates either of those from a position, and
+octobee/motion/ledger.py is what carries it from one run to the next: without
+it, closing the window was enough to make an axis that had been emergency
+stopped look freshly referenced the next morning.
+
 Soft limits
 -----------
 The controller's travel limits describe the leadscrew. Everything this rig can
@@ -145,6 +153,7 @@ import sys
 import time
 
 from octobee import paths
+from octobee.motion import ledger
 from octobee.motion.config import (
     AXIS_CONFIG,
     load_axis_frames,
@@ -345,6 +354,16 @@ class Stage:
         # Position trust is NOT the controller's homed bit -- see position_trusted.
         self._trusted = False
         self._distrust_reason = "not homed since this stage was opened"
+        # "homed" when a homing cycle this process watched granted the trust,
+        # "inherited" when open() carried it over from the ledger. Not equally
+        # strong, so the GUI says which -- see octobee/motion/ledger.py.
+        self.trust_origin = None
+        # None means the ledger beside the rest of the config. An attribute
+        # rather than a constructor argument because only the tests set it.
+        self.state_path = None
+        # The last ledger failure, kept rather than raised: _remember explains.
+        self.ledger_error = ""
+        self._ledger_last = 0.0
         # None for either half means "leave whatever the controller has", which
         # is the only way to look at a stage without changing how it moves.
         self._vel_cfg = None if vel_mm_s is None else float(vel_mm_s)
@@ -378,18 +397,18 @@ class Stage:
             # until a poll cycle has actually completed.
             time.sleep(self.poll_ms / 1000.0 * 3)
             self._read_static()
-            # A stage that is still powered from an earlier session keeps both
-            # its homed bit and a count that really does match the carriage,
-            # so opening it does not by itself make the position untrustworthy.
-            # What would is a fault it is sitting in right now.
-            bits = self.status
-            if bits & MOTION_ERROR_BIT:
-                self.distrust("the controller is reporting a motion error")
-            elif bits & HOMED_BIT:
-                self._trusted = True
+            # A stage still powered from an earlier session keeps its homed
+            # bit and a count that MAY still describe the carriage, so opening
+            # it does not by itself make the position untrustworthy. Whether it
+            # is trustworthy is not a question the controller can answer --
+            # see _adopt_recorded_trust.
+            self._adopt_recorded_trust(self.status, self._count_du)
             # After LoadSettings, which is what put the shipped 20/20 there.
             if self._vel_cfg is not None or self._accel_cfg is not None:
                 self.set_vel_params(self._vel_cfg, self._accel_cfg)
+            # Now rather than only at close(), so that a session ending in a
+            # crash or a power cut still leaves behind what was known here.
+            self._remember(force=True)
         except Exception:
             self.close()
             raise
@@ -420,6 +439,11 @@ class Stage:
             # either, and failing here would skip the close below and leak an
             # exclusive-open USB device for the lifetime of the process.
             pass
+        # While the device can still be read. An ordinary shutdown is the one
+        # moment the recorded count is certainly current, and recording it is
+        # what lets the next open() inherit the trust instead of sending the
+        # operator through a homing cycle for nothing.
+        self._remember(force=True)
         try:
             d.ISC_StopPolling(self._sb)
         finally:
@@ -528,6 +552,12 @@ class Stage:
         module watched complete, and cleared by anything that could have cost
         steps. Absolute moves require BOTH.
 
+        None of that used to survive the process it was learned in. It does
+        now: what was known at the end of a run is written to a ledger, and
+        open() adopts it only after checking that the counter has not moved
+        since. octobee/motion/ledger.py has the whole of that argument,
+        including what it still cannot see.
+
         Never raises, including on a closed stage. It is read from the stop
         path and from the dialog that offers to reset one, and a property that
         throws there would turn "the stage went away" into a traceback in the
@@ -545,10 +575,103 @@ class Stage:
             return "the controller reports this axis as not homed"
         return None
 
-    def distrust(self, reason):
-        """Mark the position counter unreliable. Absolute moves stop working."""
+    def distrust(self, reason, persist=True):
+        """Mark the position counter unreliable. Absolute moves stop working.
+
+        Recorded to the ledger as it happens, not only at close(). What makes
+        an axis stop being trustworthy is usually an emergency stop or a fault,
+        which is exactly the kind of evening that ends with the process killed
+        rather than closed -- and the next morning the reason has to still be
+        there.
+
+        persist=False sets the flags without writing anything, for the two
+        callers that are between an operator's decision and ISC_StopImmediate.
+        Both of them write it themselves the moment the stop is commanded;
+        neither may put a disk write in front of one.
+        """
         self._trusted = False
         self._distrust_reason = str(reason)
+        self.trust_origin = None
+        if persist:
+            self._remember(force=True)
+
+    @property
+    def _count_du(self):
+        """The raw step count, in the controller's own units and frame.
+
+        What the ledger compares, in preference to position_mm: rig
+        millimetres carry origin_mm and invert with them, both of which come
+        out of stages.json, so a frame edited between two sessions would look
+        exactly like a carriage that had moved -- or hide one that had.
+        """
+        self._require_open()
+        return int(dll().ISC_GetPosition(self._sb))
+
+    def _remember(self, force=False):
+        """Write this axis's state to the ledger. NEVER raises.
+
+        distrust() calls this, emergency_stop() calls distrust(), and
+        emergency_stop cannot fail for any reason -- point 2 of its docstring.
+        A full disk or a read-only config directory has to leave the machine
+        stopping, not raise out of the middle of stopping it. So a failure is
+        kept in ledger_error, which the GUI reports at connect, rather than
+        either thrown or quietly dropped.
+
+        Throttled, because wait() calls it after every completed move and a
+        raster is thousands of moves. A second of staleness costs nothing: a
+        stale count fails safe into a distrusted axis at the next open(), which
+        is the correct answer after a run that was killed mid-move anyway.
+        Anything that CHANGES the trust passes force=True.
+        """
+        if not self.is_open:
+            # Nothing readable to record, and a Stage that was never opened has
+            # no state worth carrying into the next run.
+            return
+        now = time.monotonic()
+        if not force and now - self._ledger_last < ledger.MIN_WRITE_INTERVAL_S:
+            return
+        try:
+            count = self._count_du
+            ledger.remember(self.serial, axis=self.name, count_du=count,
+                            position_dev_mm=self._to_mm(count),
+                            trusted=self.position_trusted,
+                            reason=self.distrust_reason or "",
+                            path=self.state_path)
+            self._ledger_last = now
+            self.ledger_error = ""
+        except Exception as exc:
+            # Deliberately broad, for the reason above.
+            self.ledger_error = f"{type(exc).__name__}: {exc}"
+
+    def _adopt_recorded_trust(self, bits, count_du):
+        """Decide, at open(), whether this counter may be believed.
+
+        Returns whether the recorded trust was adopted. Split out of open() so
+        the rule can be exercised with no stage attached, the same reason
+        _resolve_limit is a staticmethod.
+
+        Three questions, in order of authority. A fault the controller is
+        sitting in right now beats everything. A cleared homed bit is the
+        controller saying it no longer knows where the carriage is -- which is
+        what a power cycle leaves behind -- and no record here may outrank it.
+        Only then does the ledger get a say, and what it mostly says is what
+        the LAST session concluded, which is what open() used to throw away.
+        """
+        if bits & MOTION_ERROR_BIT:
+            self.distrust("the controller is reporting a motion error")
+        elif not bits & HOMED_BIT:
+            self.distrust("the controller has no homing reference, which is "
+                          "what it reports once its power has been off")
+        else:
+            ok, why = ledger.verdict(
+                ledger.recall(self.serial, self.state_path),
+                count_du, self._du_per_mm)
+            if ok:
+                self._trusted, self._distrust_reason = True, ""
+                self.trust_origin = "inherited"
+            else:
+                self.distrust(why)
+        return self._trusted
 
     def _require_open(self):
         if not self.is_open:
@@ -730,6 +853,7 @@ class Stage:
             "error": bool(bits & MOTION_ERROR_BIT),
             "at_hard_limit": bool(bits & HARD_LIMIT_MASK),
             "trusted": self.position_trusted,
+            "trust_origin": self.trust_origin,
             "distrust_reason": self.distrust_reason,
             "travel_mm": self.travel_mm,
             "limit_mm": self.limit_mm,
@@ -778,6 +902,8 @@ class Stage:
         if self.homed:
             self._trusted = True
             self._distrust_reason = ""
+            self.trust_origin = "homed"
+            self._remember(force=True)
         else:
             self.distrust(f"{self.name}'s homing cycle did not complete")
         return self.position_trusted
@@ -877,10 +1003,20 @@ class Stage:
         d = dll()
         if immediate:
             self.distrust(f"{self.name} was stopped immediately, which "
-                          f"abandons the deceleration ramp and can lose steps")
+                          f"abandons the deceleration ramp and can lose steps",
+                          persist=False)
         rc = (d.ISC_StopImmediate(self._sb) if immediate
               else d.ISC_StopProfiled(self._sb))
-        _check(rc, f"stop {self.name}")
+        try:
+            _check(rc, f"stop {self.name}")
+        finally:
+            # After the stop is commanded, never in front of it: setting the
+            # flags is two assignments, but writing the ledger is disk I/O and
+            # nothing may sit between "stop now" and the call that does it. In
+            # a finally because an axis that failed to stop is the last one
+            # whose distrust should go unrecorded.
+            if immediate:
+                self._remember(force=True)
 
     def emergency_stop(self, reason="emergency stop"):
         """Stop NOW, latch the interlock, and never raise on the way.
@@ -903,9 +1039,15 @@ class Stage:
         if not self.is_open:
             return ""
         try:
+            # persist=False, then the write below: see stop(). A file system
+            # that has gone slow must not be able to get between the button
+            # and ISC_StopImmediate.
             self.distrust(f"{self.name} was stopped by an emergency stop "
-                          f"({reason}), which can lose steps")
-            _check(dll().ISC_StopImmediate(self._sb), f"stop {self.name}")
+                          f"({reason}), which can lose steps", persist=False)
+            try:
+                _check(dll().ISC_StopImmediate(self._sb), f"stop {self.name}")
+            finally:
+                self._remember(force=True)
             return ""
         except Exception as exc:
             # Deliberately broad -- see point 2 above. Whatever went wrong
@@ -971,6 +1113,10 @@ class Stage:
                 f"{AXIS_CONFIG} before moving this axis again.")
         if settle_s:
             time.sleep(settle_s)
+        # The move ended, this process watched it end, and the count is
+        # therefore both current and witnessed -- the only combination worth
+        # recording. Throttled; see _remember.
+        self._remember()
 
     # ---- calibration file ----
 
@@ -1354,6 +1500,10 @@ def _cmd_status(a):
             print(envelope)
             if not snap["trusted"]:
                 print(f"      absolute moves REFUSED: {snap['distrust_reason']}")
+            elif snap["trust_origin"] == "inherited":
+                print("      position carried over from an earlier session -- "
+                      "the counter has not moved since octobee recorded it, "
+                      "which is not the same as having been homed")
         print(f"\nhome order: {' -> '.join(ss.home_sequence())}")
         if ss.interlock.tripped:
             print(f"MOTION IS LATCHED OFF: {ss.interlock.tripped}")

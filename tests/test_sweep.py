@@ -506,6 +506,63 @@ def test_sweep_positions_come_from_the_encoders(workdir):
           side["position_accuracy"][:80])
 
 
+def test_the_datum_rule_is_shared():
+    """One anchoring rule, used by the live recorder and by a sweep alike.
+
+    They must not drift: the recorder anchors once when Record is pressed and
+    a sweep anchors once per line, and a difference between them would show up
+    as two files of the same rig disagreeing about where it was, with nothing
+    in either to say which was right.
+    """
+    print("\nanchoring counts to the controllers")
+    emap = oenc.EncoderMap({
+        "x": {"column": 0, "counts_per_mm": 14400.0},
+        "y": {"column": 1, "counts_per_mm": 14400.0},
+        "z": {"column": 2, "counts_per_mm": -14400.0}})
+    rig = _Rig()
+    rig["x"].move_to(10.0)
+    rig["y"].move_to(20.0)
+    rig["z"].move_to(30.0)
+    counts = np.array([144000.0, 288000.0, -432000.0])
+
+    datum = oenc.datum_from(counts, emap, rig)
+    check("every trusted axis is anchored to what its controller says",
+          datum == {"x": (144000.0, 10.0), "y": (288000.0, 20.0),
+                    "z": (-432000.0, 30.0)}, str(datum))
+
+    # The one that matters. A stall or an immediate stop leaves the homed bit
+    # set and the count wrong, so the controller still answers -- with a number
+    # that puts the head somewhere it never was.
+    rig["y"].position_trusted = False
+    partial = oenc.datum_from(counts, emap, rig)
+    check("an axis whose counter cannot be believed is not anchored at all",
+          sorted(partial) == ["x", "z"],
+          "anchoring to an untrusted counter produces a column that is "
+          "confidently somewhere the head never was; no column can be seen")
+
+    check("with no counts there is nothing to anchor",
+          oenc.datum_from(None, emap, rig) == {})
+    check("and with no calibration there is nothing to anchor it with",
+          oenc.datum_from(counts, oenc.EncoderMap(), rig) == {})
+
+    # A column the stream does not carry is skipped rather than read past the
+    # end of the row.
+    narrow = oenc.EncoderMap({"x": {"column": 0, "counts_per_mm": 14400.0},
+                              "y": {"column": 7, "counts_per_mm": 14400.0}})
+    rig["y"].position_trusted = True
+    check("a calibrated axis whose column is not in this stream is skipped",
+          sorted(oenc.datum_from(counts, narrow, rig)) == ["x"],
+          str(oenc.datum_from(counts, narrow, rig)))
+
+    # And the sweep stores exactly what the rule returned, per line.
+    log = osweep.SweepLog(pgeom.Geometry(), {}, emap)
+    log.add_datum(3, partial)
+    log.add_datum(4, {})
+    check("a sweep files one datum per line, and none for an empty one",
+          sorted(log.datum) == [3] and sorted(log.datum[3]) == ["x", "z"],
+          str(log.datum))
+
+
 def test_sweep_refuses_an_unhomed_rig():
     """A sweep of a rig whose counters are guesses has no origin at all."""
     print("\nsweeping an unhomed rig")

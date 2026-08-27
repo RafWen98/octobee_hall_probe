@@ -5,6 +5,7 @@ import json
 import os
 
 
+from octobee.motion import ledger as oledger
 from octobee.motion import stage as ostage
 from tests.helpers import (
     _framed,
@@ -435,3 +436,113 @@ def test_stage_motion(workdir):
     check("a stage can still be opened without changing how it moves",
           ostage.Stage("45502844", vel_mm_s=None, accel_mm_s2=None)._vel_cfg
           is None)
+
+
+def test_stage_position_ledger(workdir):
+    """Position trust has to outlive the process that learned it.
+
+    Everything that withdraws trust -- an emergency stop, a stall, a move that
+    ended against a hard limit -- used to live in memory only, and open()
+    re-derived trust from the controller's HOMED bit, which stays set through
+    every one of them. Closing the window was therefore enough to make a
+    distrusted axis look freshly referenced. See octobee/motion/ledger.py.
+    """
+    print("\nposition ledger")
+    path = os.path.join(workdir, "state.json")
+    du = ostage.DEFAULT_DU_PER_MM
+
+    # The file itself. Three axes share it and finish their moves at different
+    # times, so writing one must never drop another.
+    oledger.remember("45502844", axis="x", count_du=100, position_dev_mm=0.0,
+                     trusted=True, path=path)
+    oledger.remember("45502854", axis="z", count_du=200, position_dev_mm=0.0,
+                     trusted=False, reason="z hit the hard limit", path=path)
+    check("a record round trips",
+          oledger.recall("45502844", path)["count_du"] == 100)
+    check("recording one axis leaves the others alone",
+          oledger.recall("45502854", path)["reason"] == "z hit the hard limit")
+    check("an axis nobody has recorded reads as nothing known",
+          oledger.recall("45999999", path) is None)
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("{ this is not json")
+    check("a corrupt ledger reads as nothing known rather than raising",
+          oledger.recall("45502844", path) is None,
+          "a damaged file must not take the connection down with it")
+    oledger.remember("45502844", axis="x", count_du=7, trusted=True, path=path)
+    check("and it is replaced rather than left in place to fail forever",
+          oledger.recall("45502844", path)["count_du"] == 7)
+
+    # The rule, on its own.
+    homed = {"trusted": True, "count_du": 1000, "at": "2026-08-25T18:00:00"}
+    ok, why = oledger.verdict(homed, 1000, du)
+    check("an unchanged counter is believed", ok and why == "")
+    check("one device unit of jitter does not cost a homing cycle",
+          oledger.verdict(homed, 1001, du)[0], "2.4 nm on an LTS300C")
+    ok, why = oledger.verdict(homed, 1000 + int(3.0 * du), du)
+    check("a counter that moved while octobee was away is not believed",
+          not ok and "3.000 mm" in why, why)
+    check("an axis with no record at all is not believed",
+          not oledger.verdict(None, 1000, du)[0])
+    ok, why = oledger.verdict({"trusted": False, "count_du": 1000,
+                               "reason": "x was stopped by an emergency stop",
+                               "at": "2026-08-25T23:10:00"}, 1000, du)
+    check("last night's emergency stop is still an emergency stop",
+          not ok and "emergency stop" in why and "23:10" in why, why)
+
+    # What open() makes of it. This first one is the bug the module exists for:
+    # the homed bit is still set and the count still matches, and the axis must
+    # STILL be refused, because the last session ended with it distrusted.
+    st = _framed("x", False)
+    st.state_path = path
+    oledger.remember(st.serial, axis="x", count_du=4096, trusted=False,
+                     reason="x ended a move against a hard limit switch",
+                     path=path)
+    st._adopt_recorded_trust(ostage.HOMED_BIT | ostage.ENABLED_BIT, 4096)
+    check("a homed bit does not resurrect the trust the last run withdrew",
+          not st._trusted and "hard limit switch" in st._distrust_reason,
+          st._distrust_reason)
+
+    st = _framed("x", False)
+    st.state_path = path
+    oledger.remember(st.serial, axis="x", count_du=4096, trusted=True,
+                     path=path)
+    st._adopt_recorded_trust(ostage.HOMED_BIT, 4096)
+    check("an axis left trusted, and not since moved, is carried over",
+          st._trusted and st.trust_origin == "inherited",
+          "or every restart costs three homing cycles for nothing")
+
+    st = _framed("x", False)
+    st.state_path = path
+    st._adopt_recorded_trust(ostage.HOMED_BIT, 4096 + int(50.0 * du))
+    check("but not if something drove it in between",
+          not st._trusted and "50.000 mm" in st._distrust_reason,
+          st._distrust_reason)
+
+    st = _framed("x", False)
+    st.state_path = path
+    st._adopt_recorded_trust(ostage.ENABLED_BIT, 4096)
+    check("a controller that lost its homing reference outranks the record",
+          not st._trusted and "power" in st._distrust_reason,
+          "a power cycle clears the homed bit, and no file may argue with it")
+
+    st = _framed("x", False)
+    st.state_path = path
+    st._adopt_recorded_trust(ostage.HOMED_BIT | ostage.MOTION_ERROR_BIT, 4096)
+    check("and a fault it is sitting in right now outranks everything",
+          not st._trusted and "motion error" in st._distrust_reason)
+
+    # Writing it must never be the thing that breaks a stop: distrust() is on
+    # the emergency-stop path, and that path cannot fail for any reason.
+    st = _framed("x", False)
+    st.state_path = os.path.join(path, "nested", "state.json")   # path is a FILE
+    st.is_open = True                       # nothing to talk to, just the flag
+    try:
+        st._remember(force=True)
+        raised = False
+    except Exception:
+        raised = True
+    st.is_open = False
+    check("a ledger that cannot be written does not raise", not raised)
+    check("and the failure is kept rather than dropped",
+          bool(st.ledger_error), st.ledger_error or "nothing was recorded")

@@ -73,6 +73,7 @@ def test_magnet_wizard_reopens(app, workdir):
 
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, no_connect=True,
+        stages=os.path.join(workdir, "stages.json"),
         geometry=os.path.join(workdir, "reopen_geom.json"),
         calibration=os.path.join(workdir, "reopen_cal.json"),
         machine=os.path.join(workdir, "reopen_machine.json"),
@@ -161,6 +162,7 @@ def test_magnet_wizard_saves(app, workdir):
 
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, geometry=geom_path,
+        stages=os.path.join(workdir, "stages.json"),
         calibration=cal_path, machine=os.path.join(workdir, "wiz_machine.json"),
         out_dir=os.path.join(workdir, "wizcaps"),
         screenshot=None, screenshot_tab=0, screenshot_warmup=0,
@@ -273,6 +275,7 @@ def test_magnet_wizard_standard_run(app, workdir):
 
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, no_connect=True,
+        stages=os.path.join(workdir, "stages.json"),
         geometry=os.path.join(workdir, "std_geom.json"),
         calibration=os.path.join(workdir, "std_cal.json"),
         machine=os.path.join(workdir, "std_machine.json"),
@@ -364,6 +367,7 @@ def test_magnet_wizard_refuses_a_degenerate_dither(app, workdir):
 
     ns = argparse.Namespace(
         uut=None, demo=True, replay=None, geometry=geom_path,
+        stages=os.path.join(workdir, "stages.json"),
         calibration=cal_path, machine=os.path.join(workdir, "gate_machine.json"),
         out_dir=os.path.join(workdir, "gatecaps"),
         screenshot=None, screenshot_tab=0, screenshot_warmup=0,

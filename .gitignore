@@ -14,6 +14,11 @@ captures/
 octobee_cal.png
 smoketest*.png
 
+# Where each axis was left, so position trust survives a restart. State, not
+# configuration: it describes one machine at one moment and means nothing on
+# another bench, so it lives beside the config without being any of it.
+config/stage_state.json
+
 # local configuration overrides. For a whole alternative set, point
 # $OCTOBEE_CONFIG_DIR at another directory instead of editing these.
 config/*_local.json

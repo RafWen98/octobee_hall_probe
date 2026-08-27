@@ -54,7 +54,6 @@ class MachineTab(QtWidgets.QWidget):
         self._sweep_worker = None
         self._preview = None            # [points, index] while animating
         self._preview_at = None          # the made-up stage reading it implies
-        self._enc_counts = None          # the most recent encoder counts
         self._preview_timer = None
         self._run_hz = 0.0              # the rate a sweep in flight is timed at
         self._enc_worker = None
@@ -358,8 +357,23 @@ class MachineTab(QtWidgets.QWidget):
             "accurate — the encoders are on the motors, so they count the same "
             "leadscrew — it makes it belong to the right instant.")
         self.btn_vol_encoders.clicked.connect(self.on_volume_calibrate)
+        self.spin_enc_span = QtWidgets.QDoubleSpinBox()
+        self.spin_enc_span.setRange(oenc.MIN_CALIBRATION_SPAN_MM, 290.0)
+        self.spin_enc_span.setValue(oenc.CALIBRATION_SPAN_MM)
+        self.spin_enc_span.setDecimals(0)
+        self.spin_enc_span.setSuffix(" mm span")
+        self.spin_enc_span.setToolTip(
+            "How far each axis is stepped, out and back.\n\n"
+            "Longer is better and costs only time: every fixed error in the "
+            "run — a stage that stops a little short of each target, a "
+            "reading taken a moment early — is divided by this number when it "
+            "reaches the scale. The first run on this rig used 20 mm and put "
+            "0.41% into x that way.\n\n"
+            "Clamped to whatever room the axis actually has, from where it is "
+            "standing. The run says so if it had to shorten it.")
         f4.addWidget(self.btn_vol_encoders, 7, 0)
-        f4.addWidget(self.lbl_encoders, 7, 1, 1, 3)
+        f4.addWidget(self.spin_enc_span, 7, 1)
+        f4.addWidget(self.lbl_encoders, 7, 2, 1, 2)
 
         self.lbl_volume = QtWidgets.QLabel("")
         self.lbl_volume.setWordWrap(True)
@@ -486,6 +500,11 @@ class MachineTab(QtWidgets.QWidget):
         for note in session.machine.pose_notes:
             session.log(f"WARNING: machine: {note}")
         session.machine.pose_notes.clear()
+        if session.encoders:
+            session.log(f"encoders: {session.encoders.describe()} "
+                        f"— from {session.stages_path}")
+            self._warn_if_axes_disagree(session.encoders.to_dict(),
+                                        "loaded from file")
         if session.coils is not None:
             session.log(f"coil set: {session.coils.note} — "
                         f"{session.machine.coil_file}")
@@ -899,17 +918,26 @@ class MachineTab(QtWidgets.QWidget):
             self.session.stages is not None and not running)
 
     def _counts_now(self):
-        """The most recent encoder counts, or None. Read from other threads."""
-        return self._enc_counts
+        """The most recent encoder counts, or None. Read from other threads.
+
+        Out of the session rather than a copy kept here. The acquisition tick
+        publishes one row per tick and the live recorder anchors to that same
+        row; a second copy on this tab was one more thing that could be a tick
+        behind the first, for no gain.
+        """
+        return self.session.enc_counts_now
 
     def note_encoder_counts(self, counts):
-        """Called from the acquisition tick with this tick's last count row."""
+        """Called from the acquisition tick with this tick's last count row.
+
+        Only to hand the sweep in flight something fresh to anchor a line to.
+        The tick has already put the same row on the session.
+        """
         if counts is None or not len(counts):
             return
-        self._enc_counts = np.asarray(counts[-1], dtype=float)
         runner = self.session.volume_runner
         if runner is not None:
-            runner.counts_now = self._enc_counts
+            runner.counts_now = self.session.enc_counts_now
 
     def on_volume_calibrate(self):
         if self._enc_worker is not None and self._enc_worker.isRunning():
@@ -928,12 +956,16 @@ class MachineTab(QtWidgets.QWidget):
                 "connected and this still says so, check that its rc.user "
                 "still has sites 2, 5 and 6 in the aggregator set.")
             return
+        span = float(self.spin_enc_span.value())
+        points = oenc.CALIBRATION_POINTS
         reply = QtWidgets.QMessageBox.question(
             self, "Encoders",
-            f"Each axis will be driven {oenc.CALIBRATION_MM:g} mm and back, "
-            f"one at a time, to see which stream column follows it and by how "
-            f"much.\n\nMake sure the head has that much room where it is "
-            f"standing.\n\nGo?",
+            f"Each axis will be stepped along {span:g} mm and back, one at a "
+            f"time, stopping at {points} places each way, to see which stream "
+            f"column follows it and by how many counts per millimetre.\n\n"
+            f"The span is centred on where the axis is standing and clamped "
+            f"to the room it has. Every axis is returned to where it was "
+            f"found.\n\nMake sure the head is clear over that range.\n\nGo?",
             QtWidgets.QMessageBox.StandardButton.Yes
             | QtWidgets.QMessageBox.StandardButton.Cancel,
             QtWidgets.QMessageBox.StandardButton.Cancel)
@@ -942,10 +974,42 @@ class MachineTab(QtWidgets.QWidget):
         self.btn_vol_encoders.setEnabled(False)
         self.lbl_encoders.setText("calibrating…")
         self._enc_worker = EncoderCalibrationWorker(
-            self.session.stages, self._counts_now)
+            self.session.stages, self._counts_now, span_mm=span,
+            points=points)
         self._enc_worker.message.connect(self.session.log)
+        self._enc_worker.progress.connect(self._on_enc_progress)
         self._enc_worker.done.connect(self.on_volume_calibrated)
         self._enc_worker.start()
+
+    def _on_enc_progress(self, done, total):
+        """Standstills taken so far. A long run needs to look like it is one."""
+        if done < total:
+            self.lbl_encoders.setText(
+                f"calibrating… {done}/{total} standstills")
+
+    @staticmethod
+    def _encoder_note(found):
+        """One line for stages.json recording how good the fit was.
+
+        The scale alone cannot be told apart from a wrong scale later, and
+        this file is the only thing that outlives the session it was measured
+        in. So the residual goes in beside it.
+        """
+        parts = []
+        for axis, spec in sorted(found.items()):
+            bits = [f"{spec['counts_per_mm']:+,.1f} c/mm"]
+            if spec.get("span_mm"):
+                bits.append(f"{spec['span_mm']:g} mm x {spec.get('points')} pts")
+            if spec.get("residual_um") is not None:
+                bits.append(f"residual {spec['residual_um']:.1f} um")
+            if spec.get("direction_spread_ppm") is not None:
+                bits.append(f"out/back {spec['direction_spread_ppm']:.0f} ppm")
+            if spec.get("direction_offset_um") is not None:
+                bits.append(
+                    f"out/back agree to {spec['direction_offset_um']:.1f} um")
+            parts.append(f"{axis}: " + ", ".join(bits))
+        return ("multi-point fit against the controller's measured position; "
+                + "; ".join(parts))
 
     def on_volume_calibrated(self, found, err):
         """Adopt whatever was measured, and say plainly what was not."""
@@ -954,9 +1018,10 @@ class MachineTab(QtWidgets.QWidget):
             merged.update(found)
             self.session.encoders = oenc.EncoderMap(merged)
             path = self.session.encoders.save(
-                note="measured by the GUI's encoder calibration")
+                self.session.stages_path, note=self._encoder_note(found))
             self.session.log(f"encoders: {self.session.encoders.describe()} "
                              f"-> written to {path}")
+            self._warn_if_axes_disagree(found, "this run")
         if err:
             self.session.log(f"WARNING: encoders: {err}")
         self.refresh_encoders()
@@ -967,6 +1032,46 @@ class MachineTab(QtWidgets.QWidget):
                 + "\n  ".join(err.split("; "))
                 + "\n\nWhatever was measured has been kept; the rest fall "
                   "back to the controller's own position.")
+
+    def _warn_if_axes_disagree(self, found, source="this run"):
+        """Say so when one axis's scale is the odd one out.
+
+        A warning rather than a refusal: two axes of genuinely different pitch
+        would trip this legitimately, and the operator knows what is bolted to
+        the rig where the software does not. See encoder.odd_axis_out for why
+        the axes are each other's only check here.
+
+        Run on the way IN as well as on the way out of a calibration. A scale
+        read back from stages.json is used exactly as hard as one just
+        measured, and it outlives the session that measured it -- so a bad one
+        would otherwise be caught once, on the day, and never again.
+        """
+        scales = {a: s.get("counts_per_mm") for a, s in found.items()}
+        odd = oenc.odd_axis_out(scales)
+        if odd is None:
+            if len(scales) >= 3:
+                self.session.log(
+                    f"encoders ({source}): all {len(scales)} axes agree on "
+                    f"their counts per millimetre to within 0.1% -- which is "
+                    f"what identical stages should do")
+            return
+        axis, frac = odd
+        spec = found[axis]
+        detail = ""
+        if spec.get("residual_um") is not None:
+            detail = f" Its own fit residual was {spec['residual_um']:.1f} um."
+        # In millimetres as well as per cent, because a percentage of a
+        # gearing ratio is not a quantity anyone can picture and the length of
+        # the axis is what it actually costs.
+        span = max(hi - lo for lo, hi
+                   in self.session.machine.pose.travel_mm.values())
+        self.session.log(
+            f"WARNING: encoders ({source}): {axis} is {frac * 100:+.2f}% from "
+            f"the other axes ({abs(spec['counts_per_mm']):,.1f} counts/mm), "
+            f"which is {abs(frac) * span:.1f} mm across a {span:g} mm axis. "
+            f"Identical stages share a gearing ratio, so this is more likely a "
+            f"bad run on {axis} than a real difference.{detail} Re-run it, "
+            f"with a longer span if there is room.")
 
     # ---- flying the path -------------------------------------------------
     def on_volume_preview(self):
@@ -1055,6 +1160,12 @@ class MachineTab(QtWidgets.QWidget):
             f"{self._plan.describe()}.\n\n"
             f"Roughly {hours:.1f} hours, logging at "
             f"{self.session.out_rate:g} Hz.\n\n"
+            # Said before the run rather than discovered in the sidecar
+            # after it. Which axes are on the sample clock is the
+            # difference between a position column good to a micrometre
+            # and one good to a millimetre, and it is a five-minute fix
+            # beforehand.
+            f"{self._position_plan()}\n\n"
             f"The stages will run unattended over the whole path. The "
             f"clearance was computed from the pose above -- if that pose is "
             f"not measured, nothing here protects the head.\n\nStart?",
@@ -1147,6 +1258,22 @@ class MachineTab(QtWidgets.QWidget):
             f"volume map: {log.n_rows:,} rows over {done} lines "
             f"-> {written}" + (" (aborted)" if err or (
                 runner is not None and runner.aborted) else ""))
+
+    def _position_plan(self):
+        """One line on where this map's positions will come from, per axis."""
+        enc = self.session.encoders
+        on_clock = [a for a in ("x", "y", "z") if a in enc]
+        if not on_clock:
+            return ("Positions: from the controllers over USB, interpolated "
+                    "-- no axis has a measured encoder scale. Calibrate first "
+                    "if you want them on the sample clock.")
+        polled = [a for a in ("x", "y", "z") if a not in on_clock]
+        out = (f"Positions: {', '.join(on_clock)} from the encoders, latched "
+               f"with each field sample")
+        if polled:
+            out += (f"; {', '.join(polled)} from the controllers over USB, "
+                    f"interpolated")
+        return out + "."
 
     def _sync_note(self, log, ran):
         """What the position column in this map is worth, per axis.
