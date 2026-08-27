@@ -37,6 +37,7 @@ from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.calib import geometry as pg
+from octobee.motion import encoder as oenc
 
 AXES = ocal.AXES
 N_SENSORS = ocal.N_SENSORS
@@ -79,10 +80,28 @@ class CsvRecorder:
     `tube_frame` the per-sensor axes are additionally rotated into the common
     tube frame, which is the only form in which different sensors' components
     can be compared or summed.
+
+    Where the stream carries encoder counts -- acq1001_695 aggregates the three
+    quadrature sites into its frames; see octobee/motion/encoder.py -- the
+    counts for the same rows are appended, and with them the X/Y/Z travel in
+    millimetres for every axis whose scale has been fitted. That is the whole
+    point of counting position in the frame rather than polling it: the count
+    in a row was latched when that row's samples were converted, so a recorded
+    field value and the position it was measured at share a clock by
+    construction, with nothing to interpolate.
+
+    `enc_datum` is {axis: (counts_at_datum, mm_at_datum)} -- what the encoder
+    read at the moment the controller said the axis was at mm_at_datum. A
+    quadrature counter is incremental, so this is what makes the millimetres
+    absolute. Without one for an axis the column still gets written, named
+    `X_rel_mm` rather than `X_mm`: travel measured from wherever the head
+    happened to be on the first row. The name is the difference, so a column
+    cannot be read as absolute when it is not.
     """
 
     def __init__(self, path, fs_out, cal, geom=None, tube_frame=False,
-                 include_mag=True, meta=None, samples_per_row=None):
+                 include_mag=True, meta=None, samples_per_row=None,
+                 encoders=None, enc_columns=0, enc_datum=None):
         self.path = path
         self.fs_out = float(fs_out)
         self.samples_per_row = samples_per_row
@@ -90,7 +109,28 @@ class CsvRecorder:
         self.geom = geom
         self.tube_frame = bool(tube_frame and geom is not None)
         self.include_mag = include_mag
+        self.encoders = encoders if encoders else None
+        self.enc_datum = dict(enc_datum or {})
+        # Every column the stream carries, not only the calibrated ones. A
+        # column nobody has fitted a scale to yet is still a real measurement,
+        # and a recording made today is the only place it can be recovered
+        # from once the run is over.
+        self.enc_columns = int(enc_columns or 0)
+        if self.encoders is not None:
+            self.enc_columns = max(self.enc_columns,
+                                   self.encoders.columns_needed())
+        self.enc_axes = [
+            a for a in oenc.AXES
+            if self.encoders is not None and a in self.encoders
+            and self.encoders.axes[a]["column"] < self.enc_columns]
+        # Latched from the first finite count on a relative axis; see
+        # _positions_mm.
+        self._origin = {}
         self.n_rows = 0
+        # Rows written with no counts against them -- a block that arrived
+        # without them, or with the wrong number. Counted rather than
+        # discarded: the field data in those rows is good.
+        self.n_unpaired = 0
         self.t = 0.0
         self.started = time.time()
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -125,6 +165,16 @@ class CsvRecorder:
             info["samples_per_row"] = int(self.samples_per_row)
         info["timebase"] = ("contiguous -- every stream sample contributes to "
                             "exactly one row, so t_s is real elapsed time")
+        if self.enc_columns:
+            info["encoder_columns"] = self.enc_columns
+            info["encoder_axes"] = (
+                self.encoders.describe() if self.encoders
+                else "no encoder axes calibrated -- counts only, no mm")
+            info["encoder_datum"] = self._datum_note()
+            info["encoder_timing"] = (
+                "counts were latched by the ADC clock in the same samples the "
+                "field on this row was averaged from -- no interpolation, no "
+                "clock offset against the field")
         info.update(meta)
         for k, v in info.items():
             self._f.write(f"# {k}: {v}\n")
@@ -139,11 +189,47 @@ class CsvRecorder:
             cols += [f"S{s}_{a}_mT" for a in ("Bx", "By", "Bz")]
             if self.include_mag:
                 cols.append(f"S{s}_absB_mT")
+        n_field = len(cols)
+        cols += [f"enc{c}_counts" for c in range(self.enc_columns)]
+        cols += [f"{a.upper()}_mm" if a in self.enc_datum
+                 else f"{a.upper()}_rel_mm" for a in self.enc_axes]
+        if self.enc_columns:
+            self._f.write("# enc*_counts are continuous (unwrapped) quadrature "
+                          "counts averaged over the row; position columns are "
+                          "derived from them\n")
         self._f.write(",".join(cols) + "\n")
         self._cols = cols
+        # Per column, because %.6g is right for millitesla and wrong for
+        # counts: a 32-bit counter passes six significant digits within a few
+        # millimetres of travel, after which the position column would be
+        # quantised by the format it was printed with.
+        self._fmt = (["%.6g"] * n_field + ["%.10g"] * self.enc_columns
+                     + ["%.9g"] * len(self.enc_axes))
 
-    def write(self, b_mt):
-        """Append (n, 16, 3) millitesla already decimated to fs_out."""
+    def _datum_note(self):
+        """What the millimetre columns are measured from, in words."""
+        if not self.enc_axes:
+            return "not applicable -- no axis has a fitted counts/mm scale"
+        parts = []
+        for a in self.enc_axes:
+            d = self.enc_datum.get(a)
+            if d is None:
+                parts.append(f"{a} none -- {a.upper()}_rel_mm is travel from "
+                             f"the first row, not an absolute position")
+            else:
+                parts.append(f"{a} {d[0]:,.0f} counts = {d[1]:.4f} mm from "
+                             f"the controller")
+        return "; ".join(parts)
+
+    def write(self, b_mt, counts=None):
+        """Append (n, 16, 3) millitesla already decimated to fs_out.
+
+        `counts` is the (n, columns) block of continuous encoder counts for
+        THE SAME rows, decimated by the same factor. A block whose counts do
+        not line up row for row is written without them -- as empty position
+        columns -- rather than with them shifted, because a position column a
+        few rows out is undetectable in the file and a blank one is not.
+        """
         b = np.asarray(b_mt, float)
         if b.ndim != 3 or b.shape[0] == 0:
             return 0
@@ -157,10 +243,54 @@ class CsvRecorder:
             block = np.concatenate([b, mag], axis=2).reshape(n, -1)
         else:
             block = b.reshape(n, -1)
-        rows = np.column_stack([t, block])
-        np.savetxt(self._f, rows, delimiter=",", fmt="%.6g")
+        parts = [t[:, None], block]
+        if self.enc_columns:
+            c = self._counts_block(counts, n)
+            parts.append(c)
+            if self.enc_axes:
+                parts.append(self._positions_mm(c))
+        rows = np.concatenate(parts, axis=1)
+        np.savetxt(self._f, rows, delimiter=",", fmt=self._fmt)
         self.n_rows += n
         return n
+
+    def _counts_block(self, counts, n):
+        """(n, enc_columns) counts, NaN where this block carried none."""
+        out = np.full((n, self.enc_columns), np.nan)
+        if counts is None:
+            self.n_unpaired += n
+            return out
+        counts = np.asarray(counts, dtype=float)
+        if counts.ndim != 2 or counts.shape[0] != n:
+            self.n_unpaired += n
+            return out
+        k = min(self.enc_columns, counts.shape[1])
+        out[:, :k] = counts[:, :k]
+        return out
+
+    def _positions_mm(self, counts):
+        """(n, enc_columns) counts -> (n, len(self.enc_axes)) millimetres.
+
+        An axis with a datum is absolute: the controller's millimetres at the
+        datum plus the encoder's own displacement since. An axis without one
+        counts from its first finite reading in this file, which is the most
+        that can honestly be said about it -- and is still the travel, which
+        is what a swept recording is usually about.
+        """
+        out = np.full((len(counts), len(self.enc_axes)), np.nan)
+        for i, axis in enumerate(self.enc_axes):
+            col = self.encoders.axes[axis]["column"]
+            datum = self.enc_datum.get(axis)
+            if datum is None:
+                if axis not in self._origin:
+                    finite = counts[np.isfinite(counts[:, col]), col]
+                    if not len(finite):
+                        continue
+                    self._origin[axis] = float(finite[0])
+                datum = (self._origin[axis], 0.0)
+            out[:, i] = float(datum[1]) + self.encoders.displacement_mm(
+                counts[:, col], axis, datum[0])
+        return out
 
     @property
     def size_bytes(self):

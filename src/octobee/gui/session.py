@@ -39,6 +39,7 @@ import os
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 from octobee.motion import encoder as oenc
+from octobee.motion.config import AXIS_CONFIG
 from octobee.calib import geometry as pgeom
 from octobee import machine as omach
 from octobee import paths
@@ -90,7 +91,24 @@ class Session:
         # on the way through and the counts must not be.
         self.enc_decimator = ocal.Decimator(1)
         self.enc_stream = None
-        self.encoders = oenc.EncoderMap()
+        # Read back from stages.json, beside the rest of the axis facts. The
+        # encoder calibration has always been WRITTEN there and never loaded,
+        # so a scale measured yesterday was gone this morning and every
+        # position fell back to the controllers without saying why -- the same
+        # failure the machine placement above is loaded to avoid. It is a
+        # measurement of the rig, like the axis map, not a per-session choice.
+        try:
+            self.encoders = oenc.EncoderMap.load()
+        except Exception as e:
+            self.encoders = oenc.EncoderMap()
+            err(f"{paths.config(AXIS_CONFIG)}: encoder scales not loaded ({e})"
+                f" -- positions will come from the controllers")
+        # The last count row to arrive, and what it is measured against. The
+        # counts are published here rather than only handed to the Machine tab
+        # because taking a datum -- pairing counts with a controller position
+        # -- is something a recording needs too, not only a sweep.
+        self.enc_counts_now = None
+        self.enc_datum = {}
         self.prev_clkdiv = {}
         self.out_rate = 500.0
 
@@ -147,6 +165,13 @@ class Session:
         self.enc_decimator = ocal.Decimator(self.decim())
         cols = int(getattr(self.source, "enc_columns", 0) or 0)
         self.enc_stream = oenc.EncoderStream(cols) if cols else None
+        # A fresh stream starts its unwrapping from whatever the counter reads
+        # now, so continuous counts taken before it are in a different basis.
+        # A datum is a pair of numbers in that basis and nothing else; carrying
+        # one across would offset every position derived from it by however far
+        # the counter had gone since, which is a plausible-looking number.
+        self.enc_counts_now = None
+        self.enc_datum = {}
         return self.decimator
 
     # ---- logging ----------------------------------------------------------

@@ -43,6 +43,19 @@ class ExportTab(QtWidgets.QWidget):
         f1 = QtWidgets.QGridLayout(g1)
         self.chk_csv = QtWidgets.QCheckBox("calibrated CSV (millitesla)")
         self.chk_csv.setChecked(True)
+        self.chk_csv.setToolTip(
+            "One row per output sample: t_s, then each sensor's Bx/By/Bz and "
+            "|B|.\n\n"
+            "Where the stream carries encoder counts -- acq1001_695 only -- "
+            "the counts for those same rows are appended, and with them the "
+            "X/Y/Z travel in millimetres for every axis whose counts/mm has "
+            "been fitted on the Machine tab. Those positions were latched by "
+            "the ADC clock in the samples the row was averaged from, so they "
+            "need no interpolation against the field.\n\n"
+            "A column named X_mm is absolute, anchored to the controller when "
+            "Record was pressed; one named X_rel_mm is travel from the first "
+            "row, which is what you get when the stages are not connected or "
+            "have not been homed.")
         self.chk_raw = QtWidgets.QCheckBox(
             "raw counts, full stream rate (.bin + .json sidecar)")
         self.chk_tube = QtWidgets.QCheckBox(

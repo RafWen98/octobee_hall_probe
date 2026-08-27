@@ -864,7 +864,14 @@ class MachineTab(QtWidgets.QWidget):
 
     # ---- the encoders ----------------------------------------------------
     def refresh_encoders(self):
-        """Say what the position column of the next map will be made of."""
+        """Say what the position column of the next map will be made of.
+
+        Called whenever either input changes -- the source, or the stages --
+        because both are None while this tab is being built and neither is
+        what it will be by the time anyone presses the button.
+        """
+        running = (self._enc_worker is not None
+                   and self._enc_worker.isRunning())
         enc = self.session.encoders
         cols = int(getattr(self.session.source, "enc_columns", 0) or 0)
         if enc:
@@ -883,10 +890,13 @@ class MachineTab(QtWidgets.QWidget):
             text = ("no counting encoders in this stream — a carrier has to "
                     "aggregate quadrature sites AND have phaseA_en set on "
                     "them. Positions come from the controllers, read over USB.")
-        self.lbl_encoders.setText(text)
+        # Not while a calibration is in flight: the label is that run's
+        # progress, and a stage connecting or a source arriving mid-run must
+        # not overwrite it with a description of what is being measured.
+        if not running:
+            self.lbl_encoders.setText(text)
         self.btn_vol_encoders.setEnabled(
-            self.session.stages is not None
-            and (self._enc_worker is None or not self._enc_worker.isRunning()))
+            self.session.stages is not None and not running)
 
     def _counts_now(self):
         """The most recent encoder counts, or None. Read from other threads."""

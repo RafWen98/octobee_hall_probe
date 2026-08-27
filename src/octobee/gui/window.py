@@ -240,6 +240,11 @@ class MainWindow(QtWidgets.QMainWindow):
             set_snapshot_enabled=self.act_snapshot.setEnabled)
         left.addTab(self.tab_stages, "Stages")
         self.tab_machine = MachineTab(self.session)
+        # Built after the Stages tab, so it cannot be handed to it. What the
+        # Machine tab needs to know is only that the stages came or went --
+        # its "Calibrate encoders" button is dead without them, and deciding
+        # that once at build time left it dead for the whole session.
+        self.tab_stages.stages_changed.connect(self.tab_machine.refresh_encoders)
         left.addTab(self.tab_machine, "Machine")
         self.tab_export = ExportTab(
             self.session,
@@ -614,6 +619,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_state.setText(f"{kind}: {', '.join(source.hosts)} "
                                f"@ {source.fs_hz/1000:g} kSPS")
         self._reset_buffers()
+        # The other half of what the encoder line says: which columns are
+        # arriving, and from which carrier. Both are properties of the source,
+        # so both are unknown until there is one.
+        self.tab_machine.refresh_encoders()
         self.session.log(f"{kind} source running at {source.fs_hz/1000:g} kSPS, "
                      f"decimating to {self.session.out_rate:g} Hz for display and CSV")
 
@@ -623,6 +632,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.session.source is not None:
             self.session.source.stop()
             self.session.source = None
+        self.tab_machine.refresh_encoders()
         # Symmetry with Connect: one button owns the whole rig. Leaving the
         # stages open would hold the USB devices against the Kinesis app and
         # against the next run of this window, which looks like a cabling
@@ -675,6 +685,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tab_live.refresh_units()
         self._roll_over_csv(what)
 
+    def _new_csv_recorder(self, path, meta):
+        """One CsvRecorder, however the recording came to be started.
+
+        Both callers -- pressing Record, and rolling over because the
+        calibration changed under a running one -- have to hand it the same
+        encoder state, or the second file would quietly lose the position
+        columns the first one had.
+        """
+        return orec.CsvRecorder(
+            path, self.session.out_rate, self.session.cal, self.session.geom,
+            tube_frame=self.tab_export.tube_frame(),
+            meta=meta, samples_per_row=self.session.decim(),
+            encoders=self.session.encoders,
+            enc_datum=self.session.enc_datum,
+            enc_columns=int(
+                getattr(self.session.source, "enc_columns", 0) or 0))
+
     def _roll_over_csv(self, what):
         """Close the CSV in progress and open a fresh one with a new header."""
         if self.session.csv_rec is None:
@@ -683,14 +710,16 @@ class MainWindow(QtWidgets.QMainWindow):
         rows = old.n_rows
         old.close()
         path = orec.default_name("octobee", "csv", self.session.out_dir)
-        self.session.csv_rec = orec.CsvRecorder(
-            path, self.session.out_rate, self.session.cal, self.session.geom,
-            tube_frame=self.tab_export.tube_frame(),
-            meta={"hosts": ",".join(self.session.source.hosts) if self.session.source else "",
-                  "stream_rate_hz": self.session.source.fs_hz if self.session.source else 0.0,
-                  "continues": os.path.basename(old.path),
-                  "rolled_over_because": f"{what} changed"},
-            samples_per_row=self.session.decim())
+        # The datum is deliberately NOT retaken here. The encoder stream is
+        # not reset by a calibration change, so the counts carry straight on;
+        # keeping the original datum is what makes the position columns of the
+        # two files continue each other rather than restart at the same place.
+        self.session.csv_rec = self._new_csv_recorder(
+            path,
+            {"hosts": ",".join(self.session.source.hosts) if self.session.source else "",
+             "stream_rate_hz": self.session.source.fs_hz if self.session.source else 0.0,
+             "continues": os.path.basename(old.path),
+             "rolled_over_because": f"{what} changed"})
         self.session.log(
             f"{what} changed while recording: closed {os.path.basename(old.path)} "
             f"at {rows} rows and started {os.path.basename(path)}, so each file "
@@ -730,6 +759,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # the session, and nothing downstream could tell.
                 enc = self._tick_encoders(blocks[0].shape[0])
                 if enc is not None and len(enc):
+                    self.session.enc_counts_now = np.asarray(enc[-1], float)
                     self.tab_machine.note_encoder_counts(enc)
                 if bd.shape[0] == 0:
                     return
@@ -737,7 +767,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
             if self.session.csv_rec is not None:
                 with self.session.prof.time("  write CSV"):
-                    self.session.csv_rec.write(bd)
+                    # Same rows, same decimation factor, same tick: the counts
+                    # go into the file beside the field they were latched with.
+                    self.session.csv_rec.write(bd, enc)
 
             # A volume sweep logs from here rather than owning the carriers, so
             # the live plot and any recording carry on through it. `logging` is
@@ -948,13 +980,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             if self.tab_export.csv_enabled():
                 p = orec.default_name("octobee", "csv", self.session.out_dir)
-                self.session.csv_rec = orec.CsvRecorder(
-                    p, self.session.out_rate, self.session.cal, self.session.geom,
-                    tube_frame=self.tab_export.tube_frame(),
-                    meta={"hosts": ",".join(self.session.source.hosts),
-                          "stream_rate_hz": self.session.source.fs_hz},
-                    samples_per_row=self.session.decim())
+                self.session.enc_datum = self._encoder_datum()
+                self.session.csv_rec = self._new_csv_recorder(
+                    p, {"hosts": ",".join(self.session.source.hosts),
+                        "stream_rate_hz": self.session.source.fs_hz})
                 self.session.log(f"recording CSV to {p} at {self.session.out_rate:g} Hz")
+                self._log_encoder_columns()
             if self.tab_export.raw_enabled():
                 p = orec.default_name("octobee", "bin", self.session.out_dir)
                 self.session.raw_rec = orec.RawRecorder(
@@ -967,6 +998,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.act_record.setChecked(False)
         else:
             saved = []
+            csv_rec = self.session.csv_rec
+            if (csv_rec is not None and csv_rec.enc_columns
+                    and csv_rec.n_unpaired):
+                # Not fatal and not silent: the field in those rows is good,
+                # but their position columns are empty, and that is worth
+                # knowing before the file is handed to someone.
+                self.session.log(
+                    f"WARNING: {csv_rec.n_unpaired} of {csv_rec.n_rows} rows "
+                    f"were written with no encoder counts against them -- "
+                    f"their position columns are blank")
             for rec, kind in ((self.session.csv_rec, "CSV"), (self.session.raw_rec, "raw")):
                 if rec is not None:
                     p = rec.close()
@@ -978,6 +1019,70 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tab_export.set_recording_text("")
             self._report_saved(saved)
         self._refresh_record_dot()
+
+    def _encoder_datum(self):
+        """Pair the counts arriving now with the controllers, axis by axis.
+
+        Returns {axis: (counts, mm)} for every calibrated axis that can be
+        anchored, which makes that axis's column in the CSV an absolute
+        position; an axis left out gets travel from the first row instead, and
+        the column name says so.
+
+        Taken once, here, and standing still is not guaranteed -- Record can be
+        pressed with the rig moving. That is not a reason to refuse a datum:
+        the error it costs is the USB latency on one controller read, tens of
+        milliseconds of motion, which is a common offset on that axis and not
+        a per-sample one. Every sample after it is still spaced by counts.
+
+        An axis whose counter is not trusted is skipped rather than used. The
+        controller will answer position_mm regardless -- steps lost to a stall
+        or an immediate stop leave the homed bit set and the number wrong --
+        and anchoring to that produces a column that is confidently somewhere
+        the head never was.
+        """
+        counts = self.session.enc_counts_now
+        stages = self.session.stages
+        if counts is None or not self.session.encoders or stages is None:
+            return {}
+        out = {}
+        for axis, spec in self.session.encoders.axes.items():
+            st = stages.axes.get(axis)
+            if st is None or spec["column"] >= len(counts):
+                continue
+            try:
+                if not st.position_trusted:
+                    continue
+                out[axis] = (float(counts[spec["column"]]),
+                             float(st.position_mm))
+            except Exception as e:      # a controller that has gone away
+                self.session.log(f"no encoder datum for {axis}: {e}")
+        return out
+
+    def _log_encoder_columns(self):
+        """Say what the position columns in the new file mean, at open."""
+        rec = self.session.csv_rec
+        if rec is None or not rec.enc_columns:
+            return
+        # Both taken from the columns the file actually has, not from what was
+        # asked for: a datum for an axis whose column is not in the stream
+        # produces no column, and saying otherwise here would be the one place
+        # the operator was told about it.
+        absolute = [a for a in rec.enc_axes if a in rec.enc_datum]
+        relative = [a for a in rec.enc_axes if a not in rec.enc_datum]
+        parts = [f"{rec.enc_columns} encoder count column(s)"]
+        if absolute:
+            names = "/".join(a.upper() for a in absolute)
+            parts.append(f"absolute {names}_mm anchored to the controllers")
+        if relative:
+            parts.append(f"{'/'.join(a.upper() for a in relative)}_rel_mm as "
+                         f"travel from the first row (no trusted controller "
+                         f"position to anchor to -- home the stages before "
+                         f"recording if you want absolute)")
+        if not rec.enc_axes:
+            parts.append("no counts/mm scale fitted, so counts only -- run "
+                         "the encoder calibration on the Machine tab for "
+                         "millimetres")
+        self.session.log("recording position: " + "; ".join(parts))
 
     def _refresh_record_dot(self):
         """A red dot on the Record button while a file is actually open.

@@ -38,6 +38,12 @@ from octobee.motion import stage as ostage
 
 
 class StagesTab(QtWidgets.QWidget):
+    # The stages have been opened or closed. Anything outside this tab whose
+    # controls depend on there being stages listens for this rather than
+    # sampling session.stages at build time -- which is always None, because
+    # the UI is built before anything is connected.
+    stages_changed = QtCore.pyqtSignal()
+
     def __init__(self, session, motion, stage_mm, set_status,
                  stop_recording, set_snapshot_enabled, parent=None):
         """Thorlabs LTS300C control and motorised field mapping.
@@ -444,6 +450,7 @@ class StagesTab(QtWidgets.QWidget):
         for ax in self.stage_rows:
             self.jog_pane.set_present(ax, False)
         self.session.log("stages: closed")
+        self.stages_changed.emit()
 
     def stage_action(self, what, fn):
         """Run one blocking stage command in a worker, one at a time."""
@@ -518,6 +525,7 @@ class StagesTab(QtWidgets.QWidget):
             self.session.log(f"stages: connected — {vel:.3g} mm/s, "
                          f"{acc:.3g} mm/s² profile")
             self._report_stage_envelope()
+            self.stages_changed.emit()
             # Deferred: this opens a modal, and doing that from inside a
             # worker's completion signal blocks the thread's own teardown.
             QtCore.QTimer.singleShot(0, self._prompt_home_if_needed)
