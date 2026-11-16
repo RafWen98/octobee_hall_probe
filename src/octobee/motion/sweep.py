@@ -412,6 +412,28 @@ class Aborted(RuntimeError):
 # accurate and leaves the interpolation nothing to invent.
 POLL_S = 0.02
 
+# How long to let the controller admit it has started moving before giving up
+# on ever seeing it, seconds.
+#
+# Stage.moving reads ISC_GetStatusBits, which does NOT go to the wire -- it
+# returns the Kinesis DLL's cached copy, refreshed by its own polling thread
+# every 100 ms (ISC_StartPolling(serial, 100) in Stage.open). So for up to
+# 100 ms after a move is commanded the status still reads "not moving", left
+# over from before the command.
+#
+# Waiting for the move to STOP without first watching it START therefore ends
+# the line on the first poll, POLL_S = 20 ms in, while the carriage is still
+# accelerating -- and since the logging window is exactly that loop, the whole
+# 250 mm sweep then happens with nothing recording. It does not look like a
+# failure: every line "completes", no error is raised, and the map comes back
+# with a handful of rows out of two million. Measured 2026-09-24: 262 lines
+# swept in 14 minutes instead of 5.6 hours, 5 rows logged.
+#
+# 5x the DLL's own 100 ms cache period, so a slow status refresh cannot end a
+# line early. A move that genuinely never starts costs this much and then
+# falls through to the loop below, which is the behaviour without it.
+MOVE_START_S = 0.5
+
 
 class SweepRunner:
     """Drives the stages through a SweepPlan. Blocking; run it in a thread.
@@ -540,9 +562,23 @@ class SweepRunner:
                 self.logging = True
                 try:
                     st.move_to(line.to_mm, wait=False)
+                    # Watch it start before waiting for it to stop. The status
+                    # bit is up to 100 ms stale (see MOVE_START_S), so a loop
+                    # that only waits for "stopped" reads the pre-move value
+                    # and closes this line's logging window 20 ms in, with the
+                    # sweep still to come. Poll throughout, so the position
+                    # record covers the run-up rather than starting late.
+                    began = time.monotonic() + MOVE_START_S
+                    while not st.moving and time.monotonic() < began:
+                        self._poll(i)
+                        if should_abort and should_abort():
+                            self.aborted = True
+                            st.stop()
+                            break
+                        time.sleep(POLL_S)
                     deadline = time.monotonic() + otim.move_timeout_s(
                         line.to_mm - line.from_mm, speed, accel)
-                    while True:
+                    while not self.aborted:
                         self._poll(i)
                         if not st.moving:
                             break
