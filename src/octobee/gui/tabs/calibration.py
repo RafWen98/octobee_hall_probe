@@ -24,7 +24,6 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from octobee.calib import convert as ocal
 from octobee.calib import geometry as pgeom
-from octobee.acq import carrier as ob
 from octobee.calib import roll as opc
 from octobee.gui.constants import N_SENSORS
 from octobee.gui.dialogs.magnet import MagnetWizard
@@ -531,7 +530,8 @@ class CalibrationTab(QtWidgets.QWidget):
             if r != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
         try:
-            self.session.cal.apply_pose_solution(sol)
+            for line in self.session.cal.apply_pose_solution(sol):
+                self.session.log(f"roll calibration: {line}")
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Apply roll calibration", str(e))
             return
@@ -633,7 +633,9 @@ class CalibrationTab(QtWidgets.QWidget):
         if self.chk_geom.isChecked():
             pt = (self.spin_mx.value(), self.spin_my.value(), self.spin_mz.value())
             w = self.session.geom.expected_response(pt, self.spin_exp.value())
-        _corr, skipped = self.session.cal.cross_calibrate(self.session.magnet_peaks, weights=w)
+        _corr, skipped = self.session.cal.cross_calibrate(
+            self.session.magnet_peaks, weights=w,
+            live=self.session.cal.live_mask())
         note = (f"kept their previous trim (no usable response): "
                 f"{', '.join(skipped)}") if skipped else "every live sensor trimmed"
         self.session.log(f"gain trim applied using "
@@ -690,9 +692,9 @@ class CalibrationTab(QtWidgets.QWidget):
             # does not signal).
             self._set_ranges(self.session.cal.ranges_mt)
             return
-        self.session.cal.ranges_mt[row] = value
-        self.session.log(f"S{row+1} range set to +/-{value:g} mT "
-                     f"({ob.RANGE_TO_VPT[value]:g} V/T)")
+        # Through set_range, not by writing ranges_mt: the zero, trim and
+        # matrix were measured at the old range and do not carry over.
+        self.session.log(self.session.cal.set_range(row + 1, value))
         self.calibration_changed.emit(f"the S{row+1} range")
         self.refresh_cal_report()
 

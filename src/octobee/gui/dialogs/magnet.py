@@ -1123,7 +1123,15 @@ class MagnetWizard(QtWidgets.QDialog):
 
         if self.chk_apply.isChecked():
             resp, _best = self.run.response(use_dither=use_dither)
-            _corr, skipped = win.session.cal.cross_calibrate(resp)
+            _corr, skipped = win.session.cal.cross_calibrate(
+                resp, live=win.session.cal.live_mask())
+            # Which passes went in, written down where apply_run looks:
+            # re-deriving from this run later has to divide out THIS trim,
+            # and without the record the command line must be told.
+            win.session.cal.gain_source = {
+                "use_dither": bool(use_dither),
+                "run": os.path.basename(path),
+                "excluded": sorted(win.session.cal.dead)}
             note = (f"kept their previous trim: {', '.join(skipped)}"
                     if skipped else "every live sensor trimmed")
             passes = ["axial"]

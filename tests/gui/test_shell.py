@@ -144,7 +144,14 @@ def test_a_failed_stream_stops_the_recording(app, workdir):
         src.read = lambda: None                  # the stream has gone quiet
         win.on_tick()
         check("a recording survives a short gap", win.session.csv_rec is not None)
-        win._last_rows_t -= win.STALL_S + 1
+        # The window itself busy for longer than the limit is not the stream
+        # stalling: one late tick may add no more than STALL_TICK_S.
+        win._last_tick_t -= win.STALL_S + 1
+        win.on_tick()
+        check("and survives this window being busy for longer than the limit",
+              win.session.csv_rec is not None, f"{win._quiet_s:.1f} s counted")
+        # Quiet tick after quiet tick is, and those add up.
+        win._quiet_s = win.STALL_S
         win.on_tick()
         check("but is stopped after the stall limit, with an alarm",
               win.session.csv_rec is None and "no data" in _log(win)

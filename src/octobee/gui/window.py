@@ -102,7 +102,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # raising: a source that reports an error, and one that simply goes
         # quiet. See on_tick.
         self._stream_errors_seen = set()
-        self._last_rows_t = time.monotonic()
+        self._quiet_s = 0.0
+        self._last_tick_t = time.monotonic()
         # The dead set is two things that used to be one: what a person (or
         # calibration.json) said was dead, which only a person changes, and
         # what the health scan thinks, which comes and goes. cal.dead is their
@@ -682,7 +683,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_source(self, source, kind):
         self.session.source = source
         self._stream_errors_seen = set()
-        self._last_rows_t = time.monotonic()
+        self._quiet_s = 0.0
         self.status.clearMessage()
         # A tare or magnet pass started on the old stream would otherwise
         # finish on this one, averaging two connections into one zero.
@@ -896,14 +897,22 @@ class MainWindow(QtWidgets.QMainWindow):
             if not blocks or blocks[0].shape[0] == 0:
                 self._watch_stall()
                 return
-            self._last_rows_t = time.monotonic()
+            self._quiet_s = 0.0
+            self._last_tick_t = time.monotonic()
             self.session.prof.note("samples per acquisition tick", blocks[0].shape[0])
 
             with self.session.prof.time("  keep raw history"):
                 self._keep_raw(blocks)
             if self.session.raw_rec is not None:
                 with self.session.prof.time("  write raw file"):
-                    self.session.raw_rec.write(blocks)
+                    # The index and the encoder words go in beside the
+                    # counts, so the archive can be re-aligned offline: the
+                    # .bin alone cannot say where a box's counter jumped.
+                    # Demo and replay sources have neither.
+                    src = self.session.source
+                    self.session.raw_rec.write(
+                        blocks, index=getattr(src, "block_index", None),
+                        enc=getattr(src, "enc", None))
 
             with self.session.prof.time("  counts -> tesla"):
                 grouped = ocal.assemble(blocks, self.session.source.vpc,
@@ -928,7 +937,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 with self.session.prof.time("  write CSV"):
                     # Same rows, same decimation factor, same tick: the counts
                     # go into the file beside the field they were latched with.
-                    self.session.csv_rec.write(bd, enc)
+                    # The stream's loss counters ride along, so the file
+                    # can say at close what went missing while it was open.
+                    self.session.csv_rec.write(
+                        bd, enc, stream=self.session.source.stats())
 
             # A volume sweep logs from here rather than owning the carriers, so
             # the live plot and any recording carry on through it. `logging` is
@@ -956,6 +968,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # Long enough to ride out a slow block at 20 kSPS, short enough that a dead
     # stream does not run all night under a "REC" that looks healthy.
     STALL_S = 5.0
+    # The most one tick may add to the quiet time; see _watch_stall.
+    STALL_TICK_S = 1.0
 
     def _watch_source(self):
         """Log a stream error once, and stop a recording it has made untrustworthy.
@@ -982,11 +996,22 @@ class MainWindow(QtWidgets.QMainWindow):
             f"the stream reported an error ({err or 'source failed'})")
 
     def _watch_stall(self):
-        """Stop a recording that has had no rows for STALL_S seconds."""
+        """Stop a recording that has had no rows for STALL_S seconds.
+
+        The quiet time is added up tick by tick, and no single tick may add
+        more than STALL_TICK_S. Measured as "now minus the last rows" it also
+        counted time this window spent busy -- planning a volume, waiting on a
+        slow disk -- so the first empty tick after five such seconds stopped a
+        recording whose stream had never faltered. A stream that really has
+        stopped is seen by tick after tick, and those add up just the same.
+        """
+        now = time.monotonic()
+        step, self._last_tick_t = now - self._last_tick_t, now
         if self.session.csv_rec is None and self.session.raw_rec is None:
-            self._last_rows_t = time.monotonic()
+            self._quiet_s = 0.0
             return
-        quiet = time.monotonic() - self._last_rows_t
+        self._quiet_s += min(step, self.STALL_TICK_S)
+        quiet = self._quiet_s
         if quiet >= self.STALL_S:
             self._stop_recording_with_alarm(
                 f"no data has arrived for {quiet:.0f} s")
@@ -1244,7 +1269,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"excluding {', '.join(sorted(added))}: "
                 + "; ".join(f"{k} {v[1]}" for k, v in
                             ocal.health_verdict(rows).items()
-                            if v[0] == "dead"))
+                            if f"S{k}" in added))
         if dropped:
             self.session.log(f"re-including {', '.join(sorted(dropped))}: "
                              f"healthy on two scans in a row")
@@ -1261,7 +1286,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             # A fresh recording starts a fresh stall clock, and clears the
             # alarm that the last one may have left on the status bar.
-            self._last_rows_t = time.monotonic()
+            self._quiet_s = 0.0
             self.status.clearMessage()
             if self.tab_export.csv_enabled():
                 p = orec.default_name("octobee", "csv", self.session.out_dir)
