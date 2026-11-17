@@ -173,6 +173,7 @@ from octobee.motion.kinesis import (
     MOTION_ERROR_BIT,
     MOVING_MASK,
     STATUS_BITS,
+    MoveAborted,
     TLI_HardwareInformation,
     UNIT_ACCELERATION,
     UNIT_DISTANCE,
@@ -463,8 +464,18 @@ class Stage:
         d.ISC_GetHardwareInfoBlock(self._sb, C.byref(hw))
         self.model = hw.modelNumber.decode(errors="replace").strip()
         lo, hi = C.c_double(), C.c_double()
-        if d.ISC_GetMotorTravelLimits(self._sb, C.byref(lo), C.byref(hi)) == 0:
-            self.travel_dev_mm = (lo.value, hi.value)
+        rc = d.ISC_GetMotorTravelLimits(self._sb, C.byref(lo), C.byref(hi))
+        if rc != 0:
+            # Carrying on leaves the travel at (0, 0), and with no limit_mm
+            # configured that switches the soft-limit check in move_to off
+            # altogether (it only applies when hi > lo) and puts an inverted
+            # axis's origin at zero. An axis that cannot say how far it can go
+            # is not one to move.
+            raise StageError(
+                f"{self.name}: could not read the travel limits from the "
+                f"controller (Kinesis error {rc}). Without them there are no "
+                f"soft limits -- reconnect it rather than moving it.")
+        self.travel_dev_mm = (lo.value, hi.value)
         # Derive du/mm from the device rather than trusting the constant, so a
         # different stage model on the same prefix cannot silently mis-scale.
         one_mm = C.c_int()
@@ -926,8 +937,11 @@ class Stage:
                 return 180.0
         return move_timeout_s(distance_mm, vel, acc)
 
-    def move_to(self, mm, timeout_s=None, wait=True):
-        """Absolute move to RIG millimetres, against the soft limits."""
+    def move_to(self, mm, timeout_s=None, wait=True, should_abort=None):
+        """Absolute move to RIG millimetres, against the soft limits.
+
+        `should_abort` is polled while waiting; see wait().
+        """
         self._require_open()
         self.interlock.require_clear(f"move {self.name} to {mm:g} mm")
         lo, hi = self.limit_mm
@@ -954,9 +968,26 @@ class Stage:
         here = self.position_mm if wait else None
         _check(d.ISC_MoveToPosition(self._sb, self._to_du(dev)),
                f"move {self.name} to {mm:g} mm")
+        self._stop_if_tripped(f"move {self.name} to {mm:g} mm")
         if wait:
             self.wait(timeout_s=self._timeout_for(mm - here, timeout_s),
-                      what=f"move to {mm:g} mm")
+                      what=f"move to {mm:g} mm", should_abort=should_abort)
+
+    def _stop_if_tripped(self, what):
+        """An emergency stop that arrived while a move was being issued.
+
+        The interlock is checked at the top of every mover, but several DLL
+        calls sit between that check and the one that starts the motion. A
+        stop landing in that gap halted nothing -- nothing was moving yet --
+        and the move then went out on top of it, on a machine everybody
+        believed was latched off. So look again once the move is issued, and
+        take it back.
+        """
+        if not self.interlock.tripped:
+            return
+        with contextlib.suppress(Exception):
+            self.stop(immediate=True)
+        self.interlock.require_clear(what)
 
     def move_by(self, delta_mm, timeout_s=None, wait=True):
         """Relative move, millimetres.
@@ -986,6 +1017,7 @@ class Stage:
         # to travel the other way to produce it.
         _check(d.ISC_MoveRelative(self._sb, self._to_du(self._sign * delta_mm)),
                f"move {self.name} by {delta_mm:g} mm")
+        self._stop_if_tripped(f"jog {self.name} by {delta_mm:+g} mm")
         if wait:
             self.wait(timeout_s=self._timeout_for(delta_mm, timeout_s),
                       what=f"move by {delta_mm:g} mm")
@@ -1035,31 +1067,54 @@ class Stage:
 
         Returns "" on success or the error text, for the caller to log.
         """
+        error = self._halt_now(reason)
+        return error or self._record_halt()
+
+    def _halt_now(self, reason):
+        """The half of an emergency stop that stops. No disk, never raises.
+
+        Split from _record_halt() so StageSet.emergency_stop can tell EVERY
+        axis to stop before any of them writes its ledger. Done per axis, the
+        first axis's file write -- a temp file, a flush and a rename, tens of
+        milliseconds on a good day and far more with a virus scanner looking
+        on -- sat between the button and the second axis's stop.
+        """
         self.interlock.trip(reason)
         if not self.is_open:
             return ""
         try:
-            # persist=False, then the write below: see stop(). A file system
-            # that has gone slow must not be able to get between the button
-            # and ISC_StopImmediate.
             self.distrust(f"{self.name} was stopped by an emergency stop "
                           f"({reason}), which can lose steps", persist=False)
-            try:
-                _check(dll().ISC_StopImmediate(self._sb), f"stop {self.name}")
-            finally:
-                self._remember(force=True)
+            _check(dll().ISC_StopImmediate(self._sb), f"stop {self.name}")
             return ""
         except Exception as exc:
             # Deliberately broad -- see point 2 above. Whatever went wrong
             # here, the remaining axes still have to be told to stop.
             return f"{self.name}: {type(exc).__name__}: {exc}"
 
-    def wait(self, timeout_s=180.0, what="move", settle_s=0.0):
+    def _record_halt(self):
+        """The half that writes down that the position is no longer trusted."""
+        if not self.is_open:
+            return ""
+        try:
+            self._remember(force=True)
+            return ""
+        except Exception as exc:
+            return f"{self.name}: {type(exc).__name__}: {exc}"
+
+    def wait(self, timeout_s=180.0, what="move", settle_s=0.0,
+             should_abort=None):
         """Block until motion stops.
 
         Polls the status word rather than draining the message queue: the queue
         needs every message consumed in order and one missed event hangs
         forever, whereas the status word is level-triggered and self-correcting.
+
+        `should_abort` is a callable polled every pass. When it returns true
+        the axis is stopped on its ramp, waited for, and MoveAborted is raised
+        -- so "abort" works during a long positioning move, which used to run
+        to its end (the best part of a minute across the travel) before
+        anybody looked.
         """
         if timeout_s is None:
             # Everywhere else in this class None means "work it out from the
@@ -1078,6 +1133,7 @@ class Stage:
         # taken too early sees "not moving" and returns before the axis has
         # started. Give it one poll interval to get going.
         time.sleep(max(self.poll_ms, 50) / 1000.0 * 2)
+        aborted = halted = False
         while True:
             bits = self.status
             if bits & MOTION_ERROR_BIT:
@@ -1087,12 +1143,26 @@ class Stage:
                 raise StageError(f"{self.name}: motion error during {what}")
             if not bits & MOVING_MASK:
                 break
+            if self.interlock.tripped and not halted:
+                # Latched, and this axis is still travelling: the stop that
+                # tripped it either missed this axis or lost a race with the
+                # move (see _stop_if_tripped). Checked while it moves, not
+                # only once it has stopped by itself minutes later.
+                halted = True
+                with contextlib.suppress(Exception):
+                    self.stop(immediate=True)
             if time.monotonic() > deadline:
-                self.stop()
+                # Distrust first. stop() raises if the controller refuses it,
+                # and an axis that has both stalled and will not take a stop
+                # is the last one that should keep its trust.
                 self.distrust(f"{self.name} timed out during {what}, so it may "
                               f"have stalled rather than arrived")
+                self.stop()
                 raise StageError(
                     f"{self.name}: {what} did not finish within {timeout_s:g} s")
+            if should_abort and not aborted and should_abort():
+                aborted = True
+                self.stop()
             time.sleep(0.02)
         # Motion ending is not the same as the move having been carried out.
         # An emergency stop ends it too, and the caller -- a raster loop, a
@@ -1100,6 +1170,11 @@ class Stage:
         # position and command the next move as if nothing had happened. This
         # is the check that turns a stop into a stop.
         self.interlock.require_clear(f"{self.name}: {what}")
+        if aborted:
+            # Stopped on its ramp and watched to a standstill, so the count is
+            # as good as after any other move.
+            self._remember()
+            raise MoveAborted(f"{self.name}: {what} was aborted")
         # Homing is excluded because homing ends ON the limit switch, which
         # is the whole point of it. But an ordinary move that finishes against
         # a hard stop did not arrive, it collided, and the count is a guess
@@ -1310,12 +1385,16 @@ class StageSet:
             if progress:
                 progress(name, st.position_mm)
 
-    def move_to(self, timeout_s=None, settle_s=0.0, **coords):
+    def move_to(self, timeout_s=None, settle_s=0.0, should_abort=None,
+                **coords):
         """move_to(x=10, y=20) -- start all named axes, then wait for all.
 
         Simultaneous rather than sequential: for a raster this roughly halves
         the dead time between captures, and the axes cannot foul each other
         (they are stacked, not sharing a workspace).
+
+        `should_abort` is polled while waiting; when it returns true every
+        axis is stopped on its ramp and MoveAborted is raised.
         """
         unknown = set(coords) - set(self.axes)
         if unknown:
@@ -1359,8 +1438,26 @@ class StageSet:
                 with contextlib.suppress(Exception):
                     st.stop()
             raise
-        for st, wait_s in moving:
-            st.wait(timeout_s=wait_s, what="move")
+        # Passed only when there is one, so an axis-like object that predates
+        # the argument (the guided-calibration fakes, a subclass) still works.
+        extra = {"should_abort": should_abort} if should_abort else {}
+        try:
+            for st, wait_s in moving:
+                st.wait(timeout_s=wait_s, what="move", **extra)
+        except Exception as exc:
+            # One axis timing out, faulting or being aborted says nothing
+            # about the others, which are still travelling -- and nothing was
+            # going to wait for them. Stop them all; after an abort, also see
+            # them to a standstill, so the caller gets back a machine that is
+            # not moving.
+            for st, _ in moving:
+                with contextlib.suppress(Exception):
+                    st.stop()
+            if isinstance(exc, MoveAborted):
+                for st, _ in moving:
+                    with contextlib.suppress(Exception):
+                        st.wait(timeout_s=10.0, what="stop")
+            raise
         if settle_s:
             # One settle for the whole group, after the last axis stops. The
             # stages ring mechanically after a move and the probe is on the end
@@ -1395,7 +1492,11 @@ class StageSet:
         a mushroom head in series with the motor supply, and nothing in
         software replaces it -- see EMERGENCY STOP in the module docstring.
         """
-        errors = [st.emergency_stop(reason) for st in self.axes.values()]
+        # Every axis is told to stop before any of them records it: see
+        # Stage._halt_now. The order of this list is the order of the stops.
+        axes = list(self.axes.values())
+        errors = [st._halt_now(reason) for st in axes]
+        errors += [st._record_halt() for st in axes]
         # Trip even with no axes open, so the latch is set for whatever opens
         # next rather than only for what happened to be connected.
         self.interlock.trip(reason)

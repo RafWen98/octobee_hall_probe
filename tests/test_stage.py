@@ -1,5 +1,6 @@
 """The Thorlabs stages -- binding, framing and safety."""
 
+import contextlib
 import inspect
 import json
 import os
@@ -546,3 +547,139 @@ def test_stage_position_ledger(workdir):
     check("a ledger that cannot be written does not raise", not raised)
     check("and the failure is kept rather than dropped",
           bool(st.ledger_error), st.ledger_error or "nothing was recorded")
+
+
+class _FakeKinesis:
+    """Just enough of the Kinesis DLL to drive Stage.wait and the stops.
+
+    An axis is "moving" from the moment it is in `moving` until something
+    stops it, or until its status has been read `runs_for` times.
+    """
+
+    def __init__(self, runs_for=10**9):
+        self.moving = set()
+        self.calls = []
+        self.reads = {}
+        self.runs_for = runs_for
+
+    def ISC_GetStatusBits(self, sb):
+        self.reads[sb] = self.reads.get(sb, 0) + 1
+        if self.reads[sb] > self.runs_for:
+            self.moving.discard(sb)
+        return ostage.MOVING_MASK if sb in self.moving else 0
+
+    def ISC_StopProfiled(self, sb):
+        self.calls.append(("profiled", sb))
+        self.moving.discard(sb)
+        return 0
+
+    def ISC_StopImmediate(self, sb):
+        self.calls.append(("immediate", sb))
+        self.moving.discard(sb)
+        return 0
+
+
+def _wired(monkeypatch, fake, *names):
+    """Open-looking stages on a fake DLL, with the ledger write recorded."""
+    monkeypatch.setattr(ostage, "dll", lambda: fake)
+    out = []
+    for name in names:
+        st = _framed(name, False)
+        st.is_open = True
+        st._sb = name.encode()
+        st._remember = (lambda force=False, n=name:
+                        fake.calls.append(("ledger", n.encode())))
+        out.append(st)
+    return out
+
+
+def test_wait_can_be_aborted_and_watches_the_interlock(monkeypatch):
+    """What Stage.wait does while the axis is still travelling.
+
+    It used to look at nothing but the moving bit until the move ended: an
+    abort was noticed after the positioning move had run its whole length, and
+    an emergency stop that lost the race with a move being issued left that
+    move running on a latched machine.
+    """
+    print("\nwaiting on a move that should not finish")
+    fake = _FakeKinesis()
+    (x,) = _wired(monkeypatch, fake, "x")
+
+    fake.moving.add(b"x")
+    asked = []
+    try:
+        x.wait(timeout_s=30.0, should_abort=lambda: asked.append(1) or True)
+        raised = None
+    except ostage.MoveAborted as exc:
+        raised = exc
+    check("an abort during a move raises MoveAborted", raised is not None)
+    check("and stops the axis on its ramp, once",
+          fake.calls.count(("profiled", b"x")) == 1
+          and ("immediate", b"x") not in fake.calls, str(fake.calls))
+    check("leaving the position trusted and recorded",
+          ("ledger", b"x") in fake.calls)
+    check("MoveAborted is a StageError, for callers that catch those",
+          issubclass(ostage.MoveAborted, ostage.StageError))
+
+    # An emergency stop that landed before the move went out: latched, and
+    # the axis moving anyway.
+    fake.calls.clear()
+    fake.moving.add(b"x")
+    x.interlock.trip("pressed while the move was being issued")
+    try:
+        x.wait(timeout_s=30.0)
+        raised = None
+    except ostage.MotionInterlocked as exc:
+        raised = exc
+    check("a latched interlock stops an axis that is still moving",
+          ("immediate", b"x") in fake.calls, str(fake.calls))
+    check("and the wait reports the interlock, not an arrival",
+          raised is not None)
+    x.interlock.reset()
+
+    # A timeout distrusts BEFORE it stops, so a stop that raises cannot leave
+    # a stalled axis trusted.
+    fake.calls.clear()
+    fake.moving.add(b"x")
+    x._trusted = True
+
+    def refuse(sb):
+        fake.calls.append(("profiled", sb))
+        return 1
+
+    fake.ISC_StopProfiled = refuse
+    with contextlib.suppress(ostage.StageError):
+        x.wait(timeout_s=0.0)
+    check("an axis that times out and refuses its stop is still distrusted",
+          not x.position_trusted, x.distrust_reason)
+
+
+def test_group_moves_leave_nothing_running(monkeypatch):
+    """One axis of a group failing must not leave the others travelling."""
+    print("\ngroup moves that fail part way")
+    fake = _FakeKinesis()
+    x, y = _wired(monkeypatch, fake, "x", "y")
+    ss = ostage.StageSet({"x": x, "y": y})
+    for st in (x, y):
+        st.move_to = (lambda mm, wait=True, s=st:
+                      fake.moving.add(s._sb))
+    # The position is only read to size the wait; there is no counter to ask.
+    monkeypatch.setattr(ostage.Stage, "position_mm", property(lambda self: 0.0))
+    try:
+        ss.move_to(x=10.0, y=10.0, should_abort=lambda: True)
+        raised = None
+    except ostage.MoveAborted as exc:
+        raised = exc
+    check("an abort during a group move raises", raised is not None)
+    check("and every axis of the group is stopped, not only the first",
+          ("profiled", b"x") in fake.calls and ("profiled", b"y") in fake.calls
+          and not fake.moving, f"{fake.calls}, still moving {fake.moving}")
+
+    # The emergency stop: every axis is told to stop before any of them
+    # touches the disk.
+    fake.calls.clear()
+    ss.emergency_stop("test")
+    kinds = [k for k, _ in fake.calls]
+    check("an emergency stop halts every axis before writing anything down",
+          kinds == ["immediate", "immediate", "ledger", "ledger"], str(kinds))
+    check("and still latches", ss.interlock.tripped == "test")

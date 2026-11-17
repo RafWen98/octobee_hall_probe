@@ -69,16 +69,19 @@ in the sidecar says, per axis, which it was. Nothing is thrown away: the raw
 counts and the raw polls are both stored, so either can be redone.
 """
 
+import contextlib
 import json
 import math
 import os
 import time
+from collections import deque
 
 import numpy as np
 
 from octobee.calib import geometry as pgeom
 from octobee.motion import encoder as oenc
 from octobee.motion import timing as otim
+from octobee.motion.kinesis import MoveAborted, StageError
 
 AXES = ("x", "y", "z")
 
@@ -192,8 +195,12 @@ class SweepLine:
     """
 
     def __init__(self, sweep, start_mm, stop_mm, fixed, run_in_mm=0.0,
-                 run_out_mm=0.0, part="box"):
+                 run_out_mm=0.0, part="box", via=()):
         self.sweep = sweep
+        # Where to go, in order, on the way to this line's start: full
+        # {axis: mm} positions. Empty when the straight move there is clear --
+        # see route().
+        self.via = [dict(p) for p in via]
         # "box" for the filled box or its six faces, "slice" for a plane
         # inside it. Stored per line so a tool reading the map back never has
         # to guess from the positions which lines are boundary and which are
@@ -223,11 +230,15 @@ class SweepLine:
         """The full coordinate dict for the start of this line."""
         return {**self.fixed, self.sweep: self.from_mm}
 
+    def leave(self):
+        """The full coordinate dict for where this line ends."""
+        return {**self.fixed, self.sweep: self.to_mm}
+
     def to_dict(self):
         return {"sweep": self.sweep, "start_mm": self.start_mm,
                 "stop_mm": self.stop_mm, "fixed": dict(self.fixed),
                 "run_in_mm": self.run_in_mm, "run_out_mm": self.run_out_mm,
-                "part": self.part}
+                "part": self.part, "via": [dict(p) for p in self.via]}
 
 
 class SweepPlan:
@@ -235,8 +246,15 @@ class SweepPlan:
 
     def __init__(self, volume, lines, speed_mm_s=DEFAULT_SPEED_MM_S,
                  log_hz=DEFAULT_LOG_HZ, settle_s=DEFAULT_SETTLE_S,
-                 skipped=0, note="", slices=None):
+                 skipped=0, note="", slices=None,
+                 accel_mm_s2=otim.DEFAULT_ACCEL_MM_S2, reachable=None):
         self.volume = volume
+        self.accel_mm_s2 = float(accel_mm_s2)
+        # The grid the lines were cut on, kept so the one move that cannot be
+        # planned in advance -- from wherever the head is parked to the first
+        # line -- can be checked against it when the sweep starts. Not saved:
+        # it is megabytes, and the lines and their `via` points are its result.
+        self.reachable = reachable
         self.slices = dict(slices) if slices else None
         self.lines = list(lines)
         self.speed_mm_s = float(speed_mm_s)
@@ -252,7 +270,44 @@ class SweepPlan:
     def swept_mm(self):
         return float(sum(ln.span_mm for ln in self.lines))
 
-    def duration_s(self, accel_mm_s2=20.0):
+    def entry(self, position_mm):
+        """How to get from where the head is to the first line.
+
+        Returns (waypoints, warning). The waypoints are full {axis: mm}
+        positions to visit in order before the first approach; the warning is
+        text to show when the move could not be checked, and "" when it was.
+
+        Every other transit is routed when the plan is made. This one depends
+        on where the rig was left, so it is worked out when the sweep starts.
+        A head parked outside the planned box is outside the grid the coils
+        were tested on: nothing here can say whether the way in is clear, and
+        saying so is better than pretending. Raises ValueError when the head
+        is inside the box and there is no clear way to the first line.
+        """
+        if not self.lines or self.reachable is None:
+            return [], ""
+        vol = self.volume
+        try:
+            here = np.array([float(position_mm[a]) for a in AXES])
+        except (KeyError, TypeError, ValueError):
+            here = np.full(3, np.nan)
+        slack = vol.step_mm / 2.0
+        if not (np.isfinite(here).all()
+                and np.all(here >= vol.lo_mm - slack)
+                and np.all(here <= vol.hi_mm + slack)):
+            return [], ("the head starts outside the planned volume, so the "
+                        "move to the first line is NOT checked against the "
+                        "coils -- park it inside the box, or watch it go")
+        via = route(vol, self.reachable, dict(zip(AXES, here)),
+                    self.lines[0].approach())
+        if via is None:
+            raise ValueError(
+                "there is no clear way from where the head is now to the "
+                "first line of this plan -- the coil is between them. Move "
+                "the head to open space by hand and start again.")
+        return via, ""
+
+    def duration_s(self, accel_mm_s2=None):
         """Roughly how long this takes, in seconds.
 
         The sweeps themselves are exact -- distance over velocity, plus the
@@ -262,7 +317,8 @@ class SweepPlan:
         That is the price of never reversing into a line, and it is included
         here rather than discovered overnight.
         """
-        v, a = otim.clamp_velocity(self.speed_mm_s), float(accel_mm_s2)
+        a = float(self.accel_mm_s2 if accel_mm_s2 is None else accel_mm_s2)
+        v = otim.clamp_velocity(self.speed_mm_s)
         back = otim.clamp_velocity(otim.MAX_VEL_MM_S)
         total = 0.0
         for ln in self.lines:
@@ -285,11 +341,17 @@ class SweepPlan:
                 f"{self.rows():,} rows at {self.log_hz:g} Hz")
         if self.skipped:
             bits += f" -- {self.skipped} line(s) dropped as unreachable"
+        detours = sum(1 for ln in self.lines if ln.via)
+        if detours:
+            bits += (f" -- {detours} move(s) between lines routed round the "
+                     f"coil rather than straight")
         return f"{self.note}: {bits}" if self.note else bits
 
     def to_dict(self):
         return {"volume": self.volume.to_dict(),
                 "speed_mm_s": self.speed_mm_s, "log_hz": self.log_hz,
+                "accel_mm_s2": self.accel_mm_s2,
+                "transits_checked": self.reachable is not None,
                 "settle_s": self.settle_s, "skipped": self.skipped,
                 "note": self.note, "slices": self.slices,
                 "lines": [ln.to_dict() for ln in self.lines]}
@@ -304,6 +366,110 @@ def _runs(mask):
     starts = np.concatenate([[0], breaks + 1])
     stops = np.concatenate([breaks, [len(idx) - 1]])
     return [(int(idx[a]), int(idx[b])) for a, b in zip(starts, stops)]
+
+
+def _node(volume, point_mm):
+    """The grid node nearest a rig position, as (ix, iy, iz), kept on the grid."""
+    return tuple(
+        int(min(max(math.floor((float(point_mm[a]) - volume.lo_mm[i])
+                               / volume.step_mm + 0.5), 0),
+                volume.shape[i] - 1))
+        for i, a in enumerate(AXES))
+
+
+def _grid_path(reachable, start, goal):
+    """Shortest path of face-adjacent reachable nodes, or None if there is none.
+
+    Breadth first over the same grid the lines were cut on. The grid is at
+    most a few hundred thousand nodes and this runs only for the handful of
+    transits whose straight move is blocked, so nothing cleverer is needed.
+    """
+    shape = reachable.shape
+    came = {start: None}
+    todo = deque([start])
+    while todo:
+        at = todo.popleft()
+        if at == goal:
+            path = []
+            while at is not None:
+                path.append(at)
+                at = came[at]
+            return path[::-1]
+        for k in range(3):
+            for d in (-1, 1):
+                nxt = (*at[:k], at[k] + d, *at[k + 1:])
+                if (0 <= nxt[k] < shape[k] and nxt not in came
+                        and reachable[nxt]):
+                    came[nxt] = at
+                    todo.append(nxt)
+    return None
+
+
+def route(volume, reachable, start_mm, end_mm):
+    """How to move between two rig positions without crossing a coil.
+
+    Returns the positions to visit on the way, in order, as full {axis: mm}
+    dicts: [] when the direct move is clear, None when there is no way at all.
+
+    Why this exists. The lines of a plan are cut to the space the probe body
+    fits in, but a sweep is mostly NOT sweeping: after every line the head
+    goes to the start of the next, and that move was never tested against
+    anything. Where a line had been cut in two because it passes behind a
+    winding, the move from the end of the first piece to the start of the
+    second ran along the very stretch that had been cut out -- through the
+    winding. The plan looked right, the preview flew only the swept lines,
+    and the stages would have driven the head into the coil.
+
+    What "clear" means here. A direct move starts every axis at once and each
+    runs its own ramp, so the head does not travel a straight line; it stays
+    inside the box spanned by the two ends. The direct move is therefore
+    allowed only when EVERY node of that box is reachable. Otherwise the way
+    round is found on the grid and returned as its corners, so each leg moves
+    one axis only, along nodes that were each tested.
+
+    The two ends may sit off the grid by a line's run-in or run-out. They are
+    judged by their nearest node, and when a detour is needed it begins and
+    ends on those nodes, so the off-grid part is a move of at most one ramp
+    length along the line's own axis.
+    """
+    if reachable is None:
+        return []
+    a, b = _node(volume, start_mm), _node(volume, end_mm)
+    if not (reachable[a] and reachable[b]):
+        return None
+    box = tuple(slice(min(p, q), max(p, q) + 1) for p, q in zip(a, b))
+    if reachable[box].all():
+        return []
+    path = _grid_path(reachable, a, b)
+    if path is None:
+        return None
+    corners = [path[0]]
+    for before, at, after in zip(path, path[1:], path[2:]):
+        if tuple(np.subtract(at, before)) != tuple(np.subtract(after, at)):
+            corners.append(at)
+    corners.append(path[-1])
+    return [{ax: float(volume.nodes(ax)[i]) for ax, i in zip(AXES, node)}
+            for node in corners]
+
+
+def _route_lines(volume, reachable, lines):
+    """Give every line the way to its start from the end of the one before.
+
+    Returns (lines kept, how many were dropped). A line with no clear way to
+    it is dropped rather than reached through a coil; the next line is then
+    routed from the last one that was kept.
+    """
+    kept, dropped, last = [], 0, None
+    for line in lines:
+        if last is not None:
+            via = route(volume, reachable, last.leave(), line.approach())
+            if via is None:
+                dropped += 1
+                continue
+            line.via = via
+        kept.append(line)
+        last = line
+    return kept, dropped
 
 
 def _face_rasters(volume, shell):
@@ -400,7 +566,8 @@ def _slice_rasters(volume, count, inset_mm, normal):
 
 
 def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
-         log_hz=DEFAULT_LOG_HZ, settle_s=DEFAULT_SETTLE_S, accel_mm_s2=20.0,
+         log_hz=DEFAULT_LOG_HZ, settle_s=DEFAULT_SETTLE_S,
+         accel_mm_s2=otim.DEFAULT_ACCEL_MM_S2,
          travel_mm=None, min_span_mm=None, shell=False, slices=0,
          slice_inset_mm=0.0, slice_normal="y"):
     """Turn a Volume into the lines that will actually be swept.
@@ -412,6 +579,15 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
     between them rather than one line through it. That is what makes the mapped
     region the shape of the space that is actually there, instead of the largest
     box that happens to fit in it.
+
+    The moves BETWEEN lines are held to the same grid: each line carries the
+    way to its start from the end of the one before (see route()), a line
+    with no clear way to it is dropped, and a run-in or run-out is not taken
+    where the node it would run toward is one the probe cannot occupy.
+
+    `accel_mm_s2` must be the acceleration the axes really run at. It sets
+    the run-in and run-out lengths, and too large a value puts the tail of
+    the ramp inside the span that is flagged as measured at constant speed.
 
     `shell` maps the OUTSIDE of the box instead of filling it: the six faces,
     each swept in its own plane. For a field in a current-free region that is
@@ -456,14 +632,14 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
                     continue          # the faces share their edges
                 seen.add(key)
                 if reachable is None:
-                    spans = [(a0, a1)]
+                    spans, clear = [(a0, a1)], None
                 else:
                     sel = [slice(None)] * 3
                     for k, v in idx.items():
                         sel[AXES.index(k)] = v
-                    sel[AXES.index(axis)] = slice(a0, a1 + 1)
+                    clear = reachable[tuple(sel)]      # along the whole axis
                     spans = [(a0 + s0, a0 + s1)
-                             for s0, s1 in _runs(reachable[tuple(sel)])]
+                             for s0, s1 in _runs(clear[a0:a1 + 1])]
                 if not spans:
                     skipped += 1
                     continue
@@ -476,8 +652,19 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
                                   else tuple(float(v) for v in travel_mm[axis]))
                     run_in = max(0.0, min(ramp, start - lo_t))
                     run_out = max(0.0, min(ramp, hi_t - stop))
+                    # No ramp toward a node the probe cannot occupy. A line
+                    # cut short by a winding ends at the last clear node, and
+                    # running on past it is running at the winding.
+                    if clear is not None:
+                        if start_i > 0 and not clear[start_i - 1]:
+                            run_in = 0.0
+                        if stop_i < len(clear) - 1 and not clear[stop_i + 1]:
+                            run_out = 0.0
                     lines.append(SweepLine(axis, start, stop, fixed,
                                            run_in, run_out, part))
+    if reachable is not None:
+        lines, unroutable = _route_lines(volume, reachable, lines)
+        skipped += unroutable
     note = ("the outside of the box" if shell else "the whole box, filled")
     slice_doc = None
     if int(slices) > 0:
@@ -503,7 +690,8 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
     note += (", cut to the space the probe body actually fits in"
              if reachable is not None else ", coils ignored")
     return SweepPlan(volume, lines, speed_mm_s, log_hz, settle_s, skipped, note,
-                     slices=slice_doc)
+                     slices=slice_doc, accel_mm_s2=accel_mm_s2,
+                     reachable=reachable)
 
 
 class Aborted(RuntimeError):
@@ -537,6 +725,12 @@ POLL_S = 0.02
 # line early. A move that genuinely never starts costs this much and then
 # falls through to the loop below, which is the behaviour without it.
 MOVE_START_S = 0.5
+
+# How close to its commanded end a line has to finish to count as swept, mm,
+# and how long to let the controller's cached position catch up before
+# deciding it did not. The cache is the same 100 ms one MOVE_START_S is about.
+ARRIVE_TOL_MM = 0.05
+ARRIVE_WAIT_S = 0.5
 
 
 class SweepRunner:
@@ -575,6 +769,29 @@ class SweepRunner:
         self.counts_now = None
         self.lines_done = 0
         self.aborted = False
+
+    def _go(self, where, should_abort, settle_s=0.0):
+        """A positioning move that an abort can end. True if it arrived."""
+        # Passed only when there is one, so a rig object that predates the
+        # argument still works.
+        extra = {"should_abort": should_abort} if should_abort else {}
+        try:
+            self.stages.move_to(settle_s=settle_s, **extra, **where)
+        except MoveAborted:
+            self.aborted = True
+            return False
+        return True
+
+    def _arrived(self, st, target_mm):
+        """Did the line end where it was sent? (ok, where it is)."""
+        deadline = time.monotonic() + ARRIVE_WAIT_S
+        while True:
+            at = float(st.position_mm)
+            if abs(at - target_mm) <= ARRIVE_TOL_MM:
+                return True, at
+            if time.monotonic() > deadline:
+                return False, at
+            time.sleep(POLL_S)
 
     def _fresh_counts(self, timeout_s=1.0):
         """Wait for a counts reading taken since this moment, or give up.
@@ -631,6 +848,11 @@ class SweepRunner:
         normal = {a: self.stages[a].vel_params for a in AXES
                   if a in self.stages.names}
         speed = otim.clamp_velocity(self.plan.speed_mm_s)
+        # The way in. Worked out before anything moves, so a head with no
+        # clear way to the first line is refused rather than discovered.
+        entry, unchecked = self.plan.entry(self.stages.position())
+        if unchecked:
+            self.log_fn(f"sweep: WARNING -- {unchecked}")
         self.log.start()
         self.log_fn(f"sweep: {self.plan.describe()}")
         try:
@@ -641,16 +863,26 @@ class SweepRunner:
                 axis = line.sweep
                 st = self.stages[axis]
                 accel = self.accel_mm_s2 or normal[axis][1]
-                # 1. get there at the ordinary speed, and let it stop ringing.
+                # 1. get there at the ordinary speed, by the way that was
+                # checked, and let it stop ringing. Every one of these moves
+                # can be ended by an abort: together they are half the sweep's
+                # running time, and a stop that waits for one to finish is
+                # most of a minute late.
                 st.set_vel_params(*normal[axis])
-                self.stages.move_to(settle_s=self.plan.settle_s,
-                                    **line.approach())
+                for point in (entry if i == 0 else line.via):
+                    if not self._go(point, should_abort):
+                        break
+                if self.aborted or not self._go(
+                        line.approach(), should_abort, self.plan.settle_s):
+                    break
                 if should_abort and should_abort():
                     self.aborted = True
                     break
 
                 # 2. sweep, logging position the whole way.
-                self.log.lines.append(line.to_dict())
+                doc = line.to_dict()
+                doc["completed"] = False
+                self.log.lines.append(doc)
                 st.set_vel_params(speed, accel)
                 self.line_index = i
                 # Where this line's counting starts from, taken standing
@@ -659,11 +891,23 @@ class SweepRunner:
                 # is measured against. Counts first, then the poll that the
                 # fallback interpolates from, both with nothing moving.
                 if self.log.encoders:
-                    self.log.add_datum(i, oenc.datum_from(
+                    datum = oenc.datum_from(
                         self._fresh_counts(), self.log.encoders, self.stages,
-                        on_error=self.log_fn))
+                        on_error=self.log_fn)
+                    self.log.add_datum(i, datum)
+                    lost = sorted(a for a in self.log.encoders.axes
+                                  if a not in datum)
+                    if lost:
+                        # Said here, and recorded per line in the sidecar: the
+                        # map otherwise reads "encoder" for the whole axis
+                        # while this line's positions are interpolated polls.
+                        self.log_fn(
+                            f"sweep: line {i + 1} has no encoder anchor for "
+                            f"{', '.join(lost)} -- its position falls back to "
+                            f"the controller polls")
                 self._poll(i)
                 self.logging = True
+                timed_out = False
                 try:
                     st.move_to(line.to_mm, wait=False)
                     # Watch it start before waiting for it to stop. The status
@@ -686,9 +930,16 @@ class SweepRunner:
                         self._poll(i)
                         if not st.moving:
                             break
+                        if self.stages.interlock.tripped:
+                            # Latched while this line is still running: the
+                            # stop that tripped it did not reach this axis, or
+                            # lost a race with the move. Stop it now rather
+                            # than at the end of the line.
+                            with contextlib.suppress(Exception):
+                                st.stop(immediate=True)
+                            break
                         if time.monotonic() > deadline:
-                            self.log_fn(f"sweep: line {i + 1} did not finish "
-                                        f"in time -- stopping it")
+                            timed_out = True
                             st.stop()
                             break
                         if should_abort and should_abort():
@@ -699,11 +950,31 @@ class SweepRunner:
                 finally:
                     self.logging = False
                     self._poll(i)
+                # A line ending is not a line having been swept. The loop
+                # above ends just the same on an emergency stop, a stall, a
+                # timeout or a move that never started, and each of those
+                # used to be counted as a completed line and followed by the
+                # next approach move.
+                self.stages.interlock.require_clear(f"sweeping line {i + 1}")
+                if self.aborted:
+                    break
+                if timed_out:
+                    with contextlib.suppress(Exception):
+                        st.distrust(f"{axis} did not finish sweeping line "
+                                    f"{i + 1} in time, so it may have stalled")
+                    raise StageError(
+                        f"{axis}: line {i + 1} did not finish in time and was "
+                        f"stopped -- the sweep ends here")
+                ok, at = self._arrived(st, line.to_mm)
+                if not ok:
+                    raise StageError(
+                        f"{axis}: line {i + 1} ended at {at:.3f} mm, not the "
+                        f"{line.to_mm:.3f} mm it was sent to -- the move did "
+                        f"not run, or did not finish. The sweep ends here.")
+                doc["completed"] = True
                 self.lines_done = i + 1
                 if on_progress:
                     on_progress(i + 1, len(self.plan.lines), line)
-                if self.aborted:
-                    break
         finally:
             self.logging = False
             for a, profile in normal.items():
@@ -878,7 +1149,12 @@ class SweepLog:
         if placement is None:
             machine = np.full_like(pos, np.nan)
         else:
-            machine = placement.to_machine(np.nan_to_num(pos), None)
+            # flange_path_mm, which subtracts the stage zero -- the same
+            # arithmetic that drew the volume and tested it against the coils.
+            # to_machine(pos, None) left the stage zero out, so once "Stage
+            # zero is here" had been pressed this column sat displaced from
+            # everything else in the machine frame.
+            machine = placement.flange_path_mm(np.nan_to_num(pos))
             machine[~np.isfinite(pos).all(axis=1)] = np.nan
         return t_s, pos, machine, b_mt, line_index, in_span, counts
 
@@ -888,6 +1164,24 @@ class SweepLog:
                     else "controller poll, interpolated onto the sample clock")
                 for a in AXES}
 
+    def fallback_lines(self):
+        """{axis: [line indices]} where an encoder axis had to use the polls.
+
+        pos_source() speaks for the axis as a whole. A line with no anchor --
+        the counts had not arrived, or the axis was not trusted at that moment
+        -- is positioned from the polls all the same, and this is the list of
+        which, so the map does not claim encoder timing for rows without it.
+        """
+        ran = sorted(set(self._line_of))
+        out = {}
+        for a in AXES:
+            if a not in self.encoders:
+                continue
+            missing = [li for li in ran if a not in self.datum.get(li, {})]
+            if missing:
+                out[a] = missing
+        return out
+
     def save(self, path, log_hz, placement=None, sync_note=""):
         """Write <path>.npz (bulk) and <path>.json (provenance)."""
         base = os.path.splitext(path)[0]
@@ -896,8 +1190,12 @@ class SweepLog:
             os.makedirs(d, exist_ok=True)
         t_s, pos, machine, b_mt, line_index, in_span, counts = self.assemble(
             log_hz, placement)
+        # Both files go to a temporary name and are renamed into place. This
+        # is hours of an unattended run held only in memory; a crash or a full
+        # disk half way through writing must not leave a truncated file under
+        # the name the finished one would have had.
         np.savez_compressed(
-            base + ".npz",
+            base + ".part.npz",
             t_s=t_s.astype(np.float64),
             pos_mm=pos.astype(np.float64),
             pos_machine_mm=machine.astype(np.float64),
@@ -931,6 +1229,7 @@ class SweepLog:
                                     "so the fallback can be redone",
             },
             "position_source": self.pos_source(),
+            "position_fallback_lines": self.fallback_lines(),
             "encoders": self.encoders.to_dict(),
             "encoder_datum": {str(k): v for k, v in sorted(self.datum.items())},
             "position_accuracy": (
@@ -944,9 +1243,11 @@ class SweepLog:
             "uncorrected": ("VCM subtracted and scaled by nominal V/T only -- "
                             "no tare, no gain trim, no matrix"),
         })
-        with open(base + ".json", "w", encoding="utf-8") as fh:
+        with open(base + ".part.json", "w", encoding="utf-8") as fh:
             json.dump(side, fh, indent=2, default=str)
             fh.write("\n")
+        os.replace(base + ".part.npz", base + ".npz")
+        os.replace(base + ".part.json", base + ".json")
         return base + ".npz"
 
     @classmethod

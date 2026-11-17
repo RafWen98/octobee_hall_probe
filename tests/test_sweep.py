@@ -1,5 +1,6 @@
 """Mapping a volume by sweeping it: the plan, the run, and what is logged."""
 
+import itertools
 import json
 import os
 import threading
@@ -54,7 +55,7 @@ def test_plan_lines():
     travel = {"x": (0.0, 300.0), "y": (0.0, 300.0), "z": (0.0, 300.0)}
     v = osweep.Volume((20.0, 0.0, 0.0), (120.0, 20.0, 20.0), step_mm=10.0,
                       sweep="x")
-    p = osweep.plan(v, travel_mm=travel, speed_mm_s=10.0)
+    p = osweep.plan(v, travel_mm=travel, speed_mm_s=10.0, accel_mm_s2=20.0)
     check("one line per node of the two stepping axes",
           len(p) == 3 * 3, f"{len(p)} lines")
     check("every line runs the same way, start below stop",
@@ -242,7 +243,8 @@ class _Rig:
     def position(self):
         return {a: ax.position_mm for a, ax in self.axes.items()}
 
-    def move_to(self, timeout_s=None, settle_s=0.0, **coords):
+    def move_to(self, timeout_s=None, settle_s=0.0, should_abort=None,
+                **coords):
         for a, mm in coords.items():
             self.axes[a].move_to(mm, wait=False)
         while any(self.axes[a].moving for a in coords):
@@ -629,8 +631,11 @@ def test_plan_surface_with_xz_slices():
 
     # A reachable mask cuts slice lines the same way it cuts faces, and only
     # within the rectangle.
+    # The wall stops short of the top of the box. One that reached every
+    # edge would leave no way round, and the far side would be dropped rather
+    # than reached through it -- see test_transits_go_round.
     mask = np.ones(v.shape, bool)
-    mask[14:17, :, :] = False                  # a wall across x = 140..160
+    mask[14:17, :, :28] = False           # x = 140..160, up to z = 270
     cut = osweep.plan(v, reachable=mask, shell=True, slices=3,
                       slice_inset_mm=50.0)
     pieces = [ln for ln in cut.lines if ln.part == "slice"]
@@ -657,3 +662,148 @@ def test_plan_surface_with_xz_slices():
     flat = osweep.Volume((0.0, 0.0, 0.0), (300.0, 10.0, 300.0), step_mm=10.0)
     check("nor does a box with no inside along y",
           osweep.plan(flat, shell=True, slices=3).slices is None)
+
+
+def _legs(plan_):
+    """Every positioning move a plan makes between lines, as (from, to) nodes."""
+    vol, out, last = plan_.volume, [], None
+    for ln in plan_.lines:
+        if last is not None:
+            stops = [last.leave(), *ln.via, ln.approach()]
+            out += [(osweep._node(vol, a), osweep._node(vol, b))
+                    for a, b in zip(stops, stops[1:])]
+        last = ln
+    return out
+
+
+def _box(mask, a, b):
+    return mask[tuple(slice(min(p, q), max(p, q) + 1) for p, q in zip(a, b))]
+
+
+def test_transits_go_round():
+    """The moves BETWEEN lines are held to the same grid as the lines.
+
+    A line that passes behind a winding is cut in two, and the move from the
+    end of the first piece to the start of the second used to be a straight
+    one -- along the stretch that had just been cut out, through the winding.
+    Nothing checked it, and the preview flew only the swept lines.
+    """
+    print("\nmoves between lines")
+    v = osweep.Volume((0.0, 0.0, 0.0), (100.0, 40.0, 40.0), step_mm=10.0,
+                      sweep="x")
+    travel = dict.fromkeys("xyz", (0.0, 300.0))
+
+    # A post in the middle of the box: blocked for every y, up to z = 20.
+    mask = np.ones(v.shape, bool)
+    mask[4:7, :, :3] = False
+    p = osweep.plan(v, reachable=mask, travel_mm=travel)
+    low = [ln for ln in p.lines if ln.fixed["z"] <= 20.0]
+    check("lines through the post are cut in two",
+          len(low) == 2 * 5 * 3
+          and all(ln.stop_mm <= 30.0 or ln.start_mm >= 70.0 for ln in low))
+    crossing = [ln for a, ln in itertools.pairwise(p.lines)
+                if a.fixed == ln.fixed and a.stop_mm <= 30.0
+                and ln.start_mm >= 70.0]
+    check("the move from one piece to the other is routed, not straight",
+          crossing and all(ln.via for ln in crossing),
+          f"{sum(1 for ln in crossing if ln.via)} of {len(crossing)}")
+    legs = _legs(p)
+    check("every leg of every move between lines stays on reachable nodes",
+          all(_box(mask, a, b).all() for a, b in legs),
+          f"{sum(1 for a, b in legs if not _box(mask, a, b).all())} blocked")
+    check("and each leg of a detour moves one axis only",
+          all(sum(1 for i in range(3) if a[i] != b[i]) <= 1
+              for ln in p.lines if ln.via
+              for a, b in zip([osweep._node(v, q) for q in ln.via],
+                              [osweep._node(v, q) for q in ln.via][1:])))
+    check("a clear move is left direct",
+          any(not ln.via for ln in p.lines[1:]))
+    check("the plan says how many moves were routed",
+          "routed round the coil" in p.describe(), p.describe())
+    check("and the sidecar carries the way to each line",
+          any(d["via"] for d in p.to_dict()["lines"])
+          and p.to_dict()["transits_checked"] is True)
+
+    # No ramp toward a node the probe cannot occupy.
+    first = next(ln for ln in low if ln.stop_mm <= 30.0)
+    second = next(ln for ln in low if ln.start_mm >= 70.0)
+    check("a line cut short by the post does not run on toward it",
+          first.run_out_mm == 0.0 and second.run_in_mm == 0.0,
+          f"run-out {first.run_out_mm}, run-in {second.run_in_mm}")
+    check("but still ramps where the way is open",
+          second.run_out_mm > 0.0)
+
+    # A wall with no way round: the far side is dropped, not reached.
+    wall = np.ones(v.shape, bool)
+    wall[4:7, :, :] = False
+    w = osweep.plan(v, reachable=wall, travel_mm=travel)
+    check("lines with no clear way to them are dropped",
+          w.lines and all(ln.stop_mm <= 30.0 for ln in w.lines) and w.skipped,
+          f"{len(w.lines)} kept, {w.skipped} dropped")
+
+    # The way in, which depends on where the head was left.
+    via, note = p.entry({"x": 0.0, "y": 0.0, "z": 40.0})
+    check("a head parked in clear space inside the box gets a checked way in",
+          note == "" and isinstance(via, list))
+    via, note = p.entry({"x": 250.0, "y": 0.0, "z": 0.0})
+    check("a head parked outside the box is told its way in is unchecked",
+          via == [] and "NOT checked" in note, note)
+    try:
+        p.entry({"x": 50.0, "y": 20.0, "z": 0.0})      # inside the post
+        ok = False
+    except ValueError:
+        ok = True
+    check("a head with no clear way to the first line is refused", ok)
+    check("with no reachable grid nothing is routed or claimed",
+          osweep.plan(v).entry({"x": 0, "y": 0, "z": 0}) == ([], "")
+          and osweep.plan(v).to_dict()["transits_checked"] is False)
+
+
+def test_sweep_stops_when_a_line_does_not_run(workdir):
+    """A line that ended is not a line that was swept."""
+    print("\nlines that do not complete")
+    v = osweep.Volume((0.0, 0.0, 0.0), (20.0, 0.0, 0.0), step_mm=10.0,
+                      sweep="x")
+
+    # An axis that takes the command and goes nowhere.
+    rig = _Rig()
+    real = rig.axes["x"].move_to
+    rig.axes["x"].move_to = (lambda mm, timeout_s=None, wait=True:
+                             real(mm, wait=wait) if wait else None)
+    log = osweep.SweepLog()
+    runner = osweep.SweepRunner(rig, osweep.plan(v), log,
+                                log_fn=lambda _m: None)
+    try:
+        runner.run()
+        raised = ""
+    except ostage.StageError as exc:
+        raised = str(exc)
+    check("a line whose move never ran ends the sweep with an error",
+          "not the" in raised, raised)
+    check("and is not counted as done",
+          runner.lines_done == 0 and log.lines[0]["completed"] is False)
+
+    # An abort during the move TO a line, not only during the line.
+    rig = _Rig(speed=10.0)
+    rig.axes["x"]._from = rig.axes["x"]._to = 200.0     # a long way back
+    calls = []
+
+    def move_to(timeout_s=None, settle_s=0.0, should_abort=None, **coords):
+        calls.append(should_abort)
+        if should_abort and should_abort():
+            raise ostage.MoveAborted("aborted")
+
+    rig.move_to = move_to
+    runner = osweep.SweepRunner(rig, osweep.plan(v), osweep.SweepLog(),
+                                log_fn=lambda _m: None)
+    flag = {"n": 0}
+
+    def abort():
+        flag["n"] += 1
+        return flag["n"] > 1            # clear at the top of the loop, then set
+
+    done = runner.run(should_abort=abort)
+    check("the positioning move is given the abort to watch",
+          calls and calls[0] is abort)
+    check("and an abort during it ends the sweep with nothing swept",
+          runner.aborted and done == 0)

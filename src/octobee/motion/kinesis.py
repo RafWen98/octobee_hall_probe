@@ -70,6 +70,16 @@ class StageError(RuntimeError):
     """Any failure talking to a stage, including a non-zero API return."""
 
 
+class MoveAborted(StageError):
+    """The caller asked for the move to end, and it was ended on a ramp.
+
+    Not a failure of the axis: it decelerated under control and its position
+    is still good. Raised so that whatever commanded the move cannot carry on
+    as though it had arrived. Defined here, beside StageError, so the sweep
+    and scan code can catch it without importing the stage driver.
+    """
+
+
 def check_rc(rc, what):
     """Raise on a non-zero Kinesis return code.
 
