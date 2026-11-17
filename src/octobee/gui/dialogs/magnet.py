@@ -702,13 +702,19 @@ class MagnetWizard(QtWidgets.QDialog):
                                   self._start_mm):
             self._start_mm = None
             return
+        # A failed check forgets the park, on every axis and not only the
+        # first. The message it shows says to re-park the head; with the old
+        # park kept, the next Start skipped re-reading the stages and drove to
+        # where the head USED to be.
         if across and not self._check_travel(
                 across, -self.spin_across_half.value(),
                 self.spin_across_half.value(), self._park[across]):
+            self._start_mm, self._park = None, {}
             return
         if normal and not self._check_travel(
                 normal, -self.spin_dither_half.value(),
                 self.spin_dither_half.value(), self._park[normal]):
+            self._start_mm, self._park = None, {}
             return
 
         self._pending = None

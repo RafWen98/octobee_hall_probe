@@ -125,6 +125,21 @@ def load_axis_motion(path=None, axes=()):
     return out
 
 
+def _write_json(path, doc):
+    """Write stages.json by way of a temporary file and a rename.
+
+    This file is the axis map, the soft limits that keep the head out of the
+    fixture, the homing order and the encoder scales. Opened with "w" and
+    interrupted -- a crash, a full disk -- it was left truncated, and the next
+    connect had no limits to read. The rename either happens or does not.
+    """
+    tmp = f"{path}.part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
 def save_axis_motion(path=None, velocity_mm_s=None, accel_mm_s2=None,
                      axis=None):
     """Write the motion profile into stages.json, leaving the rest of it alone.
@@ -144,9 +159,7 @@ def save_axis_motion(path=None, velocity_mm_s=None, accel_mm_s2=None,
         target["velocity_mm_s"] = clamp_velocity(velocity_mm_s)
     if accel_mm_s2 is not None:
         target["accel_mm_s2"] = float(accel_mm_s2)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.write("\n")
+    _write_json(path, doc)
     return path
 
 
@@ -169,14 +182,23 @@ def save_axis_map(mapping, path=None, frames=None):
             # doing routine housekeeping.
             prev = existing.get(str(name))
             entry = dict(prev) if isinstance(prev, dict) else {}
+            flipped = ("invert" in entry
+                       and bool(entry["invert"]) != bool(spec.get("invert", False)))
             entry["invert"] = bool(spec.get("invert", False))
-            if spec.get("origin_mm") is not None:
-                entry["origin_mm"] = float(spec["origin_mm"])
+            # origin_mm: a number sets it, "auto" removes it, None leaves it
+            # as it was. Two things used to be impossible: `--origin z=auto`
+            # arrived here as None and so cleared nothing, and an axis flipped
+            # from reversed to forward kept the origin worked out for the
+            # other direction -- rig zero at the wrong end of the travel, with
+            # the soft limits clamped to match.
+            origin = spec.get("origin_mm")
+            if origin == "auto" or (origin is None and flipped):
+                entry.pop("origin_mm", None)
+            elif origin is not None:
+                entry["origin_mm"] = float(origin)
             if spec.get("limit_mm") is not None:
                 entry["limit_mm"] = [float(spec["limit_mm"][0]),
                                      float(spec["limit_mm"][1])]
             out[str(name)] = entry
         doc["frame"] = out
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.write("\n")
+    _write_json(path, doc)

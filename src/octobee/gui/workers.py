@@ -409,8 +409,11 @@ class EncoderCalibrationWorker(QtCore.QThread):
 
                 out = self._run_axis(st, start, stop)
                 back = self._run_axis(st, stop, start) if out else None
-                # Back where it was found, whatever happened above.
-                st.move_to(here)
+                # Back where it was found, whatever happened above -- except
+                # after an abort. Whoever pressed stop wanted the axis to
+                # stop, and this was a move right back across the span.
+                if not self._abort:
+                    st.move_to(here)
                 if out is None or back is None:
                     if not self._abort:
                         problems.append(

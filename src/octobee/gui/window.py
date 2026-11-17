@@ -262,7 +262,7 @@ class MainWindow(QtWidgets.QMainWindow):
             stop_recording=self._stop_recording,
             set_snapshot_enabled=self.act_snapshot.setEnabled)
         left.addTab(self.tab_stages, "Stages")
-        self.tab_machine = MachineTab(self.session)
+        self.tab_machine = MachineTab(self.session, self.motion)
         # Built after the Stages tab, so it cannot be handed to it. What the
         # Machine tab needs to know is only that the stages came or went --
         # its "Calibrate encoders" button is dead without them, and deciding

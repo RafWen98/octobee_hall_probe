@@ -671,7 +671,7 @@ def _legs(plan_):
         if last is not None:
             stops = [last.leave(), *ln.via, ln.approach()]
             out += [(osweep._node(vol, a), osweep._node(vol, b))
-                    for a, b in zip(stops, stops[1:])]
+                    for a, b in itertools.pairwise(stops)]
         last = ln
     return out
 

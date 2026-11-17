@@ -24,6 +24,19 @@ from PyQt6 import QtCore, QtWidgets
 from octobee.motion import stage as ostage
 
 
+def is_finished(worker):
+    """True once `worker` has run and ended. Tolerates None and dead objects.
+
+    Not the opposite of is_running(): a thread that has been registered and
+    not yet started is neither running nor finished, and it is the one case
+    where the difference matters -- see MotionControl.busy().
+    """
+    try:
+        return worker is None or worker.isFinished()
+    except RuntimeError:            # the C++ object is already gone
+        return True
+
+
 def is_running(worker):
     """True if `worker` is a live QThread. Tolerates None and dead objects."""
     try:
@@ -62,7 +75,7 @@ class MotionControl(QtCore.QObject):
         registers here.
         """
         self._workers = [w for w in self._workers
-                         if w is not worker and is_running(w)]
+                         if w is not worker and not is_finished(w)]
         self._workers.append(worker)
         self.changed.emit()
 
@@ -84,8 +97,16 @@ class MotionControl(QtCore.QObject):
         self.changed.emit()
 
     def busy(self):
-        """True if any thread is currently allowed to command motion."""
-        self._workers = [w for w in self._workers if is_running(w)]
+        """True if any thread is currently allowed to command motion.
+
+        A registered worker counts from the moment it is registered, not from
+        the moment its thread starts. register() emits `changed`, the slots on
+        that signal call busy(), and a worker registered just before start()
+        used to be pruned right there as "not running" -- after which neither
+        the stop button nor closeEvent knew it existed. Only a worker that has
+        actually finished is dropped.
+        """
+        self._workers = [w for w in self._workers if not is_finished(w)]
         return bool(self._workers)
 
     def all_workers(self):
@@ -101,7 +122,7 @@ class MotionControl(QtCore.QObject):
         """Ask every registered worker to stop. Returns how many were running."""
         n = 0
         for w in list(self._workers):
-            if is_running(w):
+            if not is_finished(w):
                 n += 1
                 if hasattr(w, "abort"):
                     w.abort()

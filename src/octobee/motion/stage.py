@@ -1802,7 +1802,9 @@ def _cmd_map(a):
         if name not in mapping:
             print(f"--origin {name}: no such axis in the map")
             return 1
-        frames[name]["origin_mm"] = None if val in ("", "auto") else float(val)
+        # "auto", not None: None means "leave what is stored alone" to
+        # save_axis_map, which is how --origin auto used to clear nothing.
+        frames[name]["origin_mm"] = "auto" if val in ("", "auto") else float(val)
     frames = {k: v for k, v in frames.items() if k in mapping}
 
     save_axis_map(mapping, a.config, frames=frames)
@@ -1810,7 +1812,7 @@ def _cmd_map(a):
     for name, serial in mapping.items():
         fr = frames[name]
         how = "REVERSED" if fr["invert"] else "forward"
-        origin = ("auto" if fr["origin_mm"] is None
+        origin = ("auto" if fr["origin_mm"] in (None, "auto")
                   else f"{fr['origin_mm']:g} mm")
         print(f"  {name} = {serial}   {how}, rig zero at device {origin}")
     return 0

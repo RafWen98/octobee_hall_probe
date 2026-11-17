@@ -12,6 +12,8 @@ It reads the stage positions when asked to track them, and answers stage_mm()
 for the scanner, which needs to know the clearance before it commands a move.
 """
 
+import itertools
+import json
 import os
 
 import numpy as np
@@ -28,6 +30,7 @@ from octobee.gui.workers import (
 from octobee.motion import encoder as oenc
 from octobee.motion import stage as ostage
 from octobee.motion import sweep as osweep
+from octobee.motion import timing as otim
 
 # The sweep patterns the volume panel offers: label -> (shell, with slices).
 # The first is the default.
@@ -40,7 +43,7 @@ VOLUME_PATTERNS = {
 
 
 class MachineTab(QtWidgets.QWidget):
-    def __init__(self, session, parent=None):
+    def __init__(self, session, motion=None, parent=None):
         """Where the head is inside the coil set, and which coils are live.
 
             A field map is a table of vectors at rig millimetres, and rig
@@ -54,6 +57,13 @@ class MachineTab(QtWidgets.QWidget):
             """
         super().__init__(parent)
         self.session = session
+        # The window's MotionControl, so the stop button, the emergency stop
+        # and closeEvent know about the threads this tab starts. None only
+        # where the tab is built on its own, as some tests do.
+        self.motion = motion
+        self._plan_basis = None         # what the plan in hand was worked out for
+        self._plan_gen = 0              # bumped whenever a plan is discarded
+        self._run_pose = None           # the pose a sweep in flight started with
         self._machine_key = None
         self._machine_quiet = False
         self._machine_travel_taken = False
@@ -592,6 +602,7 @@ class MachineTab(QtWidgets.QWidget):
         for lost in self.session.machine.adopt(coils):
             self.session.log(f"coil set: {lost}")
         self.session.log(f"coil set: {coils.note} — {path}")
+        self._discard_plan("a different coil set was loaded")
         self._refresh_machine_controls()
         self.machine_view.set_coils(coils, self.session.machine.coil_radius_mm,
                                     self.session.machine.energised)
@@ -699,6 +710,7 @@ class MachineTab(QtWidgets.QWidget):
             return
         self.session.machine.coil_radius_mm = float(value)
         self.machine_view.set_radius(value)
+        self._discard_plan("the winding radius changed")
         self.refresh_machine(force=True)
 
     def on_machine_pose_edited(self, _value=None):
@@ -706,6 +718,7 @@ class MachineTab(QtWidgets.QWidget):
             return
         for attr, spin in self.machine_pose_spins.items():
             setattr(self.session.machine.pose, attr, float(spin.value()))
+        self._discard_plan("the pose changed")
         self.refresh_machine(force=True)
 
     def on_machine_pose_dragged(self, x_mm, y_mm, z_mm):
@@ -748,6 +761,7 @@ class MachineTab(QtWidgets.QWidget):
         self.session.log("machine: stage zero taken at "
                      + ", ".join(f"{k}={v:.3f} mm"
                                  for k, v in sorted(stage.items())))
+        self._discard_plan("the stage zero changed")
         self.refresh_machine(force=True)
 
     def on_machine_save(self):
@@ -801,6 +815,36 @@ class MachineTab(QtWidgets.QWidget):
                 sp.setEnabled(not on)
         self.on_volume_edited()
 
+    def _basis(self):
+        """Everything a plan depends on besides the volume controls.
+
+        Compared again when Start is pressed. _discard_plan() is called from
+        every place known to change one of these; this catches the place
+        nobody thought of, which is the one that would otherwise run a rig on
+        a path worked out for a different machine.
+        """
+        m = self.session.machine
+        return (json.dumps(m.pose.to_dict(), sort_keys=True, default=str),
+                float(m.coil_radius_mm), id(self.session.coils),
+                id(self.session.probe_cloud), id(self.session.geom),
+                float(self.spin_vol_margin.value()),
+                bool(self.chk_vol_avoid.isChecked()))
+
+    def _discard_plan(self, why):
+        """Something the plan was worked out for has changed: drop it.
+
+        Only the volume controls used to do this. Moving the pose, changing
+        the winding radius, taking a new stage zero, loading another coil
+        file or reloading the probe geometry all left the old lines armed and
+        Start enabled -- a path cut round a coil that, as far as the plan
+        knew, was somewhere else. on_volume_edited() does the dropping and
+        redraws the box where it now sits.
+        """
+        if self._plan is not None:
+            self.session.log(f"volume: the plan was discarded because {why} "
+                             f"— press Plan again")
+        self.on_volume_edited()
+
     def on_volume_edited(self, _value=None):
         """Anything that changes the volume invalidates the plan made for it.
 
@@ -810,6 +854,9 @@ class MachineTab(QtWidgets.QWidget):
         """
         self._reachable = None
         self._plan = None
+        self._plan_basis = None
+        # A plan still being worked out is for what the controls USED to say.
+        self._plan_gen += 1
         with_slices = self._pattern()["slices"] > 0
         self.spin_vol_slices.setEnabled(with_slices)
         self.spin_vol_inset.setEnabled(with_slices)
@@ -850,19 +897,32 @@ class MachineTab(QtWidgets.QWidget):
         self.btn_vol_plan.setEnabled(False)
         self.bar_volume.setRange(0, 100)
         self.bar_volume.setValue(0)
+        # A COPY of the pose. The spin boxes write into the live one, and the
+        # solve takes seconds: a drag during it gave a grid worked out partly
+        # for one pose and partly for another.
+        pose = omach.Placement.from_dict(self.session.machine.pose.to_dict())
+        gen = self._plan_gen
         self._plan_worker = PlanWorker(
-            vol, self.session.machine.pose, self.session.probe_cloud,
+            vol, pose, self.session.probe_cloud,
             self.session.coils, self.session.machine.coil_radius_mm,
             self.spin_vol_margin.value())
         self._plan_worker.progress.connect(
             lambda i, n: self.bar_volume.setValue(int(100 * i / max(n, 1))))
         self._plan_worker.done.connect(
-            lambda grid, err: self._on_plan_done(vol, grid, err))
+            lambda grid, err: self._on_plan_done(vol, grid, err, gen))
         self._plan_worker.start()
 
-    def _on_plan_done(self, vol, grid, err):
+    def _on_plan_done(self, vol, grid, err, gen=None):
         self.btn_vol_plan.setEnabled(True)
         self.bar_volume.setValue(0)
+        if gen is not None and gen != self._plan_gen:
+            # The volume, the pose or the coils changed while this was being
+            # worked out. Finishing it would arm Start with lines for controls
+            # that no longer say that.
+            self.session.log("volume: the plan that was being worked out was "
+                             "dropped — something it depends on changed "
+                             "meanwhile. Press Plan again.")
+            return
         if err:
             self.session.log(f"WARNING: volume: {err}")
             QtWidgets.QMessageBox.warning(self, "Volume", err)
@@ -870,15 +930,56 @@ class MachineTab(QtWidgets.QWidget):
             return
         self._finish_plan(vol, grid)
 
+    def _sweep_accel(self):
+        """The acceleration the ramps should be sized for, mm/s^2.
+
+        The slowest of the connected axes, since any of them may be the one
+        sweeping and too short a ramp puts the end of the acceleration inside
+        the span flagged as constant speed. The configured default when the
+        stages are not connected.
+        """
+        found = []
+        if self.session.stages is not None:
+            for name in self.session.stages.names:
+                try:
+                    found.append(float(self.session.stages[name].vel_params[1]))
+                except (ostage.StageError, TypeError, ValueError, IndexError):
+                    continue
+        return min(found) if found else otim.DEFAULT_ACCEL_MM_S2
+
+    def _outside_travel(self, plan_):
+        """Why this plan cannot be run inside the stages' travel, or ""."""
+        travel = self.session.machine.pose.travel_mm
+        for line in plan_.lines:
+            ends = {**line.fixed, line.sweep: line.from_mm}
+            for axis, mm in (*ends.items(), (line.sweep, line.to_mm)):
+                lo, hi = travel[axis]
+                if not (lo - 1e-6 <= mm <= hi + 1e-6):
+                    return (f"the box reaches {axis} = {mm:g} mm, outside the "
+                            f"{lo:g}..{hi:g} mm the stages can travel")
+        return ""
+
     def _finish_plan(self, vol, reachable):
         """Turn a reachable grid into lines, draw them, and say what it costs."""
-        self._reachable = reachable
-        self._plan = osweep.plan(
+        made = osweep.plan(
             vol, reachable=reachable,
             speed_mm_s=self.spin_vol_speed.value(),
             log_hz=self.session.out_rate,
+            accel_mm_s2=self._sweep_accel(),
             travel_mm=self.session.machine.pose.travel_mm,
             **self._pattern())
+        # Checked here, not an hour into the run: a box typed past the end of
+        # an axis used to plan happily, enable Start, and stop the sweep at
+        # the first line that asked for the impossible.
+        outside = self._outside_travel(made)
+        if outside:
+            self.lbl_volume.setText(f"{vol.describe()} — cannot be run: "
+                                    f"{outside}.")
+            self.session.log(f"WARNING: volume: {outside}")
+            return
+        self._reachable = reachable
+        self._plan = made
+        self._plan_basis = self._basis()
         pose = self.session.machine.pose
         dropped = self._dropped_points(vol)
         self.machine_view.set_volume(pose.flange_path_mm(vol.corners_mm()))
@@ -892,7 +993,8 @@ class MachineTab(QtWidgets.QWidget):
                      f"plus up to {extra:.1f} mm from working it out on a "
                      f"{vol.step_mm:g} mm grid — the grid can refuse a "
                      f"position that would in fact have been fine, never the "
-                     f"other way round.")
+                     f"other way round. The moves between lines are held to "
+                     f"the same grid.")
         self.lbl_volume.setText(note)
         self.session.log(f"volume: {vol.describe()} — {self._plan.describe()}")
         self.btn_vol_preview.setEnabled(bool(self._plan.lines))
@@ -1030,6 +1132,7 @@ class MachineTab(QtWidgets.QWidget):
         self._enc_worker.message.connect(self.session.log)
         self._enc_worker.progress.connect(self._on_enc_progress)
         self._enc_worker.done.connect(self.on_volume_calibrated)
+        self._register(self._enc_worker)
         self._enc_worker.start()
 
     def _on_enc_progress(self, done, total):
@@ -1064,6 +1167,7 @@ class MachineTab(QtWidgets.QWidget):
 
     def on_volume_calibrated(self, found, err):
         """Adopt whatever was measured, and say plainly what was not."""
+        self._retire(self._enc_worker)
         if found:
             merged = dict(self.session.encoders.to_dict())
             merged.update(found)
@@ -1150,14 +1254,27 @@ class MachineTab(QtWidgets.QWidget):
         self._preview_timer.start(40)
 
     def _preview_points(self):
-        """The whole path as rig positions, at the grid step, in run order."""
+        """The whole path as rig positions, at the grid step, in run order.
+
+        The moves BETWEEN lines are flown too, by the way the sweep will take
+        them. They are half of what the rig does, and a preview of the swept
+        lines alone showed "clear" for a plan whose transits were not.
+        """
+        axes = omach.Placement.AXES
         step = max(self._plan.volume.step_mm, 1.0)
-        out = []
+        out, last = [], None
         for line in self._plan.lines:
+            if last is not None:
+                stops = [last, *([p[a] for a in axes] for p in line.via),
+                         [line.approach()[a] for a in axes]]
+                for a, b in itertools.pairwise(stops):
+                    n = max(2, int(np.abs(np.subtract(b, a)).max() / step) + 1)
+                    out.extend(np.linspace(a, b, n)[1:].tolist())
             n = max(2, int(round(line.span_mm / step)) + 1)
             for t in np.linspace(line.start_mm, line.stop_mm, n):
                 out.append([line.fixed.get(a, 0.0) if a != line.sweep else t
-                            for a in omach.Placement.AXES])
+                            for a in axes])
+            last = [line.leave()[a] for a in axes]
         return np.array(out).reshape(-1, 3) if out else np.zeros((0, 3))
 
     def _preview_step(self):
@@ -1204,11 +1321,36 @@ class MachineTab(QtWidgets.QWidget):
                 "that is already running rather than taking the carriers over, "
                 "so it needs one -- press Connect first.")
             return
+        if self._plan_basis != self._basis():
+            # Belt and braces behind _discard_plan(): see _basis().
+            self._discard_plan("something it was worked out for has changed")
+            QtWidgets.QMessageBox.warning(
+                self, "Volume map",
+                "The pose, the coil set or the clearance has changed since "
+                "this path was planned, so it has been discarded.\n\n"
+                "Press Plan again.")
+            return
+        if self.session.collecting is not None:
+            QtWidgets.QMessageBox.warning(
+                self, "Volume map",
+                "A tare or a magnet pass is still collecting. Let it finish "
+                "first: it would change the calibration part way through "
+                "the map.")
+            return
+        # The one move no plan can check in advance: from wherever the head
+        # is standing to the first line.
+        try:
+            _via, unchecked = self._plan.entry(
+                self.stage_mm(ignore_tracking=True) or {})
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Volume map", str(exc))
+            return
         self._stop_preview()
         hours = self._plan.duration_s() / 3600.0
+        way_in = (f"WARNING: {unchecked}.\n\n" if unchecked else "")
         reply = QtWidgets.QMessageBox.question(
             self, "Volume map",
-            f"{self._plan.describe()}.\n\n"
+            f"{self._plan.describe()}.\n\n{way_in}"
             f"Roughly {hours:.1f} hours, logging at "
             f"{self.session.out_rate:g} Hz.\n\n"
             # Said before the run rather than discovered in the sidecar
@@ -1226,11 +1368,34 @@ class MachineTab(QtWidgets.QWidget):
         if reply != QtWidgets.QMessageBox.StandardButton.Yes:
             return
 
+        avoiding = self._reachable is not None
         meta = {"machine": self.session.machine.to_scan_meta(
                     self.session.coils, self.stage_mm(ignore_tracking=True)),
                 "plan": self._plan.to_dict(),
+                # What the path was held clear of, which the lines alone do
+                # not say: a map planned with the coils ignored reads exactly
+                # like one carved round them.
+                "clearance": {
+                    "avoiding_coils": avoiding,
+                    "margin_mm": (float(self.spin_vol_margin.value())
+                                  if avoiding else None),
+                    "grid_standoff_mm": (
+                        float(omach.grid_standoff_mm(self._plan.volume.step_mm))
+                        if avoiding else None),
+                    "coil_radius_mm": float(
+                        self.session.machine.coil_radius_mm)},
+                # Sensors the health scan or the calibration had excluded
+                # when the map started, so a tool reading it back does not
+                # average a dead chip into the field.
+                "excluded": sorted(self.session.cal.dead),
                 "geometry": self.session.geom.to_dict(),
                 "calibration_id": orec.calibration_id(self.session.cal)}
+        # The pose the map is OF. The spin boxes and the gizmo stay live for
+        # the hours a sweep runs, and the machine-frame positions used to be
+        # worked out at the end from wherever the pose had got to by then --
+        # under a sidecar describing where it started.
+        self._run_pose = omach.Placement.from_dict(
+            self.session.machine.pose.to_dict())
         log = osweep.SweepLog(self.session.geom, meta, self.session.encoders)
         runner = osweep.SweepRunner(self.session.stages, self._plan, log,
                                     log_fn=self.session.log)
@@ -1250,7 +1415,23 @@ class MachineTab(QtWidgets.QWidget):
         self._sweep_worker.message.connect(self.session.log)
         self._sweep_worker.progress.connect(self.on_volume_progress)
         self._sweep_worker.done.connect(self.on_volume_done)
+        self._register(self._sweep_worker)
         self._sweep_worker.start()
+
+    def _register(self, worker):
+        """Tell the window's motion control about a thread that moves the rig.
+
+        Without this the "Stop moving" button stopped the line in flight and
+        the sweep, never having been told, commanded the next one; Jog and
+        Home stayed live on axes a sweep was driving; and closing the window
+        neither asked nor waited, losing the map that was still in memory.
+        """
+        if self.motion is not None:
+            self.motion.register(worker)
+
+    def _retire(self, worker):
+        if self.motion is not None and worker is not None:
+            self.motion.retire(worker)
 
     def on_volume_abort(self):
         if self._sweep_worker is not None:
@@ -1273,6 +1454,7 @@ class MachineTab(QtWidgets.QWidget):
         log = self.session.volume_log
         self.session.volume_runner = None
         self.session.volume_log = None
+        self._retire(self._sweep_worker)
         if float(self.session.out_rate) != self._run_hz:
             self.session.log(
                 f"WARNING: volume map: the output rate changed from "
@@ -1297,12 +1479,25 @@ class MachineTab(QtWidgets.QWidget):
         # available.
         ran = runner.plan if runner is not None else None
         path = orec.default_name("volume", "npz", self.session.out_dir)
+        pose = self._run_pose or self.session.machine.pose
         try:
-            written = log.save(path, self._run_hz, self.session.machine.pose,
+            written = log.save(path, self._run_hz, pose,
                                sync_note=self._sync_note(log, ran))
-        except OSError as exc:
-            self.session.log(f"WARNING: volume map: could not be written ({exc})")
-            QtWidgets.QMessageBox.warning(self, "Volume map", str(exc))
+        except Exception as exc:
+            # Anything, not only OSError. This is the only copy of the run,
+            # and an error in assembling it used to leave the handler without
+            # a word and the hours with it. Keep the log reachable, so the
+            # save can be tried again from the session.
+            self.session.volume_log = log
+            self.session.log(
+                f"WARNING: volume map: could not be written "
+                f"({type(exc).__name__}: {exc}). The data is still in memory "
+                f"-- do not close the window; free the disk or fix the path "
+                f"and it can be saved again.")
+            QtWidgets.QMessageBox.warning(
+                self, "Volume map",
+                f"The map could not be written:\n\n{exc}\n\nIt is still in "
+                f"memory. Do not close the window.")
             return
         done = 0 if runner is None else runner.lines_done
         self.session.log(
@@ -1393,7 +1588,16 @@ class MachineTab(QtWidgets.QWidget):
                 lo, hi = self.session.stages[name].limit_mm
             except (ostage.StageError, TypeError, ValueError):
                 continue
-            self.session.machine.pose.travel_mm[name] = (float(lo), float(hi))
+            was = tuple(self.session.machine.pose.travel_mm.get(name, ()))
+            now = (float(lo), float(hi))
+            if was and tuple(float(v) for v in was) != now:
+                # Said, because it also replaces what machine.json held and
+                # "Save placement" will write it back.
+                self.session.log(
+                    f"machine: {name} travel taken from the stage as "
+                    f"{now[0]:g}..{now[1]:g} mm (the placement file had "
+                    f"{was[0]:g}..{was[1]:g})")
+            self.session.machine.pose.travel_mm[name] = now
         # "The whole travel" now means something different from what the boxes
         # are showing, so re-read it rather than leaving the fallback on screen.
         if self.chk_vol_all.isChecked():
@@ -1476,4 +1680,5 @@ class MachineTab(QtWidgets.QWidget):
     def set_geometry(self, geom):
         """Adopt a reloaded probe geometry and redraw."""
         self.machine_view.set_geometry(geom)
+        self._discard_plan("the probe geometry was reloaded")
         self.refresh_machine(force=True)

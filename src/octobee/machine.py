@@ -644,18 +644,25 @@ _COARSE_BY_CURVE = {}
 
 
 def _coarse_outline_of(points_mm):
-    """_coarse_outline for a bare centreline, cached by array identity."""
+    """_coarse_outline for a bare centreline, cached by array identity.
+
+    The array is kept in the cache beside its result and compared on the way
+    out. id() alone is only unique among objects that are alive: load a second
+    and a third coil file and a new centreline can be handed the id of one
+    that was freed, and with it that coil's outline -- the wrong forbidden
+    region, for the test that decides where the head may go.
+    """
     key = id(points_mm)
     cached = _COARSE_BY_CURVE.get(key)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] is points_mm:
+        return cached[1]
     shim = type("_Curve", (), {"points_mm": points_mm, "_coarse": None})()
-    cached = _coarse_outline(shim)
+    result = _coarse_outline(shim)
     # Bounded: a session loads a handful of coil sets, not thousands.
     if len(_COARSE_BY_CURVE) > 256:
         _COARSE_BY_CURVE.clear()
-    _COARSE_BY_CURVE[key] = cached
-    return cached
+    _COARSE_BY_CURVE[key] = (points_mm, result)
+    return result
 
 
 def clearance(points_mm, coilset, radius_mm, labels=None):

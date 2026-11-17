@@ -683,3 +683,43 @@ def test_group_moves_leave_nothing_running(monkeypatch):
     check("an emergency stop halts every axis before writing anything down",
           kinds == ["immediate", "immediate", "ledger", "ledger"], str(kinds))
     check("and still latches", ss.interlock.tripped == "test")
+
+
+def test_axis_origin_can_be_cleared(workdir):
+    """A stored rig origin is set by a number, removed by "auto", kept by None.
+
+    `--origin z=auto` used to reach the file as None, which means "leave it",
+    so it cleared nothing; and an axis flipped from reversed to forward kept
+    the origin that had been worked out for the other direction.
+    """
+    print("\nthe rig origin in stages.json")
+    path = os.path.join(workdir, "origin.json")
+    serials = {"z": "45538374"}
+
+    def stored():
+        with open(path) as fh:
+            return json.load(fh)["frame"]["z"]
+
+    ostage.save_axis_map(serials, path, frames={
+        "z": {"invert": True, "origin_mm": 300.0, "limit_mm": (10.0, 290.0)}})
+    check("a number sets the origin", stored().get("origin_mm") == 300.0)
+
+    ostage.save_axis_map(serials, path, frames={
+        "z": {"invert": True, "origin_mm": None}})
+    check("None leaves the origin and the soft limits alone",
+          stored().get("origin_mm") == 300.0
+          and stored().get("limit_mm") == [10.0, 290.0], str(stored()))
+
+    ostage.save_axis_map(serials, path, frames={
+        "z": {"invert": True, "origin_mm": "auto"}})
+    check("'auto' removes it", "origin_mm" not in stored(), str(stored()))
+
+    ostage.save_axis_map(serials, path, frames={
+        "z": {"invert": True, "origin_mm": 300.0}})
+    ostage.save_axis_map(serials, path, frames={
+        "z": {"invert": False, "origin_mm": None}})
+    check("flipping the direction drops an origin meant for the other one",
+          "origin_mm" not in stored() and stored()["invert"] is False,
+          str(stored()))
+    check("and the file is written whole, leaving no temporary behind",
+          not os.path.exists(path + ".part"))

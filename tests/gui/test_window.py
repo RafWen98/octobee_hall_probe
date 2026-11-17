@@ -637,6 +637,13 @@ def test_app(app, args, workdir):
           and len(win._last_table) == 16)
     check("channel health computed", win.session.last_health is not None
           and len(win.session.last_health) == 64)
+    # Exclusion needs the same verdict on two health scans running, and the
+    # scans are HEALTH_PERIOD_S apart -- so wait for it rather than for a
+    # fixed time that is only long enough on a quiet machine.
+    for _ in range(12):
+        if "S16" in win.session.cal.dead:
+            break
+        pump(win, app, 0.5)
     check("S16 detected as dead", "S16" in win.session.cal.dead,
           f"excluded: {sorted(win.session.cal.dead)}")
 
@@ -1035,3 +1042,122 @@ def test_app(app, args, workdir):
         check("carriers left at the clock they were found at",
               after == clkdiv_before, f"{clkdiv_before} -> {after}")
     win.close()
+
+
+def test_machine_tab_plans_stay_honest(app, workdir):
+    """A plan is for one pose, one coil set, one box -- and dies with them.
+
+    Only the volume controls used to discard a plan. Moving the pose, changing
+    the winding radius or taking a new stage zero left the old lines armed and
+    Start enabled, for a path cut round a coil the plan believed was somewhere
+    else.
+    """
+    print("\nmachine tab, plans and what invalidates them")
+
+    class Axis:
+        is_open = True
+        position_mm = 10.0
+        limit_mm = (0.0, 300.0)
+        position_trusted = True
+        vel_params = (6.0, 10.0)
+
+    class Stages:
+        names = ("x", "y", "z")
+
+        def __getitem__(self, name):
+            return Axis()
+
+    ns = argparse.Namespace(
+        uut=None, demo=True, replay=None, no_connect=True,
+        stages=os.path.join(workdir, "stages.json"),
+        geometry=os.path.join(workdir, "pl_geom.json"),
+        calibration=os.path.join(workdir, "pl_cal.json"),
+        machine=os.path.join(workdir, "pl_machine.json"),
+        out_dir=os.path.join(workdir, "plcaps"),
+        screenshot=None, screenshot_tab=0, screenshot_warmup=0)
+    win = gui.MainWindow(ns)
+    try:
+        tab = win.tab_machine
+        win.session.stages = Stages()
+        tab.chk_vol_all.setChecked(False)
+        for i in range(3):
+            tab.vol_spins["from"][i].setValue(0.0)
+            tab.vol_spins["size"][i].setValue(100.0)
+        tab.spin_vol_step.setValue(50.0)
+        tab.chk_vol_avoid.setChecked(False)
+
+        def planned():
+            tab.on_volume_plan()
+            app.processEvents()
+            return tab._plan is not None and tab.btn_vol_start.isEnabled()
+
+        check("a plan arms Start", planned())
+        check("and is sized for the acceleration the axes really run at",
+              tab._plan.accel_mm_s2 == 10.0, f"{tab._plan.accel_mm_s2}")
+
+        tab.machine_pose_spins["x_mm"].setValue(
+            tab.machine_pose_spins["x_mm"].value() + 25.0)
+        check("moving the pose discards the plan and disarms Start",
+              tab._plan is None and not tab.btn_vol_start.isEnabled())
+
+        check("(planned again)", planned())
+        tab.on_machine_radius(win.session.machine.coil_radius_mm + 5.0)
+        check("changing the winding radius discards it",
+              tab._plan is None and not tab.btn_vol_start.isEnabled())
+
+        check("(planned again)", planned())
+        tab.on_machine_zero_stage()
+        check("taking a new stage zero discards it", tab._plan is None)
+
+        check("(planned again)", planned())
+        tab.set_geometry(win.session.geom)
+        check("reloading the probe geometry discards it", tab._plan is None)
+
+        # Whatever slipped past all of those is caught at Start.
+        check("(planned again)", planned())
+        win.session.machine.coil_radius_mm += 1.0          # behind its back
+        check("a plan whose basis changed unseen is not the plan in hand",
+              tab._plan_basis != tab._basis())
+
+        # A result that arrives after the controls moved on is dropped.
+        tab.on_volume_edited()
+        stale = tab._plan_gen - 1
+        tab._on_plan_done(tab.volume(), None, "", stale)
+        check("a plan worked out for superseded controls is dropped",
+              tab._plan is None and not tab.btn_vol_start.isEnabled())
+
+        # A box past the end of an axis is refused when planned, not an hour in.
+        tab.vol_spins["from"][0].setValue(250.0)
+        tab.vol_spins["size"][0].setValue(100.0)            # x to 350
+        check("a box outside the travel is refused at Plan",
+              not planned() and "cannot be run" in tab.lbl_volume.text(),
+              tab.lbl_volume.text()[:90])
+
+        # Anything this tab starts that moves the rig is known to the stop.
+        class Mover(QtCore.QThread):
+            def __init__(self):
+                super().__init__()
+                self.aborted = False
+
+            def abort(self):
+                self.aborted = True
+
+            def run(self):
+                while not self.aborted:
+                    time.sleep(0.01)
+
+        mover = Mover()
+        tab._register(mover)
+        check("a registered job counts as busy before its thread has started",
+              win.motion.busy(),
+              "it used to be pruned as 'not running' and forgotten")
+        mover.start()
+        check("and the stop reaches it", win.motion.abort_all() == 1)
+        mover.wait(2000)
+        check("which ends it", mover.aborted and mover.isFinished())
+        tab._retire(mover)
+        check("and a finished job is no longer busy", not win.motion.busy())
+    finally:
+        win.session.stages = None
+        win.close()
+        app.processEvents()

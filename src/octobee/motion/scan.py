@@ -186,8 +186,11 @@ class FieldMap:
         d = os.path.dirname(os.path.abspath(base))
         if d:
             os.makedirs(d, exist_ok=True)
+        # To a temporary name, then renamed: see SweepLog.save. A partial
+        # map from a failed overnight scan is exactly the file that gets
+        # written while something is already going wrong.
         np.savez_compressed(
-            base + ".npz",
+            base + ".part.npz",
             pos_mm=self.pos_mm.astype(np.float64),
             pos_cmd=self.pos_cmd.astype(np.float64),
             b_mt=self.b_mt.astype(np.float32),
@@ -197,9 +200,11 @@ class FieldMap:
         side = dict(self.meta)
         side["axes"] = self.axes
         side["n_points"] = len(self)
-        with open(base + ".json", "w", encoding="utf-8") as fh:
+        with open(base + ".part.json", "w", encoding="utf-8") as fh:
             json.dump(side, fh, indent=2, default=str)
             fh.write("\n")
+        os.replace(base + ".part.npz", base + ".npz")
+        os.replace(base + ".part.json", base + ".json")
         return base + ".npz"
 
     @classmethod
