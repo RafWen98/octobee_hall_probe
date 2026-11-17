@@ -1424,8 +1424,15 @@ class MachineTab(QtWidgets.QWidget):
         self._machine_key = key
 
         if self.session.stages is not None and not self._machine_travel_taken:
-            self._machine_adopt_travel()
+            # Mark it taken BEFORE adopting, not after. Adopting re-reads the
+            # whole-travel box, which invalidates the plan, stops the preview
+            # and so calls back into refresh_machine(force=True) -- and with
+            # the flag still False that re-entry adopted again, recursing
+            # until Python gave up. It did, on every launch with the stages
+            # connected, from 2026-08-31 on: ~9,000 RecursionErrors and 3 GB
+            # of octobee_crash.log.
             self._machine_travel_taken = True
+            self._machine_adopt_travel()
 
         with self.session.prof.time("machine view"):
             self.machine_view.set_pose(pose, stage)
