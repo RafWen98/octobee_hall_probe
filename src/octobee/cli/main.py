@@ -52,7 +52,7 @@ COMMANDS = {
     "machine":   ("octobee.machine",
                   "the coil set the probe is measuring inside"),
     "record":    ("octobee.record",
-                  "inspect files this application has written"),
+                  "export a saved capture (.npz) as calibrated CSV"),
 }
 
 USAGE = """usage: octobee <command> [options]

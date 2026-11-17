@@ -36,12 +36,17 @@
 PATH=/usr/local/bin:$PATH
 export PATH
 
+# The two vendor tools, overridable only so tests/test_onbox.py can run this
+# script against stand-ins; on the carrier the defaults are what is used.
+GET_SITE=${GET_SITE:-/usr/local/bin/get.site}
+SET_SITE=${SET_SITE:-/usr/local/bin/set.site}
+
 SITE=1
 SSB=$(cat /etc/acq400/0/ssb 2>/dev/null)
 [ -z "$SSB" ] && SSB=96
 
 report() {
-    FS=$(/usr/local/bin/get.site 0 SIG:CLK_S${SITE}:FREQ 2>/dev/null | awk '{print $NF}')
+    FS=$($GET_SITE 0 SIG:CLK_S${SITE}:FREQ 2>/dev/null | awk '{print $NF}')
     DIV=$(cat /etc/acq400/$SITE/clkdiv 2>/dev/null)
     if [ -z "$FS" ]; then
         echo "could not read SIG:CLK_S${SITE}:FREQ -- is the EPICS IOC up?" >&2
@@ -67,10 +72,23 @@ case "$1" in
     ''|*[!0-9]*) echo "usage: $0 [sample_rate_hz]" >&2; exit 2 ;;
 esac
 
-CLK_MB=$(/usr/local/bin/get.site 0 SIG:CLK_MB:FREQ 2>/dev/null | awk '{print $NF}')
+# A rate of 0 would divide by zero below.
+if [ "$1" -eq 0 ]; then
+    echo "requested rate must be greater than 0 Hz" >&2
+    exit 2
+fi
+
+CLK_MB=$($GET_SITE 0 SIG:CLK_MB:FREQ 2>/dev/null | awk '{print $NF}')
+# If the IOC is not up yet this reads back nothing. awk then computes a divider
+# of 0, the clamp below turns that into 1, and the carrier is set to its
+# MAXIMUM rate with no sign anything was wrong. Refuse instead.
+if ! awk -v c="$CLK_MB" 'BEGIN{ exit !(c ~ /^[0-9.]+([eE][+-]?[0-9]+)?$/ && c+0 > 0) }'; then
+    echo "could not read a motherboard clock from SIG:CLK_MB:FREQ (got '${CLK_MB}') -- is the EPICS IOC up? Nothing was changed." >&2
+    exit 1
+fi
 DIV=$(awk -v c="$CLK_MB" -v f="$1" 'BEGIN{d=int(c/f + 0.5); if (d<1) d=1; print d}')
 
 echo "motherboard clock ${CLK_MB} Hz / clkdiv ${DIV}"
-/usr/local/bin/set.site $SITE clkdiv $DIV
+$SET_SITE $SITE clkdiv $DIV
 sleep 3
 report

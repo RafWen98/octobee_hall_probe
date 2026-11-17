@@ -229,11 +229,19 @@ def id_sweep(devs, dwell):
             continue
         print(f"  sensor {pos}: channels OFF")
         sys.stdout.flush()
-        dx.change_channel_state(state=["off", "off", "off", "on"],
-                                channel=["x", "y", "z", "t"])
-        time.sleep(dwell)
-        dx.change_channel_state(state=["on", "on", "on", "on"],
-                                channel=["x", "y", "z", "t"])
+        # try/finally around the whole muted period, and the mute itself
+        # inside it. The muted state is a chip register: Ctrl-C during the
+        # dwell, or an SPI error half way through the mute, used to leave this
+        # sensor's axes switched off, where it reads as a dead channel until
+        # the chip is power-cycled -- indistinguishable from the real fault
+        # this script exists to find. The restore runs on any exit.
+        try:
+            dx.change_channel_state(state=["off", "off", "off", "on"],
+                                    channel=["x", "y", "z", "t"])
+            time.sleep(dwell)
+        finally:
+            dx.change_channel_state(state=["on", "on", "on", "on"],
+                                    channel=["x", "y", "z", "t"])
         print(f"  sensor {pos}: channels back ON")
         sys.stdout.flush()
         time.sleep(dwell)

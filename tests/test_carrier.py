@@ -2,7 +2,11 @@
 
 import numpy as np
 
+import os
 import queue
+import socket
+import threading
+import time
 
 from octobee.acq import carrier as ob
 from octobee.gui.sources import LiveSource
@@ -157,3 +161,120 @@ def test_decode_survives_any_buffer_length():
                   got is not None and got["ai"].shape[0] == want
                   and np.array_equal(got["ai"], ai),
                   "decoded nothing" if got is None else str(got["ai"].shape))
+
+
+def test_find_gaps_sees_the_step_between_blocks():
+    """check_continuity is per block; a shed block left no trace."""
+    print("\ncounter gaps across blocks")
+    a = np.arange(100, 200, dtype=np.uint32)
+    b = np.arange(300, 400, dtype=np.uint32)          # block 200..299 missing
+    check("within a block alone the loss is invisible (the old behaviour)",
+          ob.check_continuity(b) == (0, 0))
+    check("with the previous block's last counter it is found at row 0",
+          ob.find_gaps(b, prev=int(a[-1])) == [(0, 100)],
+          str(ob.find_gaps(b, prev=int(a[-1]))))
+    inside = np.concatenate([a[:50], a[60:]])
+    check("a loss inside a block is placed at the row after it",
+          ob.find_gaps(inside) == [(50, 10)], str(ob.find_gaps(inside)))
+    wrap = (np.arange(10, dtype=np.int64) + 2 ** 32 - 4).astype(np.uint32)
+    check("a 32-bit wrap is a step of one, not a gap",
+          ob.find_gaps(wrap) == [] and ob.find_gaps(
+              np.array([0, 1], np.uint32), prev=2 ** 32 - 1) == [])
+
+
+def test_a_decode_failure_is_reported_not_swallowed(monkeypatch):
+    """Only OSError was caught; anything else killed the reader silently."""
+    print("\nStreamer survives to report")
+
+    class _Sock:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+        def settimeout(self, t):
+            pass
+
+        def recv(self, n):
+            return b"\x00" * self.nbytes
+
+        def close(self):
+            pass
+
+    lay = _layout(96)
+    st = ob.Streamer("fake", layout=lay, block_samples=4, take_over=False)
+    monkeypatch.setattr(socket, "create_connection",
+                        lambda *a, **k: _Sock(st.block_bytes))
+
+    def boom(buf, layout):
+        raise ValueError("frame shape nobody planned for")
+
+    monkeypatch.setattr(ob, "decode", boom)
+    st._run()
+    check("the reader records what killed it",
+          isinstance(st.error, ValueError) and "nobody planned" in str(st.error),
+          repr(st.error))
+
+
+def test_a_scratchpad_too_short_is_refused(monkeypatch):
+    print("\nprobe_uut scratchpad check")
+
+    class _Uut:
+        def __init__(self, host):
+            self.host = host
+
+        def value(self, knob, site=0):
+            return {"ssb": "96", "data32": "0", "spad": "0,0,0"}.get(knob, "")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ob, "Uut", _Uut)
+    try:
+        ob.probe_uut("acq1001_xyz")
+        msg = None
+    except RuntimeError as e:
+        msg = str(e)
+    check("a box with the scratchpad off is refused with a reason",
+          msg is not None and "scratchpad" in msg and "SamCnt" in msg, str(msg))
+
+
+def test_uut_cmd_does_not_read_a_stale_reply():
+    """A late banner must not be taken as the answer to the next command."""
+    print("\nUut.cmd drains stale input")
+    client, server = socket.socketpair()
+    try:
+        u = ob.Uut("fake")
+        u._sockets[0] = client
+        server.sendall(b"WELCOME late banner\n")
+        time.sleep(0.05)                       # let it land in the buffer
+
+        def answer():
+            server.settimeout(2)
+            server.recv(64)
+            server.sendall(b"SIG:CLK:FREQ 200000\n")
+
+        t = threading.Thread(target=answer)
+        t.start()
+        reply = u.cmd("SIG:CLK:FREQ")
+        t.join()
+        check("the reply is the answer, not the banner",
+              reply == "SIG:CLK:FREQ 200000", repr(reply))
+    finally:
+        client.close()
+        server.close()
+
+
+def test_capture_default_goes_to_the_captures_directory(tmp_path, monkeypatch):
+    print("\ncapture default path")
+    monkeypatch.setenv("OCTOBEE_CAPTURES_DIR", str(tmp_path / "caps"))
+    lay = _layout(96)
+    d = {"ai": np.zeros((2, 32), np.int16), "sam_cnt": np.arange(2, dtype=np.uint32),
+         "usec_cnt": np.arange(2, dtype=np.uint32)}
+    monkeypatch.setattr(ob, "capture_all",
+                        lambda hosts, seconds: dict.fromkeys(hosts, (d, lay)))
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    ob._cmd_capture(("a", "b"), 1.0, None)
+    check("with no -o the file lands in the captures directory",
+          os.path.exists(tmp_path / "caps" / "octobee_capture.npz"))
+    check("and not in the working directory", not os.listdir(cwd))

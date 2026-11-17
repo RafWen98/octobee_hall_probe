@@ -48,9 +48,9 @@ echo STREAM_OPTS= >> /etc/sysconfig/acq400_streamd.conf
 # an EEPROM ever went invalid the chip would boot to datasheet defaults (no
 # trims) and the loop would make the gain look correct anyway -- hiding exactly
 # the fault you want to see. With no loop, a bad EEPROM shows up immediately as
-# gain 1500 in:  python3 /tmp/onbox_gain_config.py verify --gain 3000
+# gain 1500 in:  python3 /tmp/gain_config.py verify --gain 3000
 #
 # To change gain, change the EEPROM (this also loads that gain's trim set):
-#     python3 onbox_gain_config.py set --gain <15|150|1500|3000>
-#     python3 onbox_gain_config.py verify --gain <same>
+#     python3 gain_config.py set --gain <15|150|1500|3000>
+#     python3 gain_config.py verify --gain <same>
 # -----------------------------------------------------------------------------

@@ -31,9 +31,11 @@ Usage
 """
 
 import argparse
+import os
 
 import numpy as np
 
+from octobee import paths
 from octobee.acq import carrier as ob
 from octobee.calib import convert as ocal
 
@@ -261,7 +263,7 @@ def report(boxes, ranges, do_plot, plot_path):
                 offs.append(x.mean() / v_per_t * 1e6)      # uT
                 noise.append(x.std() / v_per_t * 1e6)      # uT rms
             rows.append({"sensor": gs, "vcm_v": vcm_v, "temp_c": temps[s],
-                         "off": offs, "noise": noise})
+                         "off": offs, "noise": noise, "v_per_t": v_per_t})
             print(f"{'S'+str(gs):>7} {vcm_v:9.4f} {temps[s]:7.1f} "
                   f"{offs[0]:9.1f} {offs[1]:9.1f} {offs[2]:9.1f}   "
                   f"{noise[0]:9.2f} {noise[1]:9.2f} {noise[2]:9.2f}")
@@ -283,10 +285,16 @@ def report(boxes, ranges, do_plot, plot_path):
 
     vcms = np.array([r["vcm_v"] for r in rows])
     noises = np.array([r["noise"] for r in rows])
+    # Each chip's VCM is turned into field with ITS OWN box's V/T. The loop
+    # above leaves `v_per_t` holding the last box's scale, so converting the
+    # whole spread with it was only right when both carriers share a range --
+    # which they did not until the gains were harmonised, and may not again.
+    apparent_ut = vcms / np.array([r["v_per_t"] for r in rows]) * 1e6
     print()
     print(f"VCM spread across the 16 chips: {vcms.min():.4f} .. {vcms.max():.4f} V "
           f"(delta {(vcms.max()-vcms.min())*1e3:.1f} mV = "
-          f"{(vcms.max()-vcms.min())/v_per_t*1e6:.0f} uT of apparent field if not subtracted)")
+          f"{apparent_ut.max()-apparent_ut.min():.0f} uT of apparent field "
+          f"if not subtracted, each chip at its own box's V/T)")
     med_noise = np.median(noises)
     worst = np.argsort(noises.max(axis=1))[::-1][:4]
     print(f"noise: median {med_noise:.2f} uT rms; noisiest sensors " +
@@ -438,7 +446,9 @@ def main():
                         "gains. Read the true value with onbox/sensor_audit.py. "
                         "Default: whatever calibration.json records.")
     p.add_argument("--plot", action="store_true", help="also write a PNG")
-    p.add_argument("--plot-path", default="octobee_cal.png")
+    p.add_argument("--plot-path", default=None,
+                   help="PNG to write with --plot (default: octobee_cal.png "
+                        "in the captures directory)")
     a = p.parse_args()
 
     hosts = tuple(a.uut) if a.uut else ob.DEFAULT_UUTS
@@ -456,7 +466,11 @@ def main():
     for bx, r in zip(boxes, rng):
         bx["range_mt"] = r
         bx["v_per_t"] = ob.RANGE_TO_VPT[r]
-    report(boxes, rng, a.plot, a.plot_path)
+    plot_path = a.plot_path or os.path.join(paths.captures_dir(),
+                                            "octobee_cal.png")
+    if a.plot:
+        os.makedirs(os.path.dirname(os.path.abspath(plot_path)), exist_ok=True)
+    report(boxes, rng, a.plot, plot_path)
 
 
 if __name__ == "__main__":

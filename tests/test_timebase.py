@@ -111,5 +111,8 @@ def test_csv_header_states_its_timebase(workdir):
     text = "".join(head)
     check("the header names the samples per row", "samples_per_row: 40" in text,
           text[:200])
-    check("the header states the timebase is contiguous",
-          "timebase: contiguous" in text)
+    check("the header states what t_s is, and that a lost sample breaks it",
+          "timebase: t_s is the row number" in text
+          and "does not skip over them" in text, text[-400:])
+    check("and that the two carriers are paired by order, not synchronised",
+          "paired row for row by sample order" in text)

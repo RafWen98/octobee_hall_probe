@@ -44,12 +44,15 @@ Stream frame layout
 
 import contextlib
 import argparse
+import os
 import queue
 import socket
 import threading
 import time
 
 import numpy as np
+
+from octobee import paths
 
 # The two carriers. Order here defines the global sensor numbering.
 DEFAULT_UUTS = ("acq1001_694", "acq1001_695")
@@ -170,8 +173,22 @@ class Uut:
             self._sockets[site] = s
         return self._sockets[site]
 
+    def _drain(self, s):
+        """Discard whatever the box has already said and nobody has read.
+
+        A banner that arrived after BANNER_WAIT, or the tail of a reply that
+        ran past REPLY_GAP, is still sitting in the socket. Without this the
+        next cmd() reads it as the answer to ITS question -- a knob read then
+        returns the previous knob's value, with nothing to show it is stale.
+        """
+        s.settimeout(0.0)
+        with contextlib.suppress(OSError):      # nothing waiting, or closed
+            while s.recv(16384):
+                pass
+
     def cmd(self, knob, site=0, settle=0.0):
         s = self._sock(site)
+        self._drain(s)
         s.sendall((knob + "\n").encode())
         s.settimeout(self.REPLY_GAP)
         buf = b""
@@ -345,7 +362,18 @@ def probe_uut(host):
             raise RuntimeError(f"{host}: data32=1, this decoder assumes packed 16-bit")
         spad = u.value("spad").split(",")          # e.g. '1,7,0'
         spad_lw = int(spad[1]) if len(spad) > 1 and spad[0] != "0" else 0
-        fs = read_freq_hz(u, "SIG:CLK_S1:FREQ")
+        # decode() reads sam_cnt and usec_cnt out of the first two scratchpad
+        # longwords. A box with the scratchpad off (or one longword long)
+        # would make that an IndexError, or worse, read the last encoder or
+        # ADC word as a sample counter, and every continuity figure after that
+        # would be noise. Refuse here, where the cause can still be named.
+        if spad_lw < 2:
+            raise RuntimeError(
+                f"{host}: scratchpad is {spad_lw} longword(s) long (spad "
+                f"reply {spad}); the stream needs at least 2 for SamCnt and "
+                f"uSecCnt, without which dropped samples cannot be detected. "
+                f"Enable it with: set.site 1 spad=1,7,0")
+        fs =read_freq_hz(u, "SIG:CLK_S1:FREQ")
         nchan_ai = int(u.value("NCHAN", site=1))
         rng = u.value("GAIN:ALL", site=1).strip()
         if rng not in ADC_RANGES:
@@ -463,6 +491,31 @@ def check_continuity(sam_cnt):
     return int(bad.sum()), int((d[bad] - 1).sum())
 
 
+def find_gaps(sam_cnt, prev=None):
+    """
+    [(row, lost)] for every break in the sample counter, with WHERE it is.
+
+    `row` is the index of the first sample after the break, so a loss before
+    the very first row of this block has row 0. `prev` is the last counter of
+    the block before, which is what makes that case visible at all:
+    check_continuity() only differences within one array, so a whole block
+    shed by a full queue -- the common loss on a slow GUI -- left no trace,
+    the step between two blocks never being looked at. `lost` is the masked
+    32-bit difference minus one, as in check_continuity; a counter that went
+    BACKWARDS (a box restarted) therefore reads as an enormous number, and the
+    caller has to decide what to do about that.
+    """
+    s = np.asarray(sam_cnt, dtype=np.uint32).astype(np.int64)
+    if prev is not None:
+        s = np.concatenate([[int(prev)], s])
+    d = (np.diff(s) & 0xFFFFFFFF)
+    rows = np.flatnonzero(d != 1)
+    # d[i] is the step into s[i+1]; with `prev` prepended that sample is
+    # row i of the block, without it row i+1.
+    first = 0 if prev is not None else 1
+    return [(int(r) + first, int(d[r]) - 1) for r in rows]
+
+
 # --------------------------------------------------------------------------
 # capture
 # --------------------------------------------------------------------------
@@ -571,6 +624,13 @@ class Streamer:
         except OSError as e:
             if not self._stop.is_set():
                 self.error = e
+        except Exception as e:
+            # Anything else -- a decode failure on a frame shape nobody
+            # planned for, say -- used to end this thread without a word. The
+            # queue just stopped filling, error stayed None, and LiveSource
+            # read() returned None forever: a frozen display with nothing in
+            # the log to say why. Record it so the source can report it.
+            self.error = e
         finally:
             s.close()
 
@@ -615,6 +675,11 @@ def _cmd_info(hosts):
 
 
 def _cmd_capture(hosts, seconds, out):
+    # A bare default filename was resolved against whatever directory the
+    # command happened to be run from, so captures landed beside the shell, not
+    # with the rest -- the same trap octobee.paths exists to remove.
+    out = out or os.path.join(paths.captures_dir(), "octobee_capture.npz")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     res = capture_all(hosts, seconds)
     save = {}
     for bi, h in enumerate(hosts):
@@ -714,7 +779,9 @@ def main():
                     help="sample rate in Hz; omit to just report")
     c = sub.add_parser("capture", help="capture raw data from every box to an .npz")
     c.add_argument("--seconds", type=float, default=2.0)
-    c.add_argument("-o", "--out", default="octobee_capture.npz")
+    c.add_argument("-o", "--out", default=None,
+                   help="output .npz (default: octobee_capture.npz in the "
+                        "captures directory)")
     a = p.parse_args()
     hosts = tuple(a.uut) if a.uut else DEFAULT_UUTS
 

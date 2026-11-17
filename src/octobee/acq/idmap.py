@@ -30,11 +30,27 @@ which the SPI sweep cannot.
 """
 
 import argparse
+import os
 
 import numpy as np
 
+from octobee import paths
 from octobee.acq import carrier as ob
 from octobee import live as ol
+
+
+def resolve_save_path(name):
+    """A bare --save filename goes to the captures directory.
+
+    Left alone it was resolved against whatever directory the command was run
+    from, scattering captures that every other tool writes to one place (see
+    octobee.paths). A name that carries a directory is taken at its word.
+    """
+    if os.path.dirname(name):
+        return name
+    out = os.path.join(paths.captures_dir(), name)
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    return out
 
 
 def bin_stats(ai, fs, bin_s):
@@ -84,7 +100,9 @@ def main():
     p.add_argument("--magnet", action="store_true",
                    help="magnet-pass mode: rank groups by response instead of "
                         "looking for muted channels")
-    p.add_argument("--save", default=None, help="also save the raw capture to .npz")
+    p.add_argument("--save", default=None,
+                   help="also save the raw capture to .npz (a bare name goes "
+                        "to the captures directory)")
     a = p.parse_args()
 
     prev = None
@@ -102,9 +120,10 @@ def main():
 
     ai = d["ai"]
     if a.save:
-        np.savez_compressed(a.save, ai=ai, fs_hz=lay.fs_hz,
+        save = resolve_save_path(a.save)
+        np.savez_compressed(save, ai=ai, fs_hz=lay.fs_hz,
                             vpc=lay.volts_per_count)
-        print(f"saved {a.save}")
+        print(f"saved {save}")
 
     means, stds, bin_s = bin_stats(ai, lay.fs_hz, a.bin)
     print(f"{means.shape[0]} bins of {bin_s:.2f} s\n")

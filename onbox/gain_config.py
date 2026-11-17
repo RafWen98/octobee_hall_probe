@@ -158,10 +158,17 @@ def cmd_set(devs, gain, skip_eeprom=False):
     want_sel = egain_byte(gain)
     print(f"target gain {gain} -> +/-{GAIN_RANGE_MT[gain]} mT, "
           f"{GAIN_VPT[gain]} V/T, EGain_sel=0x{want_sel:02x}")
+    # Sensors that were NOT set: absent, or open_sensor() could not get an
+    # answer from them. They used to be skipped with a printed line and an
+    # exit status of 0, so a script (or an operator reading only the last
+    # line) saw success while a chip kept its old gain -- the half-harmonised
+    # probe this tool exists to prevent.
+    skipped = []
     for pos in range(1, NSENS + 1):
         d = devs.get(pos)
         if d is None:
-            print(f"  sensor {pos}: absent, skipped")
+            print(f"  sensor {pos}: absent or not answering, SKIPPED")
+            skipped.append(pos)
             continue
         before = d.get_gain()
         d.set_amplifier_gain(data=gain)               # registers, all 3 channels
@@ -179,6 +186,7 @@ def cmd_set(devs, gain, skip_eeprom=False):
                 line += f", EGain_sel 0x{have:02x} -> 0x{got:02x}"
                 if got != want_sel:
                     line += "  !! WRITE DID NOT STICK"
+                    skipped.append(pos)
             else:
                 line += f", EGain_sel already 0x{have:02x}"
             # rewrite key + checksum so the chip still trusts its EEPROM
@@ -187,6 +195,9 @@ def cmd_set(devs, gain, skip_eeprom=False):
             line += f", EEPROM valid={d.verify_EEPROM_data_for_config()}"
         print(line)
         sys.stdout.flush()
+    if skipped:
+        print(f"!! gain NOT set on sensor(s) {skipped}")
+    return not skipped
 
 
 def cmd_verify(devs, gain):
@@ -266,7 +277,7 @@ def main():
     elif a.cmd == "backup":
         cmd_backup(devs, a.out)
     elif a.cmd == "set":
-        cmd_set(devs, a.gain, a.registers_only)
+        sys.exit(0 if cmd_set(devs, a.gain, a.registers_only) else 1)
     elif a.cmd == "verify":
         sys.exit(0 if cmd_verify(devs, a.gain) else 1)
     elif a.cmd == "restore":

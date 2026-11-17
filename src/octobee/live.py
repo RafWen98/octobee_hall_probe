@@ -10,7 +10,7 @@ port 4210 on both boxes and draws all 16 sensors at once.
     python octobee/live.py --mode overlay     # all traces on one pair of axes
     python octobee/live.py --mode grid        # one subplot per sensor
     python octobee/live.py --show-vcm         # include the 16 VCM references
-    python octobee/live.py --raw              # raw counts, no VCM subtraction
+    python octobee/live.py --raw              # raw volts, no VCM subtraction
     python octobee/live.py --fs 0             # do not touch the box's sample rate
 
 Sample rate
@@ -46,6 +46,7 @@ import time
 import numpy as np
 
 from octobee.acq import carrier as ob
+from octobee.calib import convert as ocal
 
 
 # --------------------------------------------------------------------------
@@ -110,15 +111,29 @@ class Rolling:
             self.buf[-k:] = block
 
 
-def prepare(ai, vpc, subtract_vcm, show_vcm, decim):
+def prepare(ai, vpc, subtract_vcm, show_vcm, decim, decimator=None):
     """
     Raw (nsamples, 32) counts -> (ndecim, nchan_out) volts, plus the column list.
     Decimation is by block averaging, which also suppresses noise.
+
+    A stream arrives in blocks that are not multiples of `decim`. Averaging each
+    block on its own and dropping the remainder lost (len % decim) samples per
+    block -- about 2.3% at the default decimation -- and, because the plot lays
+    points out at exactly decim/fs apart, made its time axis run slow by the
+    same fraction. Pass one octobee.calib.convert.Decimator PER BOX as `decimator`
+    and the tail is carried into the next block instead. Without one this is
+    the old one-shot behaviour, which is right for a single whole array.
     """
-    n = (ai.shape[0] // decim) * decim
-    if n == 0:
-        return None
-    x = ai[:n].astype(np.float64).reshape(n // decim, decim, ai.shape[1]).mean(axis=1)
+    if decimator is not None:
+        x = decimator.push(ai.astype(np.float64))
+        if x.shape[0] == 0:
+            return None
+    else:
+        n = (ai.shape[0] // decim) * decim
+        if n == 0:
+            return None
+        x = ai[:n].astype(np.float64).reshape(
+            n // decim, decim, ai.shape[1]).mean(axis=1)
     cols = []
     out = []
     for s in range(ob.SENSORS_PER_BOX):
@@ -135,6 +150,19 @@ def prepare(ai, vpc, subtract_vcm, show_vcm, decim):
 # --------------------------------------------------------------------------
 # plot
 # --------------------------------------------------------------------------
+
+def axis_unit(b_range, raw):
+    """The y-axis label for what prepare() actually produces.
+
+    prepare() multiplies by volts-per-count whatever --raw says, so without a
+    range the data is volts either way. Labelling the raw case "counts" put a
+    volts axis under a counts label, out by a factor of ~3e-4 for anyone
+    reading a level off it.
+    """
+    if b_range:
+        return f"B [mT] (+/-{b_range:g} mT range)"
+    return "V (raw, VCM not subtracted)" if raw else "V (VCM subtracted)"
+
 
 AXIS_STYLE = {"Bz": "-", "By": "--", "Bx": ":", "VCM": "-."}
 
@@ -201,7 +229,8 @@ def main():
                         "Lowering it aliases: 2.0x noise at 50k, 3.2x at 20k. "
                         "The original clock is restored on exit.")
     p.add_argument("--raw", action="store_true",
-                   help="plot raw counts without subtracting each sensor's VCM")
+                   help="plot raw channel voltages without subtracting each "
+                        "sensor's VCM")
     p.add_argument("--show-vcm", action="store_true",
                    help="also plot the 16 VCM reference channels")
     p.add_argument("--range", dest="b_range", type=float, default=None,
@@ -242,8 +271,7 @@ def main():
               f"-> {plot_fs:.0f} points/s, {npoints} points in view")
 
         vpt = ob.RANGE_TO_VPT[a.b_range] if a.b_range else None
-        unit = f"B [mT] (+/-{a.b_range:g} mT range)" if vpt else (
-            "counts" if a.raw else "V (VCM subtracted)")
+        unit = axis_unit(a.b_range, a.raw)
         scale = (1e3 / vpt) if vpt else 1.0
 
         # ---- channel bookkeeping ----------------------------------------
@@ -271,11 +299,12 @@ def main():
 
         nch_box = len(per_box_axes) * ob.SENSORS_PER_BOX
         rolls = [Rolling(nch_box, npoints) for _ in hosts]
+        decimators = [ocal.Decimator(decim) for _ in hosts]
         t = np.linspace(-a.window, 0, npoints)
         state = {"step": a.stack_step, "t0": time.time(), "frames": 0}
 
         def update(_):
-            for st, roll in zip(streamers, rolls):
+            for st, roll, dec in zip(streamers, rolls, decimators):
                 if st.error:
                     print(f"\n{st.host}: {st.error}", file=sys.stderr)
                     continue
@@ -283,7 +312,7 @@ def main():
                     if blk is None:
                         continue
                     prep = prepare(blk["ai"], st.layout.volts_per_count,
-                                   subtract_vcm, a.show_vcm, decim)
+                                   subtract_vcm, a.show_vcm, decim, dec)
                     if prep is not None:
                         roll.push(prep[0] * scale)
 

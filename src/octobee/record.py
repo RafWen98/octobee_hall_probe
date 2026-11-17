@@ -42,15 +42,31 @@ from octobee.motion import encoder as oenc
 AXES = ocal.AXES
 N_SENSORS = ocal.N_SENSORS
 
+# The LiveSource.stats() entries that say how much of the stream went missing.
+_STREAM_KEYS = ("gaps", "lost", "dropped blocks")
+
 
 def _stamp():
     return time.strftime("%Y%m%d_%H%M%S")
 
 
 def default_name(prefix, ext, directory=None):
+    """A path in the captures directory that does not exist yet.
+
+    The stamp has one-second resolution, and the recorders open their files
+    with "w". Two recordings started in the same second -- a rollover, or
+    Record pressed twice -- therefore got the SAME name, and the second one
+    silently truncated the first. A suffix is added until the name is free.
+    """
     directory = directory or paths.captures_dir()
     os.makedirs(directory, exist_ok=True)
-    return os.path.join(directory, f"{prefix}_{_stamp()}.{ext}")
+    stem = f"{prefix}_{_stamp()}"
+    path = os.path.join(directory, f"{stem}.{ext}")
+    n = 1
+    while os.path.exists(path) or os.path.exists(path + ".json"):
+        n += 1
+        path = os.path.join(directory, f"{stem}_{n}.{ext}")
+    return path
 
 
 def calibration_id(cal):
@@ -88,7 +104,10 @@ class CsvRecorder:
     point of counting position in the frame rather than polling it: the count
     in a row was latched when that row's samples were converted, so a recorded
     field value and the position it was measured at share a clock by
-    construction, with nothing to interpolate.
+    construction, with nothing to interpolate -- for the sensors on the SAME
+    carrier as the encoders (S9-S16, acq1001_695). S1-S8 are on the other box,
+    which free-runs on its own clock and is only paired with this one by
+    sample order; see the timebase and encoder_timing lines of the header.
 
     `enc_datum` is {axis: (counts_at_datum, mm_at_datum)} -- what the encoder
     read at the moment the controller said the axis was at mm_at_datum. A
@@ -133,6 +152,9 @@ class CsvRecorder:
         self.n_unpaired = 0
         self.t = 0.0
         self.started = time.time()
+        # Stream loss counters as first and last reported; see note_stream.
+        self._stream0 = None
+        self._stream = None
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self._f = open(path, "w", encoding="utf-8", newline="")
         self._write_header(meta or {})
@@ -158,13 +180,27 @@ class CsvRecorder:
         # those the inference was wrong: the live recorder decimated each
         # arriving block on its own and dropped the remainder, so rows were
         # contiguous in the file and not in time -- t_s ran slow by the
-        # discarded fraction, up to 9.9% at 100 Hz. A file that says
-        # "timebase: contiguous" was written after the carry was added and its
-        # t_s is real elapsed time. A file without the field cannot promise it.
+        # discarded fraction, up to 9.9% at 100 Hz. A file with a "timebase"
+        # line was written after the carry was added.
+        #
+        # The carry fixed the remainder and nothing else. "t_s is real elapsed
+        # time" was still false after a dropped block or lost samples, because
+        # those are simply absent from the rows and t_s steps over them by one
+        # row, and it was never exactly true across the two carriers, which
+        # free-run on their own clocks (200001 Hz against 199999 Hz). So say
+        # what a row is, and where to look for what it is not.
         if self.samples_per_row:
             info["samples_per_row"] = int(self.samples_per_row)
-        info["timebase"] = ("contiguous -- every stream sample contributes to "
-                            "exactly one row, so t_s is real elapsed time")
+        info["timebase"] = (
+            "t_s is the row number over the output rate. No stream sample is "
+            "dropped by decimation, but samples LOST in transit (a dropped "
+            "block, a break in the sample counter) are not in the file and t_s "
+            "does not skip over them, so after any such gap it is not real "
+            "elapsed time -- the stream_gaps footer counts them where the "
+            "application reported them. The two carriers are not "
+            "synchronised: each free-runs on its own clock and they are paired "
+            "row for row by sample order, not resampled, so S1-S8 and S9-S16 "
+            "in one row drift apart by about 2 samples per second")
         if self.enc_columns:
             info["encoder_columns"] = self.enc_columns
             info["encoder_axes"] = (
@@ -172,9 +208,12 @@ class CsvRecorder:
                 else "no encoder axes calibrated -- counts only, no mm")
             info["encoder_datum"] = self._datum_note()
             info["encoder_timing"] = (
-                "counts were latched by the ADC clock in the same samples the "
-                "field on this row was averaged from -- no interpolation, no "
-                "clock offset against the field")
+                f"counts were latched by the ADC clock of {ob.DEFAULT_UUTS[1]} "
+                f"(S9-S16), in the same samples the S9-S16 field on this row "
+                f"was averaged from -- no interpolation, no clock offset. "
+                f"S1-S8 come from {ob.DEFAULT_UUTS[0]}, a separate carrier "
+                f"paired by sample order, so against them the position is only "
+                f"as good as that pairing (see timebase)")
         info.update(meta)
         for k, v in info.items():
             self._f.write(f"# {k}: {v}\n")
@@ -221,8 +260,25 @@ class CsvRecorder:
                              f"the controller")
         return "; ".join(parts)
 
-    def write(self, b_mt, counts=None):
+    def note_stream(self, stats):
+        """Record the source's loss counters, for the footer written at close.
+
+        `stats` is LiveSource.stats(): its gaps / lost / dropped blocks are
+        totals since the source connected, so the first call is kept as the
+        baseline and the footer reports what happened while THIS file was
+        open. A file that never gets this says nothing about gaps, and its
+        header says so.
+        """
+        got = {k: int(stats.get(k, 0)) for k in _STREAM_KEYS}
+        if self._stream0 is None:
+            self._stream0 = got
+        self._stream = got
+
+    def write(self, b_mt, counts=None, stream=None):
         """Append (n, 16, 3) millitesla already decimated to fs_out.
+
+        `stream` is optionally the source's stats() dict, passed through to
+        note_stream.
 
         `counts` is the (n, columns) block of continuous encoder counts for
         THE SAME rows, decimated by the same factor. A block whose counts do
@@ -251,6 +307,14 @@ class CsvRecorder:
                 parts.append(self._positions_mm(c))
         rows = np.concatenate(parts, axis=1)
         np.savetxt(self._f, rows, delimiter=",", fmt=self._fmt)
+        # Flushed every call, as the raw recorder is: without it a killed run
+        # loses up to a buffer of rows and leaves the last one cut off
+        # mid-line, which a reader then fails on. A call is one acquisition
+        # tick (~20 a second) carrying a few dozen rows of a few kilobytes at
+        # most, so one flush per call costs nothing measurable.
+        self._f.flush()
+        if stream is not None:
+            self.note_stream(stream)
         self.n_rows += n
         return n
 
@@ -301,6 +365,14 @@ class CsvRecorder:
 
     def close(self):
         if self._f and not self._f.closed:
+            if self._stream is not None:
+                d = {k: self._stream[k] - self._stream0[k]
+                     for k in _STREAM_KEYS}
+                self._f.write(
+                    f"# stream_gaps: {d['gaps']} break(s) in a sample counter, "
+                    f"{d['lost']} sample(s) lost, {d['dropped blocks']} "
+                    f"block(s) dropped while this file was open -- each is a "
+                    f"hole in t_s that the rows do not show\n")
             self._f.close()
         return self.path
 
@@ -324,6 +396,20 @@ class RawRecorder:
     wire, in wire order, with nothing subtracted. The sidecar records the volts
     per count, sample rate, host order and channel names so it can always be
     read back, including by a future version that has corrected the channel map.
+
+    The .bin itself holds counts only, in the order the two boxes were paired
+    live. Two optional companions let it be re-aligned offline, without changing
+    the .bin (old files load exactly as before):
+
+      <path>.index.csv  one line per write: the row the block starts at, its
+                        length, each box's own sample counter at that row, and
+                        the loss totals so far. The counters are what show a
+                        box's step across a hole that was repaired by trimming
+                        the other box, and the cumulative counts show which
+                        block it fell in.
+      <path>.enc        the encoder counts for the same rows (uint32, little
+                        endian, `enc_columns` per row) -- the position, which
+                        the .bin has no room for.
     """
 
     def __init__(self, path, hosts, vpc, fs_hz, nchan_per_box=32, meta=None,
@@ -332,6 +418,9 @@ class RawRecorder:
         self.hosts = list(hosts)
         self.nchan = nchan_per_box * len(hosts)
         self.n_samples = 0
+        self._index = None          # opened on the first indexed write
+        self._enc = None            # likewise
+        self._enc_rows = 0
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self._f = open(path, "wb")
         self.meta = {"created": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -364,8 +453,14 @@ class RawRecorder:
         with open(self.path + ".json", "w", encoding="utf-8") as f:
             json.dump(self.meta, f, indent=2)
 
-    def write(self, ai_by_box):
-        """Append per-box (n, 32) int16 blocks, trimmed to the shorter one."""
+    def write(self, ai_by_box, index=None, enc=None):
+        """Append per-box (n, 32) int16 blocks, trimmed to the shorter one.
+
+        `index` is LiveSource.block_index for these rows and `enc` its .enc
+        counts; both optional, and both are only ever written alongside the
+        data, never into it. A block whose counts do not match its length is
+        left out of the .enc file, and its index line says so.
+        """
         arrs = [np.asarray(a) for a in ai_by_box]
         if not arrs or min(a.shape[0] for a in arrs) == 0:
             return 0
@@ -377,8 +472,36 @@ class RawRecorder:
         # size this is one write() syscall per acquisition tick against the
         # megabytes it carries, so it costs nothing measurable.
         self._f.flush()
+        if index is not None:
+            self._write_index(n, index, enc)
         self.n_samples += n
         return n
+
+    def _write_index(self, n, index, enc):
+        """One line of <path>.index.csv, and the block's counts to <path>.enc."""
+        enc_row = ""
+        if enc is not None and np.shape(enc)[:1] == (n,) and np.ndim(enc) == 2:
+            if self._enc is None:
+                self._enc = open(self.path + ".enc", "wb")
+                self.meta["enc_columns"] = int(np.shape(enc)[1])
+                self.meta["enc_file"] = os.path.basename(self.path) + ".enc"
+                self._write_sidecar()
+            self._enc.write(np.ascontiguousarray(enc, dtype="<u4").tobytes())
+            self._enc.flush()
+            enc_row = self._enc_rows
+            self._enc_rows += n
+        if self._index is None:
+            self._index = open(self.path + ".index.csv", "w", encoding="utf-8",
+                               newline="")
+            self._index.write(",".join(
+                ["row", "n"] + [f"sam_cnt_{h}" for h in self.hosts]
+                + ["gaps", "lost", "dropped_blocks", "enc_row"]) + "\n")
+            self.meta["index_file"] = os.path.basename(self.path) + ".index.csv"
+            self._write_sidecar()
+        fields = [self.n_samples, n, *index["sam_cnt"], index["gaps"],
+                  index["lost"], index["dropped_blocks"], enc_row]
+        self._index.write(",".join(str(v) for v in fields) + "\n")
+        self._index.flush()
 
     @property
     def size_bytes(self):
@@ -387,6 +510,9 @@ class RawRecorder:
     def close(self):
         if self._f and not self._f.closed:
             self._f.close()
+        for extra in (self._index, self._enc):
+            if extra is not None and not extra.closed:
+                extra.close()
         self.meta["n_samples"] = self.n_samples
         self._write_sidecar()
         return self.path
@@ -425,6 +551,36 @@ def load_raw(path, mmap=False):
          else np.fromfile(path, dtype="<i2"))
     n = x.size // nchan
     return x[:n * nchan].reshape(n, nchan), meta
+
+
+def load_raw_index(path):
+    """The per-block index of a RawRecorder file as {column: array}, or None.
+
+    None for a file written without one -- every file before the index
+    existed, and any recording made through a caller that did not pass it.
+    """
+    try:
+        with open(path + ".index.csv", encoding="utf-8") as f:
+            names = f.readline().strip().split(",")
+            rows = [ln.strip().split(",") for ln in f if ln.strip()]
+    except OSError:
+        return None
+    out = {}
+    for i, name in enumerate(names):
+        # enc_row is blank for a block that carried no counts.
+        out[name] = np.array([float(r[i]) if r[i] != "" else np.nan
+                              for r in rows if len(r) == len(names)])
+    return out
+
+
+def load_raw_enc(path, meta):
+    """The encoder counts stored beside a RawRecorder file, (n, columns) or None."""
+    if not meta.get("enc_file"):
+        return None
+    cols = int(meta["enc_columns"])
+    x = np.fromfile(os.path.join(os.path.dirname(path), meta["enc_file"]),
+                    dtype="<u4")
+    return x[:x.size // cols * cols].reshape(-1, cols)
 
 
 def raw_to_boxes(x, meta):

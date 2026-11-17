@@ -3,7 +3,6 @@
 import os
 import queue
 import time
-from collections import deque
 
 import numpy as np
 
@@ -60,8 +59,29 @@ class LiveSource(SourceBase):
         self.vpc = [lay.volts_per_count for lay in layouts]
         self.volt_offset = [lay.volt_offset for lay in layouts]
         self.fs_hz = float(layouts[0].fs_hz)
-        self._pending = {h: deque() for h in self.hosts}
-        self._n = dict.fromkeys(self.hosts, 0)
+        # Rows received and not yet handed out, one (n, nchan) array per box,
+        # and the same for the encoder counts of the encoder box.
+        self._buf = {h: np.empty((0, lay.nchan_ai), dtype=np.int16)
+                     for h, lay in zip(self.hosts, self.layouts)}
+        self._enc_buf = None
+        # Each pending row's own sample counter, cut in step with the rows, so
+        # the counter of the first row handed out is known whatever was
+        # discarded before it (see block_index).
+        self._sam_buf = {h: np.empty(0, dtype=np.uint32) for h in self.hosts}
+        # What the rows the last read() returned were: see block_index.
+        self.block_index = None
+        # Rows handed out so far. Both boxes are paired by ROW INDEX, so this
+        # is the one clock the pairing lives on; see _owe().
+        self._taken = 0
+        # Last sample counter seen per box, so the step between one block and
+        # the next is checked too (None until a box's first block).
+        self._last_sam = dict.fromkeys(self.hosts)
+        # Samples per box that the counter says went by, lost ones included.
+        self._span = dict.fromkeys(self.hosts, 0)
+        # Rows still to be thrown away from a box when they arrive, as
+        # (row index, count); see _owe().
+        self._debt = {h: [] for h in self.hosts}
+        self._reported = set()
         self._temp = {h: np.zeros(8, dtype=np.uint32) for h in self.hosts}
         # Which box the positions come from. Decided on what the carriers say
         # about themselves -- how many of their quadrature modules are actually
@@ -79,7 +99,6 @@ class LiveSource(SourceBase):
                             else int(best[2].n_site2_lw))
         self.enc_sites = (() if self._enc_host is None
                           else tuple(sorted(best[2].encoder_columns)))
-        self._enc_pending = deque()
         self.gaps = 0
         self.lost = 0
         self.error = None
@@ -109,37 +128,159 @@ class LiveSource(SourceBase):
             st.dropped = 0
             st.bytes_read = 0
 
+    @property
+    def failed(self):
+        """Hosts whose reader thread has died, as a list (empty while healthy).
+
+        read() reports each error once, so the caller can no longer tell from
+        `error` alone that nothing more will ever arrive; this can. One dead
+        box is enough to stop the source -- the other half of every row is
+        missing -- so a non-empty list means "stop recording and reconnect".
+        """
+        return [h for h, st in zip(self.hosts, self.streamers) if st.error]
+
+    # A counter step this large is the counter going BACKWARDS (a box that
+    # restarted), not a loss of two billion samples. Counted as a gap, but
+    # there is nothing sensible to realign by.
+    _MAX_LOSS = 1 << 31
+
     def read(self):
         for h, st in zip(self.hosts, self.streamers):
-            if st.error and self.error is None:
+            # Once. st.error persists after a failure, and the GUI polls this
+            # every 50 ms, so re-reporting it was twenty identical log lines a
+            # second for as long as the session stayed open.
+            if st.error and h not in self._reported and self.error is None:
+                self._reported.add(h)
                 self.error = f"{h}: {st.error}"
             for blk in st.get_all():
                 if blk is None:
                     continue
-                self._pending[h].append(blk["ai"])
-                self._n[h] += blk["ai"].shape[0]
-                if h == self._enc_host and blk.get("enc") is not None:
-                    self._enc_pending.append(blk["enc"])
+                self._take_block(h, blk)
                 if "temp_raw" in blk:
                     self._temp[h] = blk["temp_raw"]
-                gaps, lost = ob.check_continuity(blk["sam_cnt"])
-                self.gaps += gaps
-                self.lost += lost
-        n = min(self._n.values()) if self._n else 0
+        n = min(len(b) for b in self._buf.values()) if self._buf else 0
         if n <= 0:
             self.enc = None
+            self.block_index = None
             return None
         out = []
         for h in self.hosts:
-            buf = np.concatenate(self._pending[h], axis=0)
-            out.append(buf[:n])
-            rest = buf[n:]
-            self._pending[h].clear()
-            if rest.shape[0]:
-                self._pending[h].append(rest)
-            self._n[h] = rest.shape[0]
+            out.append(self._buf[h][:n])
+            self._buf[h] = self._buf[h][n:]
+        # For the raw archive: where in each box's own counter this block
+        # starts, and the loss totals so far. Rows are contiguous in the file
+        # even where a hole was repaired, so this is what lets an offline
+        # reader see that a box's counter jumped inside or between blocks.
+        self.block_index = {
+            "sam_cnt": [int(self._sam_buf[h][0]) for h in self.hosts],
+            "gaps": self.gaps, "lost": self.lost,
+            "dropped_blocks": sum(st.dropped for st in self.streamers)}
+        for h in self.hosts:
+            self._sam_buf[h] = self._sam_buf[h][n:]
         self.enc = self._take_enc(n)
+        self._taken += n
         return out
+
+    def _take_block(self, h, blk):
+        """Accept one block from box h, noticing and repairing any loss.
+
+        The two carriers are paired by row index: row i of box A is shown,
+        recorded and converted against row i of box B, and the encoder counts
+        (which ride in box 695's frames) against both. That is only true while
+        neither box has lost a sample. A block shed by a full queue, or
+        samples missing inside one, removes rows from ONE box, and every row
+        after that is permanently shifted against the other -- one half of the
+        probe paired with a partner half and a position from a different
+        instant, with nothing in the file to show it.
+
+        So each box's own sample counter is followed across blocks (the step
+        BETWEEN blocks was never checked, which is how a dropped block went
+        unseen) and every break is counted in gaps/lost AND repaired: the
+        other box is made to discard the same number of samples at the same
+        place, so the rows after the hole are paired as they were before it.
+        The time axis therefore has a hole of that many samples, which the
+        counters report, instead of a silent shift.
+
+        A box's counter is only ever compared with ITS OWN earlier values. The
+        two start at unrelated numbers, so nothing is compared across boxes.
+        """
+        sam = np.asarray(blk["sam_cnt"], dtype=np.uint32)
+        if not len(sam):
+            return
+        ai = blk["ai"]
+        enc = blk.get("enc") if h == self._enc_host else None
+        pos = 0
+        for row, lost in ob.find_gaps(sam, self._last_sam[h]):
+            self._accept(h, ai[pos:row], sam[pos:row],
+                         None if enc is None else enc[pos:row])
+            pos = row
+            self.gaps += 1
+            if lost >= self._MAX_LOSS:
+                continue
+            self.lost += lost
+            self._span[h] += lost
+            for other in self.hosts:
+                if other != h:
+                    self._owe(other, self._taken + len(self._buf[h]), lost)
+        self._accept(h, ai[pos:], sam[pos:], None if enc is None else enc[pos:])
+        self._last_sam[h] = int(sam[-1])
+        self._span[h] += len(sam)
+
+    def _accept(self, h, ai, sam, enc):
+        """Append rows to box h, discarding any it owes (see _owe)."""
+        while len(ai):
+            have = self._taken + len(self._buf[h])
+            due = self._debt[h]
+            if due and due[0][0] <= have:
+                at, count = due[0]
+                k = min(count, len(ai))
+                ai, sam = ai[k:], sam[k:]
+                enc = None if enc is None else enc[k:]
+                if k == count:
+                    due.pop(0)
+                else:
+                    due[0] = (at, count - k)
+                continue
+            k = len(ai) if not due else min(len(ai), due[0][0] - have)
+            self._buf[h] = np.concatenate([self._buf[h], ai[:k]], axis=0)
+            self._sam_buf[h] = np.concatenate([self._sam_buf[h], sam[:k]])
+            if enc is not None:
+                self._enc_buf = (enc[:k] if self._enc_buf is None
+                                 else np.concatenate([self._enc_buf, enc[:k]]))
+            ai, sam = ai[k:], sam[k:]
+            enc = None if enc is None else enc[k:]
+
+    def _owe(self, h, at, count):
+        """Box h must give up `count` rows starting at row index `at`.
+
+        `at` is where the other box lost samples, in the shared row numbering.
+        Rows of h that are already here are cut out of its pending data (they
+        are always still pending: `at` is never behind what has been handed
+        out, because the box that lost samples had not yet got that far). Any
+        part h has not received yet becomes a debt, paid as those rows
+        arrive -- which also covers a count larger than what is pending, so a
+        long loss is carried forward rather than clipped.
+
+        For the encoder box the counts are cut with the same rows, so a count
+        stays with the sample it was latched in. When the loss was on the
+        encoder box itself nothing is cut from its counts: they are missing
+        exactly where its samples are, and the OTHER box does the discarding.
+        """
+        have = self._taken + len(self._buf[h])
+        if at < have:
+            i = at - self._taken
+            k = min(count, have - at)
+            buf = self._buf[h]
+            self._buf[h] = np.concatenate([buf[:i], buf[i + k:]], axis=0)
+            sam = self._sam_buf[h]
+            self._sam_buf[h] = np.concatenate([sam[:i], sam[i + k:]])
+            if h == self._enc_host and self._enc_buf is not None:
+                e = self._enc_buf
+                self._enc_buf = np.concatenate([e[:i], e[i + k:]], axis=0)
+            count -= k
+        if count:
+            self._debt[h].append((at, count))
+            self._debt[h].sort()
 
     @property
     def enc_host(self):
@@ -156,18 +297,16 @@ class LiveSource(SourceBase):
         by a few samples is worse than one that is absent, because nothing
         downstream can tell.
         """
-        if not self._enc_pending:
+        buf, self._enc_buf = self._enc_buf, None
+        if buf is None:
             return None
-        buf = np.concatenate(self._enc_pending, axis=0)
-        self._enc_pending.clear()
         if buf.shape[0] < n:
             self.error = self.error or (
                 f"{self._enc_host}: {buf.shape[0]} encoder rows against {n} "
                 f"analogue rows -- encoder positions dropped for this block")
             return None
-        rest = buf[n:]
-        if rest.shape[0]:
-            self._enc_pending.append(rest)
+        if buf.shape[0] > n:
+            self._enc_buf = buf[n:]
         return buf[:n]
 
     def temperatures(self):
@@ -176,9 +315,19 @@ class LiveSource(SourceBase):
     def stats(self):
         total = sum(st.bytes_read for st in self.streamers)
         dt = max(time.time() - self.t0, 1e-3)
-        return {"MB/s": total / dt / 1e6,
-                "gaps": self.gaps, "lost": self.lost,
-                "dropped blocks": sum(st.dropped for st in self.streamers)}
+        out = {"MB/s": total / dt / 1e6,
+               "gaps": self.gaps, "lost": self.lost,
+               "dropped blocks": sum(st.dropped for st in self.streamers)}
+        if len(self.hosts) > 1:
+            # The boxes free-run on their own clocks (200001 Hz against
+            # 199999 Hz on this rig), so the number of samples each has
+            # produced slowly diverges, ~2 per second. Rows are paired by
+            # order, not resampled, so this is how far apart in time the two
+            # halves of a row have drifted. It includes whatever each box has
+            # buffered, so read its trend, not a single value.
+            out["box offset"] = (self._span[self.hosts[0]]
+                                 - self._span[self.hosts[1]])
+        return out
 
     def stop(self):
         for st in self.streamers:
