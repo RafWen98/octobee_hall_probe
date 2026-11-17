@@ -319,6 +319,17 @@ def peak_response(b_mt):
     Peak rather than mean because the magnet is only near a given sensor for a
     few points of the sweep; the mean would mostly measure how long the sweep
     was.
+
+    NO BASELINE IS SUBTRACTED, unlike convert.peak_response(). The peak is
+    |magnet field + whatever else the reading carries|: the ambient field
+    (~0.05 mT) and, if the run was not tared, the sensor's own offset
+    (0.1-0.6 mT on this probe). Against a peak of several mT that is a few per
+    cent on the trim and is the same order as the corrections this module
+    argues about. It matters most in fit_falloff(), which fits a pure power
+    law: a constant added to |B| bends ln|B| against ln|d - z| and comes out
+    as a wrong distance and a wrong exponent, not as a residual. So tare
+    before a guided run, and read a falloff exponent that drifts away from 3
+    on the far, weak end of a dither as this before anything else.
     """
     b = np.asarray(b_mt, float)
     mag = np.linalg.norm(b, axis=2)                  # (npoints, 16)
@@ -1218,23 +1229,48 @@ class MagnetRun:
                 f"{move}")
         return out
 
-    def trim(self, use_dither=True):
+    def trim(self, use_dither=True, live=None):
         """(16,) the multiplicative gain trim this run implies, 1.0 = neutral.
 
         Returned rather than applied: what to do with it is the caller's
         decision, and Calibration.cross_calibrate() is the thing that owns how
         a trim is folded in.
+
+        `live` is `Calibration.live_mask()`, and it is the same argument
+        cross_calibrate() takes for the same reason, so that the two keep
+        returning the same factor. A dead sensor's peak is whatever its broken
+        channels read -- a railed axis is hundreds of mT -- and counted in, it
+        moves the median every healthy sensor is trimmed toward and the
+        threshold that decides who answered. Sensors that are not live get
+        1.0. Default is all sixteen, as before the argument existed.
         """
         resp, _ = self.response(use_dither=use_dither)
-        ok = resp > DEAD_FRACTION * np.median(resp)
+        live = self._live(live)
+        if not live.any():
+            return np.ones(N_SENSORS)
+        ok = live & (resp > DEAD_FRACTION * np.median(resp[live]))
         ref = np.median(resp[ok]) if ok.any() else 1.0
         return np.where(ok & (resp > 0), ref / np.where(resp > 0, resp, 1.0), 1.0)
 
-    def quiet_sensors(self, use_dither=True):
-        """Sensors that never really answered, as S-labels."""
+    def quiet_sensors(self, use_dither=True, live=None):
+        """Sensors that never really answered, as S-labels.
+
+        Judged against the median of the LIVE sensors (see trim()), and only
+        live sensors are listed: one already excluded is not news, and a
+        railed one is anything but quiet.
+        """
         resp, _ = self.response(use_dither=use_dither)
-        thresh = DEAD_FRACTION * np.median(resp)
-        return [f"S{i + 1}" for i in range(N_SENSORS) if resp[i] <= thresh]
+        live = self._live(live)
+        if not live.any():
+            return []
+        thresh = DEAD_FRACTION * np.median(resp[live])
+        return [f"S{i + 1}" for i in range(N_SENSORS)
+                if live[i] and resp[i] <= thresh]
+
+    @staticmethod
+    def _live(live):
+        return (np.ones(N_SENSORS, bool) if live is None
+                else np.asarray(live, bool).reshape(N_SENSORS))
 
     # ---- what it says about the geometry --------------------------------
     def slot_groups(self):
@@ -1887,7 +1923,8 @@ def ring_positions(sweep, n_rings=pgeom.SENSORS_PER_FACE):
 # re-deriving a trim from a run already on disk
 # --------------------------------------------------------------------------
 
-def apply_run(run, cal, use_dither=True, replacing=None, geom=None):
+def apply_run(run, cal, use_dither=True, replacing=None, geom=None,
+              replacing_use_dither=None, source=None):
     """Fold a saved run's trim into `cal`. Returns a list of report lines.
 
     Every capture is converted through the calibration that was live when it
@@ -1901,17 +1938,73 @@ def apply_run(run, cal, use_dither=True, replacing=None, geom=None):
 
     `replacing` is usually the same run -- that is the shape of "apply this
     one again, differently", which is what a failed pass C leaves you needing.
+
+    The undo has to divide out the factor that WAS applied, and one run has
+    two: with pass C and without. `replacing_use_dither` says which. It used
+    to be taken as "with", always -- and the calibration this was written for
+    had been applied without ("A+B, pass C dropped"), so --replacing divided
+    out a 5.9x-spread trim that had never been multiplied in. The mode is now
+    recorded in `cal.gain_source` every time this function applies a trim, and
+    read back from there; pass `replacing_use_dither` for a calibration that
+    predates the record. With neither, this refuses rather than guess: the two
+    answers differ by more than the trim is worth.
+
+    Dead sensors (`cal.live_mask()`) are left out of the reference median and
+    keep the gain they had -- see Calibration.cross_calibrate.
+
+    Refuses a run measured at other ranges than `cal` is set to, for the
+    reason apply_pose_solution does: the chip loads a separate factory
+    dataset per gain, so a trim measured at one is not the trim at another.
+
+    `source` is a name for the run, kept in the record for whoever reads the
+    file later.
     """
+    if (run.ranges_mt is not None
+            and not np.allclose(run.ranges_mt, cal.ranges_mt)):
+        raise ValueError(
+            f"this run was measured at ranges {run.ranges_mt.tolist()} but "
+            f"the calibration is set to {cal.ranges_mt.tolist()}; a gain trim "
+            f"does not carry from one range to another")
     lines = []
     if replacing is not None:
-        undo = replacing.trim()
+        record = cal.gain_source or {}
+        mode = replacing_use_dither
+        if mode is None:
+            mode = record.get("use_dither")
+        if mode is None:
+            raise ValueError(
+                "cannot divide out the earlier trim: this calibration does "
+                "not record whether it was applied with pass C or without, "
+                "and the two factors are different. Say which with "
+                "replacing_use_dither (--replacing-passes on the command "
+                f"line). The calibration's own notes read: {cal.notes!r}")
+        mode = bool(mode)
+        if record.get("use_dither") is not None \
+                and bool(record["use_dither"]) != mode:
+            lines.append(
+                f"NOTE: the calibration records its trim as applied "
+                f"{'with' if record['use_dither'] else 'without'} pass C, "
+                f"and you asked for the other to be divided out. Doing as "
+                f"asked")
+        # The same sensors the earlier apply trimmed. One that predates the
+        # record trimmed all sixteen, which is what an absent list means.
+        was_live = ocal.live_mask(record.get("excluded"))
+        undo = replacing.trim(use_dither=mode, live=was_live)
         cal.gain_corr = cal.gain_corr / undo[:, None]
-        lines.append(f"divided out the trim already applied from that run "
+        lines.append(f"divided out the {'A+B+C' if mode else 'A+B'} trim "
+                     f"already applied from that run "
                      f"({undo.min():.3f}..{undo.max():.3f}, "
                      f"{undo.max() / undo.min():.2f}x spread)")
+    live = cal.live_mask()
     resp, _best = run.response(use_dither=use_dither)
-    _corr, skipped = cal.cross_calibrate(resp)
-    t = run.trim(use_dither=use_dither)
+    _corr, skipped = cal.cross_calibrate(resp, live=live)
+    if N_SENSORS - len(skipped) >= 2:
+        # Not when cross_calibrate declined to trim at all (fewer than two
+        # usable sensors): a record of a trim that was never applied is how
+        # the next undo divides out the wrong thing.
+        cal.gain_source = {"use_dither": bool(use_dither), "run": source,
+                           "excluded": sorted(cal.dead)}
+    t = run.trim(use_dither=use_dither, live=live)
     lines.append(f"applied the {'A+B+C' if use_dither else 'A+B'} trim "
                  f"({t.min():.3f}..{t.max():.3f}, "
                  f"{t.max() / t.min():.2f}x spread)")
@@ -1944,7 +2037,15 @@ def _cmd_apply(a):
     cal = ocal.Calibration.load(a.calibration)
     before = cal.gain_corr[:, 0].copy()
     prev = MagnetRun.load(a.replacing) if a.replacing else None
-    for line in apply_run(run, cal, use_dither=use_dither, replacing=prev):
+    prev_mode = {None: None, "abc": True, "ab": False}[a.replacing_passes]
+    try:
+        lines = apply_run(run, cal, use_dither=use_dither, replacing=prev,
+                          replacing_use_dither=prev_mode,
+                          source=os.path.basename(a.run))
+    except ValueError as exc:
+        print(f"  refusing: {exc}")
+        return 1
+    for line in lines:
         print(f"  {line}")
     after = cal.gain_corr[:, 0]
     print(f"  gain {before.min():.3f}..{before.max():.3f} "
@@ -1982,6 +2083,13 @@ def main(argv=None):
                     help="a run whose trim is already folded into that "
                          "calibration; its factor is divided out first. Pass "
                          "the same run to re-apply it differently.")
+    ap.add_argument("--replacing-passes", choices=("ab", "abc"), default=None,
+                    help="which trim of the --replacing run is in the "
+                         "calibration now: 'abc' if it was applied with pass "
+                         "C, 'ab' if with --no-dither. Read from the "
+                         "calibration when it records it; required when it "
+                         "does not, because the two differ and guessing "
+                         "divides out the wrong one")
     ap.add_argument("--standoff", type=float, default=None,
                     help="the standoff you believe you clamped, in mm, to "
                          "check the dither fits against")

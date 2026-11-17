@@ -76,11 +76,22 @@ def test_conversion():
                           [lay_uni.volt_offset] * 2)
     check("a unipolar range converts bottom-of-scale to 0 V, not -2.5 V",
           abs(float(volts[0, 0, 0])) < 1e-9, f"got {volts[0,0,0]:+.3f} V")
-    rows = ocal.channel_health([counts, counts],
+    # A chip resting at its 2.2 V virtual ground, as the unipolar range codes
+    # it. (Not bottom-of-scale: that is 0 V, which is what an unpowered chip
+    # reads and is now rightly outside the window.)
+    rest = np.full((4, 32), int(round((2.2 - lay_uni.volt_offset)
+                                      / lay_uni.volts_per_count)),
+                   dtype=np.int16)
+    rows = ocal.channel_health([rest, rest],
                                [lay_uni.volts_per_count] * 2,
                                ["a", "b"], [lay_uni.volt_offset] * 2)
     check("and channel_health does not call all 64 channels out of range",
           not any(r["out_of_range"] for r in rows))
+    rows = ocal.channel_health([rest, rest],
+                               [lay_uni.volts_per_count] * 2, ["a", "b"])
+    check("which it would, without the pedestal",
+          all(r["out_of_range"] for r in rows),
+          f"{rows[0]['mean_v']:+.2f} V")
 
     # A wrapping uint32 sample counter is a step of 1, not a 4-billion gap.
     wrap = np.arange(2 ** 32 - 3, 2 ** 32 + 3, dtype=np.int64).astype(np.uint32)
@@ -308,3 +319,207 @@ def test_calibration_archives_each_save(workdir):
     check("and does not stop the next archive being written",
           cal.archived_to and "raffi" not in cal.archived_to,
           str(cal.archived_to))
+
+
+def _resting_box(volts, vpc, rng, n=400):
+    """(32,) resting volts in wire order -> (n, 32) counts with ADC noise."""
+    v = np.asarray(volts, float)[None, :] / vpc + rng.normal(0, 2, (n, 32))
+    return np.round(v).astype(np.int16)
+
+
+def test_plausible_window():
+    """A channel resting where no working chip can must not pass as healthy.
+
+    The old window was -0.5..5.5 V against an output that can only be
+    0.125..4.380 V. An unpowered chip does not rail, it rests near 0 V, so it
+    sat comfortably inside: a whole unpowered box read -0.02 V and was called
+    healthy, and on 2026-10-27 S10's VCM at -0.20 V was not flagged.
+    """
+    print("\nchannel health -- the plausible window")
+    vpc = 20.0 / 65536.0
+    rng = np.random.default_rng(5)
+    healthy = np.full(32, 2.2)
+
+    lo, hi = ocal.PLAUSIBLE_V
+    check("the window brackets the datasheet output range, tightly",
+          0.0 < lo < 0.125 and 4.380 < hi < 5.0, f"{lo}..{hi} V")
+
+    rows = ocal.channel_health(
+        [_resting_box(healthy, vpc, rng),
+         _resting_box(np.full(32, -0.02), vpc, rng)], [vpc, vpc], ["a", "b"])
+    check("an unpowered box at -0.02 V is out of range on all 32 channels",
+          all(r["out_of_range"] for r in rows if r["box"] == 1)
+          and not any(r["out_of_range"] for r in rows if r["box"] == 0))
+    check("and every one of its sensors is excluded",
+          ocal.suggest_dead(rows) == {f"S{i}" for i in range(9, 17)},
+          str(sorted(ocal.suggest_dead(rows))))
+
+    # S10 is the second sensor of the second box; VCM is the last of its four.
+    v = healthy.copy()
+    v[1 * 4 + 3] = -0.20
+    rows = ocal.channel_health(
+        [_resting_box(healthy, vpc, rng), _resting_box(v, vpc, rng)],
+        [vpc, vpc], ["a", "b"])
+    verdict = ocal.health_verdict(rows)
+    check("a VCM at -0.20 V is caught, and takes the sensor with it",
+          verdict[10][0] == "dead" and "VCM" in verdict[10][1], str(verdict[10]))
+    check("without touching its neighbours",
+          verdict[9][0] == "ok" and verdict[11][0] == "ok")
+
+    # The legal extremes are still legal.
+    v = healthy.copy()
+    v[0], v[1] = 0.125, 4.380
+    rows = ocal.channel_health(
+        [_resting_box(v, vpc, rng), _resting_box(healthy, vpc, rng)],
+        [vpc, vpc], ["a", "b"])
+    check("an output at either datasheet limit is not flagged",
+          not any(r["bad"] for r in rows),
+          str([r["mean_v"] for r in rows if r["bad"]]))
+
+
+def test_one_bad_axis_excludes_the_sensor():
+    """A sensor with a single broken field channel must leave the statistics.
+
+    The real case is S11: Bx resting at -0.91 V, the other three channels
+    fine. That was rated "fault", suggest_dead() only took "dead", and so a
+    -57 mT reading stayed in every median and every export.
+    """
+    print("\nchannel health -- one bad axis")
+    vpc = 20.0 / 65536.0
+    rng = np.random.default_rng(6)
+    healthy = np.full(32, 2.2)
+    v = healthy.copy()
+    v[2 * 4 + 2] = -0.91                  # S11 is box 1 sensor 3; wire Bz By Bx VCM
+    rows = ocal.channel_health(
+        [_resting_box(healthy, vpc, rng), _resting_box(v, vpc, rng)],
+        [vpc, vpc], ["a", "b"])
+    verdict = ocal.health_verdict(rows)
+    check("one bad field channel is still labelled a fault, not dead",
+          verdict[11][0] == "fault" and "Bx" in verdict[11][1], str(verdict[11]))
+    cal = ocal.Calibration()
+    b = cal.convert([_resting_box(healthy, vpc, rng), _resting_box(v, vpc, rng)],
+                    [vpc, vpc])
+    check("and it really is reading tens of mT of nothing",
+          abs(np.median(b[:, 10, 0])) > 40.0, f"{np.median(b[:, 10, 0]):+.1f} mT")
+    dead = ocal.suggest_dead(rows)
+    check("suggest_dead excludes it", dead == {"S11"}, str(sorted(dead)))
+
+
+def test_per_axis_dead_entries():
+    """A "S16.Bx" entry must actually take S16 out of the live mask."""
+    print("\nper-axis dead entries")
+    cal = ocal.Calibration(dead={"S16.Bx", "S3"})
+    live = cal.live_mask()
+    check("a per-axis entry takes the whole sensor out of the live mask",
+          not live[15] and not live[2] and live.sum() == 14, str(live.tolist()))
+    check("is_dead still answers for the single channel",
+          cal.is_dead(16, "Bx") and not cal.is_dead(16, "By"))
+    check("ids are matched whatever their case",
+          ocal.dead_sensors(["s16", " s3.bx ", ""]) == {"S16", "S3"},
+          str(sorted(ocal.dead_sensors(["s16", " s3.bx ", ""]))))
+    check("no entries means all sixteen live",
+          ocal.live_mask(()).all() and ocal.live_mask(None).all())
+
+
+def test_cross_calibration_skips_dead():
+    """A dead sensor must not set the reference, nor be trimmed itself."""
+    print("\ncross-calibration with dead sensors")
+    # Eight sensors at 1.0, seven at 1.1, and S16 railed: its "peak" is
+    # hundreds of mT. Counted in, it drags the median from 1.0 to 1.05.
+    peaks = np.array([1.0] * 8 + [1.1] * 7 + [400.0])
+    cal = ocal.Calibration(dead={"S16"})
+    cal.gain_corr[15] = 0.7                     # whatever it carried before
+    _corr, skipped = cal.cross_calibrate(peaks, live=cal.live_mask())
+    check("the reference is the median of the live sensors only",
+          np.allclose(cal.gain_corr[:8], 1.0)
+          and np.allclose(cal.gain_corr[8:15], 1.0 / 1.1),
+          f"S1 trim {cal.gain_corr[0, 0]:.4f}, want 1.0000")
+    check("the dead sensor keeps the gain it had",
+          np.allclose(cal.gain_corr[15], 0.7), f"{cal.gain_corr[15, 0]:.4f}")
+    check("and is reported as not trimmed", skipped == ["S16"], str(skipped))
+
+    # Most of the probe dead and reading garbage must not lift the
+    # min-response gate over the sensors that are actually working.
+    peaks = np.array([1.0, 1.2, 0.9, 1.1] + [400.0] * 12)
+    cal = ocal.Calibration(dead={f"S{i}" for i in range(5, 17)})
+    _corr, skipped = cal.cross_calibrate(peaks, live=cal.live_mask())
+    check("dead sensors do not move the min-response gate",
+          not np.allclose(cal.gain_corr[:4], 1.0)
+          and skipped == [f"S{i}" for i in range(5, 17)], str(skipped))
+
+    # Callers that pass nothing get what they always got.
+    a, b = ocal.Calibration(), ocal.Calibration()
+    p = np.linspace(0.8, 1.3, 16)
+    a.cross_calibrate(p)
+    b.cross_calibrate(p, live=np.ones(16, bool))
+    check("with no mask, all sixteen take part as before",
+          np.allclose(a.gain_corr, b.gain_corr)
+          and np.allclose(p * a.gain_corr[:, 0], np.median(p)))
+
+
+def test_set_range_resets_what_the_old_range_measured(workdir):
+    """Changing a sensor's range must not keep subtracting the old zero.
+
+    The Calibration tab assigned into ranges_mt directly. zero_mt is stored in
+    mT at the old V/T, so after 20 -> 400 mT a 0.4 mT zero went on being
+    subtracted from readings now 16.7x coarser -- and the gain trim and matrix,
+    measured against the gain-3000 factory dataset, went on being applied to
+    the gain-150 one.
+    """
+    print("\nchanging a sensor's range")
+    rng = np.random.default_rng(8)
+    cal = ocal.Calibration()
+    cal.zero_mt = rng.normal(0, 0.4, (16, 3))
+    cal.gain_corr = 1.0 + rng.normal(0, 0.05, (16, 3))
+    cal.matrix = cal.matrix + rng.normal(0, 0.01, (16, 3, 3))
+    cal.gain_source = {"use_dither": False, "run": "x", "excluded": []}
+    before = (cal.zero_mt.copy(), cal.gain_corr.copy(), cal.matrix.copy())
+
+    line = cal.set_range(5, 400.0)
+    check("the range is changed", cal.ranges_mt[4] == 400.0
+          and abs(cal.volts_per_tesla[4] - 3.78) < 1e-9)
+    check("that sensor's zero, trim and matrix are reset",
+          not cal.zero_mt[4].any() and np.allclose(cal.gain_corr[4], 1.0)
+          and np.allclose(cal.matrix[4], np.eye(3)))
+    others = np.arange(16) != 4
+    check("and nobody else's are touched",
+          np.array_equal(cal.zero_mt[others], before[0][others])
+          and np.array_equal(cal.gain_corr[others], before[1][others])
+          and np.array_equal(cal.matrix[others], before[2][others]))
+    check("the line says what was reset, and why",
+          "S5" in line and "RESET" in line and "zero" in line
+          and "gain trim" in line and "pose matrix" in line, line)
+    check("the trim is no longer recorded as one run's",
+          cal.gain_source is None)
+    # The point of it: a sensor at its resting voltage reads zero field, not
+    # minus a zero that belonged to another gain.
+    volts = np.full((4, 16, 4), 2.2)
+    check("a resting sensor on the new range reads zero",
+          np.abs(cal.to_mt(volts)[:, 4]).max() < 1e-12,
+          f"{np.abs(cal.to_mt(volts)[:, 4]).max():.3g} mT")
+
+    same = cal.set_range(6, 20.0)
+    check("setting the range it is already on changes nothing",
+          "nothing changed" in same
+          and np.array_equal(cal.zero_mt[5], before[0][5]), same)
+    try:
+        cal.set_range(6, 25.0)
+        ok = False
+    except ValueError:
+        ok = True
+    check("a range the part does not have is refused", ok)
+
+    path = os.path.join(workdir, "calibration.json")
+    cal.gain_source = {"use_dither": False, "run": "magcal_x.npz",
+                       "excluded": ["S16"]}
+    cal.save(path, archive=False)
+    back = ocal.Calibration.load(path)
+    check("how the trim was derived survives a save and a load",
+          back.gain_source == cal.gain_source, str(back.gain_source))
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    doc.pop("gain_source")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    check("and a file from before it was recorded still loads",
+          ocal.Calibration.load(path).gain_source is None)

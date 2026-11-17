@@ -241,6 +241,21 @@ class PoseSolution:
                 bool      whether the transverse-vs-axial gauge was pinned by
                           the data. Needs two distinct |inclination| values,
                           which an end-for-end flip alone does NOT provide.
+    scale_identified
+                bool      whether the COMMON scale of M was set by b_earth_ut.
+                          It is the same equation as the gauge above:
+                          a^2 Bt^2 + c^2 Bz^2 = |B|^2 has two unknowns, so one
+                          |inclination| leaves the overall scale where the
+                          seed put it. The seed takes the transverse swing at
+                          face value, so that is the chips' nominal V/T --
+                          unless the swing is larger than b_earth_ut allows,
+                          when it is the smallest scale consistent with it.
+                          Either way b_earth_ut has not MEASURED it. True
+                          with two distinct
+                          |inclination| values, or with a flip plus
+                          anisotropy="assume_isotropic" (a = c removes one
+                          unknown). When False the gains are still matched to
+                          each other; they are not absolute.
     bt, bz      (G,)      transverse and axial field per orientation, mT
     tags        (G,)      the orientation labels, in the same order
     residual_mt (16,)     RMS fit residual per sensor
@@ -255,7 +270,7 @@ class PoseSolution:
     def __init__(self, M, b, identified, bt, bz, residual_mt, phis,
                  b_earth_ut, ranges_mt=None, n_sweeps=1, notes="",
                  tags=None, anisotropy_identified=True,
-                 offset_leverage=0.0):
+                 offset_leverage=0.0, scale_identified=None):
         self._singular = []
         self._decomp_sig = None
         self._decomp = None
@@ -272,6 +287,11 @@ class PoseSolution:
         self.n_sweeps = int(n_sweeps)
         self.tags = list(tags) if tags is not None else ["A"]
         self.anisotropy_identified = bool(anisotropy_identified)
+        # A solution saved before this flag existed says nothing either way;
+        # the gauge flag is the same condition, so it is the honest default.
+        self.scale_identified = bool(self.anisotropy_identified
+                                     if scale_identified is None
+                                     else scale_identified)
         self.offset_leverage = float(offset_leverage)
         self.notes = notes
 
@@ -440,6 +460,7 @@ class PoseSolution:
                 "bt": self.bt.tolist(), "bz": self.bz.tolist(),
                 "tags": self.tags,
                 "anisotropy_identified": self.anisotropy_identified,
+                "scale_identified": self.scale_identified,
                 "offset_leverage": self.offset_leverage,
                 "residual_mt": self.residual_mt.tolist(),
                 "b_earth_ut": self.b_earth_ut,
@@ -463,9 +484,11 @@ class PoseSolution:
                    n_sweeps=d.get("n_sweeps", 1), notes=d.get("notes", ""),
                    tags=d.get("tags"),
                    anisotropy_identified=d.get("anisotropy_identified", True),
-                   offset_leverage=d.get("offset_leverage", 0.0))
+                   offset_leverage=d.get("offset_leverage", 0.0),
+                   scale_identified=d.get("scale_identified"))
 
     def report(self, dead=()):
+        dead = ocal.dead_sensors(dead)
         g = self.gains()
         ortho = self.orthogonality_deg()
         incl = self.inclination_deg
@@ -477,6 +500,9 @@ class PoseSolution:
                  f"axial column identified:     {bool(self.identified[:, 2].all())}",
                  f"transverse/axial gauge:      "
                  f"{'measured' if self.anisotropy_identified else 'NOT MEASURED'}",
+                 "absolute scale:              "
+                 + (f"from |B| = {self.b_earth_ut:g} uT" if self.scale_identified
+                    else "NOMINAL -- not derived from b_earth_ut"),
                  f"offset leverage:             {self.offset_leverage:.2f} "
                  f"({'good' if self.offset_leverage > 0.6 else 'WEAK'}; "
                  f"an end-for-end flip gives the most)",
@@ -541,6 +567,17 @@ class PoseSolution:
                       "cradle turned to another azimuth. This gauge is COMMON",
                       "MODE, so inter-sensor matching below is still valid; what",
                       "is uncertain is the absolute axial-vs-transverse ratio."]
+        if not self.scale_identified:
+            lines += ["",
+                      "WARNING: the overall scale is NOMINAL. With a single",
+                      "|inclination| the field magnitude gives one equation for",
+                      "two unknowns, so b_earth_ut did not set the scale: the",
+                      "transverse swing was taken at face value, and a probe",
+                      "reading 10 % low everywhere comes back looking correct.",
+                      "The sensors are matched to EACH OTHER; they are not",
+                      "calibrated to the Earth's field. A sweep at another",
+                      "cradle azimuth fixes it, or assume_isotropic if a flip",
+                      "was recorded."]
         return "\n".join(lines)
 
 
@@ -622,10 +659,17 @@ def solve_roll(sweeps, geometry=None, b_earth_ut=DEFAULT_B_EARTH_UT,
     geometry    probe_geometry.Geometry for the nominal orientations. Used to
                 seed the solve, to anchor the leftover rotation gauge, and to
                 fill the axial column when it is not identified.
-    b_earth_ut  total field magnitude, microtesla. Fixes absolute scale ONLY.
+    b_earth_ut  total field magnitude, microtesla. Fixes absolute scale ONLY,
+                and only when the sweeps can support it: with one
+                |inclination| it does not determine the scale, which stays
+                at the chips' nominal V/T, and the solution says so in
+                `scale_identified` and in its report.
     dead        sensor ids ("S16") to leave out of the shared field estimate.
                 They are still fitted, so you get numbers for them, they just
-                do not get a vote on where the field is pointing.
+                do not get a vote on where the field is pointing. A per-axis
+                entry ("S16.Bx") takes the whole sensor out: a chip missing
+                one axis cannot report a vector, and a vector is what the
+                shared field estimate is built from.
     anisotropy  "solve"            require the data to pin the gauge (default);
                                    if it cannot, leave it and flag it.
                 "assume_isotropic" fall back on the average chip having equal
@@ -651,8 +695,7 @@ def solve_roll(sweeps, geometry=None, b_earth_ut=DEFAULT_B_EARTH_UT,
                 "sweeps were taken at different ranges; the EEPROM holds a "
                 "separate factory dataset per gain, so they cannot be combined")
 
-    dead = {str(d) for d in dead}
-    live = np.array([f"S{i + 1}" not in dead for i in range(N_SENSORS)])
+    live = ocal.live_mask(dead)
     if live.sum() < 2:
         raise ValueError("need at least two live sensors to fix the roll angle")
 
@@ -805,13 +848,27 @@ def solve_roll(sweeps, geometry=None, b_earth_ut=DEFAULT_B_EARTH_UT,
     identified[:, 2] = axial_ok
 
     resid = _residuals(data, gidx, phis, M, b, bt, bz)
+    # The common scale rides on the same equation as the anisotropy gauge --
+    # see PoseSolution.scale_identified. Without two |inclination| values
+    # alpha never leaves its seed, the seed takes the transverse amplitude at
+    # face value, and so M comes out at nominal scale rather than at the one
+    # b_earth_ut implies.
     sol = PoseSolution(M, b, identified, bt, bz, resid, phis, b_earth_ut,
                        ranges_mt=ranges, n_sweeps=len(sweeps),
                        tags=groups, anisotropy_identified=aniso_ok,
-                       offset_leverage=offset_leverage)
+                       offset_leverage=offset_leverage,
+                       scale_identified=aniso_ok)
     if not aniso_ok and anisotropy == "assume_isotropic":
         _assume_isotropic(sol)
     _anchor_gauge(sol, geometry)
+    # Recomputed from what is actually being returned. Both steps above are
+    # meant to be pure changes of gauge, which leave M @ B alone, so this
+    # should reproduce the number from before them -- and when one of them was
+    # not (the isotropy step once rescaled the field without rescaling M) the
+    # stale figure went on reporting a noise-floor fit for a solution that no
+    # longer reproduced its own data.
+    sol.residual_mt = _residuals(data, gidx, sol.phis, sol.M, sol.b,
+                                 sol.bt, sol.bz)
     return sol
 
 
@@ -843,6 +900,12 @@ def _assume_isotropic(sol):
     Chip +Y is the tube axis on every sensor here, so the gauge shows up as the
     median S[1,1] drifting away from the median of S[0,0] and S[2,2]. Rescaling
     the tube frame's axial direction pulls it back.
+
+    With the axial column identified this also pins the COMMON scale from
+    b_earth_ut, which the data alone could not: a = c turns
+    a^2 Bt^2 + c^2 Bz^2 = |B|^2 into one equation in one unknown. With a single
+    sweep the axial column is nominal filler, Bz was never observed, and the
+    scale stays unidentified -- scale_identified is left False.
     """
     for _ in range(12):
         _, S = sol.decompose()
@@ -861,11 +924,25 @@ def _assume_isotropic(sol):
         # is M @ diag(1, 1, k).
         sol.M = sol.M * np.array([1.0, 1.0, k])[None, None, :]
         sol.bz = sol.bz / k
-        norm = np.hypot(sol.bt, sol.bz)
-        good = norm > 0
-        scale = np.where(good, sol.b_earth_ut * 1e-3 / np.where(good, norm, 1.0), 1.0)
-        sol.bt = sol.bt * scale
-        sol.bz = sol.bz * scale
+        # Restore |B|, and take the same factor back out of M. The field and
+        # the response only ever appear as the product M @ B, so rescaling one
+        # without the other is not a change of gauge, it is a change of answer:
+        # this used to scale bt and bz alone, which left every gain out by the
+        # common factor (1.6 % on a synthetic probe reading 20 % high, rolled
+        # at +/-25 deg) under a residual that still read as the noise floor
+        # because it was never recomputed.
+        #
+        # One factor for all orientations, because M is shared between them
+        # and a per-orientation factor has nowhere to go. They agree anyway:
+        # this branch only runs when every orientation has the same
+        # |inclination|, which is what made the gauge unidentified.
+        norm = float(np.sqrt(np.mean(sol.bt ** 2 + sol.bz ** 2)))
+        if norm > 0:
+            scale = sol.b_earth_ut * 1e-3 / norm
+            sol.bt = sol.bt * scale
+            sol.bz = sol.bz * scale
+            sol.M = sol.M / scale
+    sol.scale_identified = bool(sol.identified[:, 2].all())
     sol.notes = (sol.notes + " Transverse-vs-axial gauge was NOT identified by "
                  "the data; it was fixed by assuming the median chip is "
                  "isotropic. Roll in a second cradle azimuth to measure it "
@@ -903,14 +980,24 @@ def _anchor_gauge(sol, geometry):
     """
     R, _ = sol.decompose()
     R_nom = geometry.rotations()
-    # Best single rotation about z aligning solved to nominal: maximise
-    # sum_i trace(Rz(g)^T R_nom_i R_i^T) -> closed form in atan2.
+    # Best single rotation about z aligning solved to nominal. The rotation is
+    # applied as M @ Rz(g), and C = M^-1 = R S, so the solved rotation becomes
+    # Rz(g)^T R_i. That is closest to R_nom_i where
+    #     sum_i trace(R_nom_i^T Rz(g)^T R_i) = sum_i trace(Rz(g)^T R_i R_nom_i^T)
+    # is largest -> closed form in atan2 on Q_i = R_i R_nom_i^T.
+    #
+    # The order of that product is the whole thing. Written the other way
+    # round, R_nom_i R_i^T, it is the transpose, which yields -g: the frame was
+    # then turned AWAY from nominal by the offset it had, and a 20 deg offset
+    # came back as 40. It went unnoticed because the solve is seeded from the
+    # nominal geometry and normally arrives here with an offset near zero,
+    # where doubling it changes nothing visible.
     s = c = 0.0
     bad = set(sol.unusable())
     for i in range(N_SENSORS):
         if f"S{i + 1}" in bad:
             continue        # a sensor that saw nothing gets no say in the frame
-        Q = R_nom[i] @ R[i].T
+        Q = R[i] @ R_nom[i].T
         c += Q[0, 0] + Q[1, 1]
         s += Q[1, 0] - Q[0, 1]
     gamma = np.arctan2(s, c)
@@ -918,6 +1005,10 @@ def _anchor_gauge(sol, geometry):
     Rz = np.array([[cg, -sg, 0.0], [sg, cg, 0.0], [0.0, 0.0, 1.0]])
     # M maps tube -> chip, so rotating the tube frame by Rz means M @ Rz.
     sol.M = np.einsum("sij,jk->sik", sol.M, Rz)
+    # The field in the new frame is Rz^T @ B, i.e. every roll angle moves back
+    # by gamma. Kept in step so that M, bt, bz and phis still describe the
+    # data together.
+    sol.phis = [np.asarray(phi, float) - gamma for phi in sol.phis]
     sol.notes = (sol.notes + f" gauge anchored by {np.degrees(gamma):+.2f} deg "
                              "about the tube axis.").strip()
     return sol
@@ -998,7 +1089,8 @@ def ambient_uniformity(solution):
 # carrying a calibration to another range
 # --------------------------------------------------------------------------
 
-def range_transfer(b_lo_mt, b_hi_mt, min_signal_mt=1.0):
+def range_transfer(b_lo_mt, b_hi_mt, min_signal_mt=1.0,
+                   zero_lo_mt=None, zero_hi_mt=None):
     """
     Per-sensor, per-axis ratio between two gain settings.
 
@@ -1009,14 +1101,44 @@ def range_transfer(b_lo_mt, b_hi_mt, min_signal_mt=1.0):
     change gain, capture again.
 
     The magnet's absolute value never enters: only that it held still. Returns
-    (ratio (16,3), skipped list) where ratio multiplies a low-range gain to
-    give the high-range one.
+    (ratio (16,3), skipped list, notes list) where ratio multiplies a
+    low-range gain to give the high-range one.
 
-    Both arguments are (n,16,3) uncorrected mT, each converted with the
+    b_lo_mt and b_hi_mt are (n,16,3) uncorrected mT, each converted with the
     NOMINAL V/T of the range it was taken at.
+
+    zero_lo_mt and zero_hi_mt are the same thing with the magnet REMOVED, one
+    per range: a capture (n,16,3) or its mean (16,3). They are not optional in
+    any useful sense. An uncorrected reading is field plus the sensor's own
+    offset, the offsets on this probe run 0.1-0.6 mT at the 20 mT range, and
+    the chip loads a different offset trim per gain -- so the offset is a
+    different number of mT in the two captures and does not cancel in hi/lo.
+    Against a few mT of magnet that puts the ratio out by tens of per cent.
+    The baselines also remove the ambient field, which is why they are taken
+    without the magnet rather than in a zero chamber.
+
+    Without both of them the ratio is still returned, because a caller with a
+    30 mT magnet and a tared probe may know better -- but `notes` says in
+    plain words that offsets are in it, and the number should not be used
+    until whoever reads that has decided it does not matter.
     """
     lo = np.asarray(b_lo_mt, float).mean(axis=0)
     hi = np.asarray(b_hi_mt, float).mean(axis=0)
+    notes = []
+    if zero_lo_mt is None or zero_hi_mt is None:
+        notes.append(
+            "WARNING: no zero-field baseline was given for "
+            + ("either range" if zero_lo_mt is None and zero_hi_mt is None
+               else "the low range" if zero_lo_mt is None else "the high range")
+            + ", so the sensor offsets are INCLUDED in this ratio. They differ "
+              "between gains and do not cancel; at 0.1-0.6 mT of offset "
+              "against a few mT of magnet the ratio is wrong by tens of per "
+              "cent. Capture each range again with the magnet removed and "
+              "pass zero_lo_mt / zero_hi_mt")
+    if zero_lo_mt is not None:
+        lo = lo - np.asarray(zero_lo_mt, float).reshape(-1, N_SENSORS, 3).mean(axis=0)
+    if zero_hi_mt is not None:
+        hi = hi - np.asarray(zero_hi_mt, float).reshape(-1, N_SENSORS, 3).mean(axis=0)
     ok = np.abs(lo) > float(min_signal_mt)
     ratio = np.ones((N_SENSORS, 3))
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -1024,7 +1146,7 @@ def range_transfer(b_lo_mt, b_hi_mt, min_signal_mt=1.0):
     ratio[ok] = r[ok]
     skipped = [f"S{i + 1}.{AXES[k]}"
                for i in range(N_SENSORS) for k in range(3) if not ok[i, k]]
-    return ratio, skipped
+    return ratio, skipped, notes
 
 
 # --------------------------------------------------------------------------
@@ -1058,7 +1180,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     geom = pg.Geometry.load_or_default(a.geometry)
-    dead = [d.strip() for d in a.dead.split(",") if d.strip()]
+    # Normalised the way octobee/calib/poses.py does it: "--dead s16" used to
+    # be compared verbatim against "S16", matched nothing, and left the dead
+    # sensor voting on the field direction with no message at all.
+    dead = sorted(ocal.dead_sensors(a.dead.split(",")),
+                  key=lambda sid: (len(sid), sid))
     sweeps = [RollSweep.load(p) for p in a.sweeps]
     sol = solve_roll(sweeps, geom, a.b_earth_ut, dead=dead,
                      anisotropy=a.anisotropy)
@@ -1076,7 +1202,8 @@ def main(argv=None):
         print(f"\nwrote {a.save}")
     if a.apply:
         cal = ocal.Calibration.load_or_default(a.apply)
-        cal.apply_pose_solution(sol)
+        for line in cal.apply_pose_solution(sol):
+            print(f"  {line}")
         cal.save(a.apply)
         print(f"applied to {a.apply}")
     return 0

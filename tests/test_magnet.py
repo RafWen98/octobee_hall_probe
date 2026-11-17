@@ -4,6 +4,7 @@ import os
 
 import numpy as np
 
+from octobee.calib import convert as ocal
 from octobee.calib import poses as opcap
 from octobee.calib import magnet as omag
 from octobee.calib import geometry as pgeom
@@ -553,3 +554,143 @@ def test_magnet_range_check():
           near["fraction"].max() > 1.0 / 1.5,
           f"the worst point is "
           f"{near['fraction'].max() / (1 / 1.5):.2f}x the peak field")
+
+
+def test_magnet_apply_run(workdir):
+    """Re-applying a run must undo the trim that was applied, not another one.
+
+    One run has two trims: with pass C and without. apply_run's undo always
+    took "with". The shipped calibration had been applied WITHOUT ("A+B, pass
+    C dropped"), so --replacing divided out a factor that had never been
+    multiplied in and left the difference of the two folded into every gain.
+    """
+    print("\nguided magnet calibration -- re-applying a run")
+    g = pgeom.Geometry()
+    rng = np.random.default_rng(23)
+    gain = rng.normal(1.0, 0.05, 16)
+    magnet = np.array([0.0, 200.0, g.fsv_radius_mm + 25.0])
+    run = _synth_magnet_passes(g, gain, magnet, (1.0, 1.0, 1.0))
+    check("the two trims of this run really are different",
+          np.abs(run.trim(True) / run.trim(False) - 1.0).max() > 0.01,
+          f"up to {100 * np.abs(run.trim(True) / run.trim(False) - 1).max():.1f} %")
+
+    fresh = ocal.Calibration()
+    omag.apply_run(run, fresh, use_dither=True)
+
+    cal = ocal.Calibration()
+    omag.apply_run(run, cal, use_dither=False, source="magcal_x.npz")
+    check("applying records which passes the trim used",
+          cal.gain_source == {"use_dither": False, "run": "magcal_x.npz",
+                              "excluded": []}, str(cal.gain_source))
+    check("and the A+B trim is what went in",
+          np.allclose(cal.gain_corr[:, 0], run.trim(False)))
+
+    # Through the file, as the command line does it.
+    path = os.path.join(workdir, "calibration.json")
+    cal.save(path, archive=False)
+    cal = ocal.Calibration.load(path)
+    lines = omag.apply_run(run, cal, use_dither=True, replacing=run)
+    check("replacing an A+B apply divides out the A+B trim",
+          np.allclose(cal.gain_corr, fresh.gain_corr, rtol=1e-9),
+          f"worst {np.abs(cal.gain_corr / fresh.gain_corr - 1).max():.2e} "
+          f"from a clean A+B+C apply")
+    check("and says which one it divided out",
+          any("divided out the A+B trim" in ln for ln in lines), str(lines))
+    check("the record now says A+B+C", cal.gain_source["use_dither"] is True)
+
+    # A calibration from before the record existed: the trim is in it, the
+    # mode is not. Guessing is how the bug happened.
+    legacy = ocal.Calibration()
+    legacy.gain_corr = legacy.gain_corr * run.trim(False)[:, None]
+    legacy.notes = "gain trim re-derived using passes A+B (pass C dropped)"
+    kept = legacy.gain_corr.copy()
+    try:
+        omag.apply_run(run, legacy, use_dither=True, replacing=run)
+        refused, msg = False, ""
+    except ValueError as exc:
+        refused, msg = True, str(exc)
+    check("with no record and no answer, the undo is refused",
+          refused and "pass C dropped" in msg, msg[:100])
+    check("and nothing was changed by the refusal",
+          np.array_equal(legacy.gain_corr, kept))
+    omag.apply_run(run, legacy, use_dither=True, replacing=run,
+                   replacing_use_dither=False)
+    check("told the mode, it undoes the right trim",
+          np.allclose(legacy.gain_corr, fresh.gain_corr, rtol=1e-9))
+
+    # The command line, end to end, on files.
+    base = os.path.join(workdir, "magcal_x")
+    run.save(base)
+    legacy = ocal.Calibration()
+    legacy.gain_corr = legacy.gain_corr * run.trim(False)[:, None]
+    legacy.save(path, archive=False)
+    rc = omag.main(["apply", base + ".npz", "--calibration", path,
+                    "--replacing", base + ".npz"])
+    check("the CLI refuses --replacing when the mode is unknown",
+          rc == 1 and np.allclose(ocal.Calibration.load(path).gain_corr,
+                                  legacy.gain_corr))
+    rc = omag.main(["apply", base + ".npz", "--calibration", path,
+                    "--replacing", base + ".npz", "--replacing-passes", "ab"])
+    back = ocal.Calibration.load(path)
+    check("and with --replacing-passes ab it lands on the clean answer",
+          rc == 0 and np.allclose(back.gain_corr, fresh.gain_corr, rtol=1e-6)
+          and back.gain_source["run"] == "magcal_x.npz",
+          f"rc {rc}, source {back.gain_source}")
+
+    # ---- a run measured at another range is refused ----------------------
+    other = _synth_magnet_passes(g, gain, magnet, (0.0, 0.0, 0.0), dither=False)
+    other.ranges_mt = np.full(16, 40.0)
+    cal = ocal.Calibration()
+    try:
+        omag.apply_run(other, cal, use_dither=False)
+        refused = False
+    except ValueError:
+        refused = True
+    check("a run measured at another range is refused",
+          refused and np.allclose(cal.gain_corr, 1.0))
+    other.ranges_mt = np.full(16, 20.0)
+    omag.apply_run(other, cal, use_dither=False)
+    check("and one at the same range is not",
+          not np.allclose(cal.gain_corr, 1.0))
+
+
+def test_magnet_trim_skips_dead():
+    """A dead sensor must not set the reference, nor be trimmed, nor be news."""
+    print("\nguided magnet calibration -- dead sensors")
+    g = pgeom.Geometry()
+    rng = np.random.default_rng(31)
+    gain = rng.normal(1.0, 0.05, 16)
+    magnet = np.array([0.0, 200.0, g.fsv_radius_mm + 25.0])
+    clean = _synth_magnet_passes(g, gain, magnet, (0.0, 0.0, 0.0), dither=False)
+    broken = _synth_magnet_passes(g, gain, magnet, (0.0, 0.0, 0.0), dither=False)
+    for s in broken.sweeps:
+        s.b_mt[:, 15, :] = 300.0            # S16 on the rail: hundreds of mT
+        s.b_mt[:, 3, :] = 0.0               # S4 saw nothing at all
+    live = np.ones(16, bool)
+    live[15] = False
+    rest = np.array([i not in (3, 15) for i in range(16)])
+
+    t = broken.trim(use_dither=False, live=live)
+    # What the fourteen good sensors would get with those two simply absent.
+    resp = clean.response(use_dither=False)[0]
+    want = np.median(resp[live & (np.arange(16) != 3)]) / resp
+    check("the reference is the median of the live, responding sensors",
+          np.allclose(t[rest], want[rest]),
+          f"worst {np.abs(t[rest] / want[rest] - 1).max():.2e}")
+    check("which the railed sensor would otherwise have shifted",
+          not np.allclose(broken.trim(use_dither=False)[rest], want[rest]))
+    check("dead and silent sensors get a neutral trim",
+          t[15] == 1.0 and t[3] == 1.0)
+    check("a silent live sensor is reported as quiet; a dead one is not",
+          broken.quiet_sensors(use_dither=False, live=live) == ["S4"],
+          str(broken.quiet_sensors(use_dither=False, live=live)))
+
+    cal = ocal.Calibration(dead={"S16.Bz"})
+    cal.gain_corr[15] = 0.7
+    lines = omag.apply_run(broken, cal, use_dither=False)
+    check("apply_run leaves the dead sensor's gain alone",
+          np.allclose(cal.gain_corr[15], 0.7)
+          and np.allclose(cal.gain_corr[rest, 0], want[rest]),
+          f"S16 gain {cal.gain_corr[15, 0]:.3f}")
+    check("and says who kept their previous trim",
+          any("S4" in ln and "S16" in ln for ln in lines), str(lines))

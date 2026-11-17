@@ -472,7 +472,8 @@ def main(argv=None):
                     help="skip the repeat of pose 1 that measures session drift")
     ap.add_argument("--dead", default="",
                     help="comma-separated ids to leave out of the on-screen "
-                         "summary, e.g. S16")
+                         "summary, e.g. S16. A per-axis id such as S16.Bx "
+                         "leaves out the whole sensor")
     ap.add_argument("--yes", action="store_true",
                     help="do not wait for Enter between poses (for a motorised "
                          "or otherwise scripted index)")
@@ -481,9 +482,13 @@ def main(argv=None):
         ap.error("--tag is required (or use --survey to score a location first)")
 
     hosts = a.uut or list(ob.DEFAULT_UUTS)
-    dead = {d.strip().upper() for d in a.dead.split(",") if d.strip()}
     cal = ocal.Calibration.load_or_default(a.cal)
-    live = np.array([f"S{i + 1}" not in dead for i in range(opc.N_SENSORS)])
+    # Through the one definition of "live", so a per-axis entry ("S16.Bx")
+    # takes the whole sensor out of the summary here as it does everywhere
+    # else: the figures below are |B| and vector differences, and a chip
+    # missing an axis has neither. Compared by hand against "S16" it matched
+    # nothing and the sensor stayed in.
+    live = ocal.live_mask(a.dead.split(","))
     step = 360 // max(1, a.poses)
     n_poses = a.poses * max(1, a.turns)
 

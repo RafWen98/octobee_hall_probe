@@ -245,12 +245,42 @@ def test_posecal():
     # ---- range transfer ---------------------------------------------------
     base = rng.normal(0, 5.0, (200, n_sens, 3))
     ratio_true = 1.82
-    r, skipped = opc.range_transfer(base, base * ratio_true, min_signal_mt=0.5)
+    r, skipped, notes = opc.range_transfer(base, base * ratio_true,
+                                           min_signal_mt=0.5)
     check("range transfer recovers a known gain ratio",
           np.allclose(r[np.abs(base.mean(axis=0)) > 0.5], ratio_true, atol=1e-6),
           f"{ratio_true}x")
     check("range transfer skips channels with too little signal",
           isinstance(skipped, list))
+    check("and warns that it was given no zero-field baseline",
+          len(notes) == 1 and "offsets are INCLUDED" in notes[0], str(notes))
+
+    # Real captures are field PLUS offset, and the offset is a different
+    # number of mT at each gain. A few mT of magnet against 0.4 mT of offset
+    # puts the bare ratio out by tens of per cent.
+    field = rng.normal(0, 5.0, (n_sens, 3))
+    z_lo = rng.normal(0, 0.4, (n_sens, 3))
+    z_hi = rng.normal(0, 0.4, (n_sens, 3))
+    b_lo = np.tile(field + z_lo, (50, 1, 1))
+    b_hi = np.tile(field * 1.02 + z_hi, (50, 1, 1))
+    strong = np.abs(field) > 1.0
+    r, _skipped, notes = opc.range_transfer(b_lo, b_hi)
+    check("without baselines the offsets wreck the ratio, and it says so",
+          np.abs(r[strong & (np.abs(field + z_lo) > 1.0)] - 1.02).max() > 0.1
+          and notes, f"worst error "
+          f"{np.abs(r[strong & (np.abs(field + z_lo) > 1.0)] - 1.02).max():.2f}")
+    r, skipped, notes = opc.range_transfer(
+        b_lo, b_hi, zero_lo_mt=np.tile(z_lo, (20, 1, 1)), zero_hi_mt=z_hi)
+    check("with a zero-field baseline per range the ratio is right",
+          np.allclose(r[strong], 1.02, atol=1e-9) and not notes,
+          f"worst error {np.abs(r[strong] - 1.02).max():.2e}")
+    check("and the signal gate is applied to the field, not field + offset",
+          sorted(skipped) == sorted(
+              f"S{i + 1}.{opc.AXES[k]}" for i in range(n_sens)
+              for k in range(3) if not strong[i, k]))
+    _r, _s, notes = opc.range_transfer(b_lo, b_hi, zero_lo_mt=z_lo)
+    check("one baseline of the two is still warned about",
+          len(notes) == 1 and "high range" in notes[0], str(notes))
 
 
 def test_posecal_persistence():
@@ -302,6 +332,34 @@ def test_posecal_persistence():
     check("applying a pose solution installs the solved offset",
           np.allclose(cal.zero_mt, sol.b))
 
+    # A sensor the solve could not believe must be left alone, not written.
+    # S16 flat is the simple version of its real fault: the solve returns a
+    # rank-deficient response for it, and installing that -- and wiping its
+    # magnet trim on the way -- replaces an uncorrected sensor with a wrong one.
+    flat = []
+    for tag, incl in (("A", 25.0), ("B", -25.0), ("C", 60.0)):
+        m = sweep(tag, incl).b_mt.copy()
+        m[:, 15, :] = 0.0
+        flat.append(opc.RollSweep(m, tag=tag))
+    dsol = opc.solve_roll(flat, geom, 49.0)
+    cal_d = ocal.Calibration(ranges_mt=np.full(n_sens, 20.0))
+    cal_d.gain_corr = np.full((n_sens, 3), 1.5)
+    cal_d.zero_mt[15] = [0.3, -0.2, 0.1]
+    cal_d.matrix[15] = np.diag([1.01, 0.99, 1.02])
+    lines = cal_d.apply_pose_solution(dsol)
+    check("an unusable sensor keeps its zero, trim and matrix",
+          dsol.unusable() == ["S16"]
+          and np.allclose(cal_d.zero_mt[15], [0.3, -0.2, 0.1])
+          and np.allclose(cal_d.gain_corr[15], 1.5)
+          and np.allclose(cal_d.matrix[15], np.diag([1.01, 0.99, 1.02])),
+          f"zero {cal_d.zero_mt[15]}, gain {cal_d.gain_corr[15]}")
+    check("the other fifteen are installed and their trim cleared",
+          np.allclose(cal_d.gain_corr[:15], 1.0)
+          and np.allclose(cal_d.zero_mt[:15], dsol.b[:15])
+          and np.allclose(cal_d.matrix[:15], dsol.decompose()[1][:15]))
+    check("and the returned lines name the sensor left alone",
+          any("S16" in ln and "untouched" in ln for ln in lines), str(lines))
+
     sol.ranges_mt = np.full(n_sens, 400.0)
     try:
         cal.apply_pose_solution(sol)
@@ -321,3 +379,166 @@ def test_posecal_persistence():
     spread = np.std(np.linalg.norm(tube, axis=2), axis=1).mean()
     check("corrected sensors agree on |B| in the tube frame",
           spread / 49.0e-3 < 0.01, f"spread {spread / 49.0e-3 * 100:.3f} % of |B|")
+
+
+def _reconstruction_ut(sol, sweeps):
+    """RMS of data - (M @ B + b), built only from what the solution RETURNS.
+
+    Not sol.residual_mt: the point is to check that M, bt, bz and phis still
+    describe the data together after the gauge steps, and a stored residual
+    cannot show that.
+    """
+    acc, n = 0.0, 0
+    for sw, phi in zip(sweeps, sol.phis):
+        g = sol.tags.index(sw.tag)
+        B = np.column_stack([sol.bt[g] * np.cos(phi), sol.bt[g] * np.sin(phi),
+                             np.full(len(phi), sol.bz[g])])
+        pred = np.einsum("sij,tj->tsi", sol.M, B) + sol.b[None]
+        acc += float(((sw.reduced() - pred) ** 2).sum())
+        n += pred.size
+    return np.sqrt(acc / n) * 1e3
+
+
+def _median_diag(sol):
+    _, S = sol.decompose()
+    return np.median(S[:, [0, 1, 2], [0, 1, 2]], axis=0)
+
+
+def test_roll_absolute_scale():
+    """b_earth_ut sets the scale only when the sweeps can support it.
+
+    Every sensor reads 20 % high, so the right correction is 1/1.2 = 0.8333 on
+    all three axes. Three inclinations find it. One, or a flip pair, cannot --
+    |B| gives one equation for the transverse and axial scales together -- and
+    used to hand back some other scale under a docstring that said b_earth_ut
+    fixed it.
+    """
+    print("\n== roll calibration: absolute scale ==")
+    geom = pgeom.Geometry.load_or_default()
+    n_sens = pgeom.N_SENSORS
+    sweep, _S_true, _b = _synth_sweeps(geom, np.full(n_sens, 1.2))
+    A, B, C = sweep("A", 25.0), sweep("B", -25.0), sweep("C", 60.0)
+    want = 1.0 / 1.2
+
+    full = opc.solve_roll([A, B, C], geom, 49.0)
+    check("three inclinations recover the absolute scale from |B|",
+          np.abs(_median_diag(full) - want).max() < 0.002
+          and full.scale_identified, f"S diag {_median_diag(full).round(4)}")
+    check("and the report says where the scale came from",
+          "from |B| = 49 uT" in full.report() and "NOMINAL" not in full.report())
+
+    for name, sweeps in (("one sweep", [A]), ("a flip pair", [A, B])):
+        sol = opc.solve_roll(sweeps, geom, 49.0)
+        check(f"{name} does not claim an absolute scale",
+              not sol.scale_identified
+              and "NOMINAL -- not derived from b_earth_ut" in sol.report(),
+              f"S diag {_median_diag(sol).round(4)}, want {want:.4f}")
+        check(f"{name}: and indeed the scale it returns is not the right one",
+              abs(_median_diag(sol)[0] - want) > 0.01,
+              f"transverse {_median_diag(sol)[0]:.4f}, truth {want:.4f}")
+
+    # What "nominal" means: a probe reading 10 % low everywhere, rolled once,
+    # comes back with a transverse correction of 1.00, not the 1.11 it needs.
+    low, _S, _b = _synth_sweeps(geom, np.full(n_sens, 0.9), seed=4)
+    nominal = opc.solve_roll([low("A", 25.0)], geom, 49.0)
+    check("an unidentified scale is the nominal one",
+          abs(_median_diag(nominal)[0] - 1.0) < 0.005
+          and not nominal.scale_identified,
+          f"transverse {_median_diag(nominal)[0]:.4f}, truth {1 / 0.9:.4f}")
+
+    # The flag survives a save and a load, and an older file without it falls
+    # back on the gauge flag, which is the same condition.
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "sol.json")
+        opc.solve_roll([A, B], geom, 49.0).save(path)
+        back = opc.PoseSolution.load(path)
+        check("scale_identified round trips", not back.scale_identified)
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc.pop("scale_identified")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        check("a solution saved before the flag reads it off the gauge flag",
+              not opc.PoseSolution.load(path).scale_identified)
+
+    # ---- assume_isotropic: a = c is the missing equation -----------------
+    # It used to rescale bt and bz to restore |B| without taking the same
+    # factor out of M, so M @ B stopped reproducing the data and every gain
+    # was out by that factor, under a residual that was never recomputed.
+    iso = opc.solve_roll([A, B], geom, 49.0, anisotropy="assume_isotropic")
+    check("assume_isotropic with a flip pair recovers the absolute scale",
+          np.abs(_median_diag(iso) - want).max() < 0.002
+          and iso.scale_identified, f"S diag {_median_diag(iso).round(4)}")
+    check("and the returned M, field and angles still reproduce the data",
+          _reconstruction_ut(iso, [A, B]) < 0.25,
+          f"{_reconstruction_ut(iso, [A, B]):.3f} uT rms")
+    check("with a residual that is the returned solution's own",
+          abs(np.sqrt(np.mean(iso.residual_mt ** 2)) * 1e3
+              - _reconstruction_ut(iso, [A, B])) < 1e-6)
+    check("|B| is still the one that was asked for",
+          np.allclose(np.hypot(iso.bt, iso.bz), 49.0e-3, rtol=1e-3))
+    lone = opc.solve_roll([A], geom, 49.0, anisotropy="assume_isotropic")
+    check("assume_isotropic on one sweep still cannot claim a scale",
+          not lone.scale_identified and _reconstruction_ut(lone, [A]) < 0.25)
+
+
+def test_roll_gauge_anchor():
+    """The gauge anchor must remove a frame offset, not double it."""
+    print("\n== roll calibration: gauge anchor ==")
+    geom = pgeom.Geometry.load_or_default()
+    n_sens = pgeom.N_SENSORS
+    gains = 1.0 + np.random.default_rng(1).normal(0, 0.03, n_sens)
+    sweep, _S_true, _b = _synth_sweeps(geom, gains)
+    sweeps = [sweep("A", 25.0), sweep("B", -25.0), sweep("C", 60.0)]
+    sol = opc.solve_roll(sweeps, geom, 49.0)
+
+    def frame_error_deg(sv):
+        R, _ = sv.decompose()
+        Rn = geom.rotations()
+        return max(np.degrees(np.arccos(np.clip(
+            (np.trace(R[i] @ Rn[i].T) - 1) / 2, -1, 1))) for i in range(n_sens))
+
+    # Turn the solved frame 20 deg about the tube axis -- M and the roll
+    # angles together, which is the freedom the data cannot see.
+    for turn in (20.0, -35.0):
+        g = np.deg2rad(turn)
+        Rz = np.array([[np.cos(g), -np.sin(g), 0.0],
+                       [np.sin(g), np.cos(g), 0.0], [0.0, 0.0, 1.0]])
+        sol.M = np.einsum("sij,jk->sik", sol.M, Rz)
+        sol.phis = [phi - g for phi in sol.phis]
+        offset = frame_error_deg(sol)
+        opc._anchor_gauge(sol, geom)
+        check(f"a {turn:+.0f} deg frame offset is anchored out",
+              abs(offset - abs(turn)) < 0.1 and frame_error_deg(sol) < 0.2,
+              f"{offset:.2f} deg before, {frame_error_deg(sol):.2f} deg after")
+        check(f"and after {turn:+.0f} deg the roll angles moved with the frame",
+              _reconstruction_ut(sol, sweeps) < 0.25,
+              f"{_reconstruction_ut(sol, sweeps):.3f} uT rms")
+
+
+def test_roll_dead_ids():
+    """--dead must mean the sensor however it is spelled."""
+    print("\n== roll calibration: dead ids ==")
+    geom = pgeom.Geometry.load_or_default()
+    n_sens = pgeom.N_SENSORS
+    gains = 1.0 + np.random.default_rng(1).normal(0, 0.03, n_sens)
+    sweep, _S_true, _b = _synth_sweeps(geom, gains)
+    rng = np.random.default_rng(12)
+    sweeps = []
+    for tag, incl in (("A", 25.0), ("B", -25.0), ("C", 60.0)):
+        m = sweep(tag, incl).b_mt.copy()
+        # A sensor wandering by many times the signal: left in, it gets a
+        # vote on every roll angle.
+        m[:, 15, :] += np.cumsum(rng.normal(0, 2e-3, m[:, 15, :].shape), axis=0)
+        sweeps.append(opc.RollSweep(m, tag=tag))
+    told = opc.solve_roll(sweeps, geom, 49.0, dead=["S16"])
+    untold = opc.solve_roll(sweeps, geom, 49.0)
+    check("excluding the bad sensor changes the solve at all",
+          not np.allclose(told.M[:15], untold.M[:15], atol=1e-6))
+    for spelling in ("s16", "S16.Bx", " s16.bx "):
+        sol = opc.solve_roll(sweeps, geom, 49.0, dead=[spelling])
+        check(f"dead={spelling!r} excludes S16 like 'S16' does",
+              np.array_equal(sol.M, told.M))
+    check("the report marks it excluded whatever the spelling",
+          "(excluded)" in told.report(dead=["s16.Bx"])
+          or "(NO RESPONSE)" in told.report(dead=["s16.Bx"]))

@@ -56,8 +56,19 @@ ADC_RAIL = 32767            # 16-bit signed full scale
 # (datasheet Table 7). The ADC, on the +/-10 V range, can represent far more
 # than that, so a channel resting outside this window is not a working sensor
 # output at all -- it is a broken connection, a dead buffer, or a railed input.
-# The window is opened up a little to leave room for offset and drift.
-PLAUSIBLE_V = (-0.5, 5.5)
+#
+# The margins are small on purpose, and the lower one is the one that matters.
+# The failure this has to catch is a chip with no power or no connection, and
+# that does not rail: it rests at about 0 V. An unpowered box read -0.02 V on
+# all 32 channels (docs/hardware.md), and on 2026-10-27 S10's VCM sat at
+# -0.20 V. The old window of -0.5..5.5 V called both of those healthy, so a
+# dead reference stayed in every statistic. The lower edge is therefore put
+# halfway between the lowest voltage a working output can produce (0.125 V) and
+# the 0 V an unpowered one rests at: the ADC's own offset on +/-10 V is
+# millivolts, so neither can land on the wrong side of 0.06 V. The upper edge
+# gets 0.22 V over the 4.380 V maximum, which is still well short of the 5 V
+# supply a shorted output would be pulled to.
+PLAUSIBLE_V = (0.06, 4.60)
 
 
 # --------------------------------------------------------------------------
@@ -193,6 +204,13 @@ class Calibration:
                          remains probe_geometry's job, so nothing downstream has
                          to change its idea of what frame it is holding.
     dead        set      "S16" or "S16.Bx" entries excluded from summaries.
+                         A per-axis entry takes the WHOLE sensor out of every
+                         statistic -- see dead_sensors() for why.
+    gain_source dict     how the magnet trim in gain_corr was derived, when it
+                         came from a guided run: {"use_dither": bool,
+                         "run": name, "excluded": [...]}. None when the trim
+                         has no single recorded origin. magnet.apply_run()
+                         reads it to undo exactly the factor it applied.
 
     A note on ordering, because it changed. Up to v1 the tare was subtracted
     *after* the gain trim, which is wrong the moment the trim is not 1.0: it
@@ -205,7 +223,7 @@ class Calibration:
 
     def __init__(self, ranges_mt=None, zero_mt=None, gain_corr=None,
                  subtract_vcm=True, dead=None, notes="", matrix=None,
-                 version=None):
+                 version=None, gain_source=None):
         self.ranges_mt = (np.full(N_SENSORS, 20.0) if ranges_mt is None
                           else np.asarray(ranges_mt, float).reshape(N_SENSORS))
         # Validate here rather than at the first conversion. An unknown range
@@ -227,6 +245,7 @@ class Calibration:
         self.subtract_vcm = bool(subtract_vcm)
         self.dead = set(dead or ())
         self.notes = notes
+        self.gain_source = dict(gain_source) if gain_source else None
         self.archived_to = None       # dated copy the last save() left, if any
 
         if version is None and np.any(self.zero_mt):
@@ -249,7 +268,11 @@ class Calibration:
                 "matrix": self.matrix.tolist(),
                 "subtract_vcm": self.subtract_vcm,
                 "dead": sorted(self.dead),
-                "notes": self.notes}
+                "notes": self.notes,
+                # An extra key, not a new version: load() ignores keys it does
+                # not know, so a file carrying this still opens in a checkout
+                # that predates it.
+                "gain_source": self.gain_source}
 
     def save(self, path=None, archive=True):
         """Write the calibration, and keep a dated copy of it beside itself.
@@ -312,7 +335,8 @@ class Calibration:
     # silently ran on built-in defaults -- exactly the uniformly-wrong-number
     # failure the notes in calibration.json warn about.
     _FIELDS = frozenset(("ranges_mt", "zero_mt", "gain_corr", "matrix",
-                         "subtract_vcm", "dead", "notes", "version"))
+                         "subtract_vcm", "dead", "notes", "version",
+                         "gain_source"))
 
     @classmethod
     def load(cls, path=None):
@@ -396,7 +420,8 @@ class Calibration:
     def clear_tare(self):
         self.zero_mt = np.zeros((N_SENSORS, 3))
 
-    def cross_calibrate(self, peak_mag_mt, weights=None, min_response=None):
+    def cross_calibrate(self, peak_mag_mt, weights=None, min_response=None,
+                        live=None):
         """
         Trim residual per-sensor gain so every sensor reports the same |B| for
         the same physical stimulus.
@@ -408,12 +433,26 @@ class Calibration:
                             without it you would fold the 1/r^3 distance
                             difference into the gain trim and make things worse.
 
-        A sensor with no usable response keeps its previous correction and is
-        reported back in `skipped`.
+        live         (16,)  bool, which sensors take part. Pass
+                            `cal.live_mask()`. A dead sensor's "peak" is
+                            whatever its broken channels happened to read --
+                            S16 with three channels on the rail reports
+                            hundreds of mT -- and left in, it shifts the
+                            reference median every healthy sensor is trimmed
+                            to, moves the min-response gate, and gets a trim
+                            of its own computed from nonsense. Default is all
+                            sixteen, which is what every caller got before this
+                            argument existed.
+
+        A sensor with no usable response, or one that is not live, keeps its
+        previous correction and is reported back in `skipped`.
         """
         p = np.asarray(peak_mag_mt, float).reshape(N_SENSORS)
         w = np.ones(N_SENSORS) if weights is None else np.asarray(weights, float)
+        live = (np.ones(N_SENSORS, bool) if live is None
+                else np.asarray(live, bool).reshape(N_SENSORS))
         corrected = p / np.where(w > 0, w, np.nan)
+        usable = live & np.isfinite(corrected)
         if min_response is None:
             # Gate against the TYPICAL sensor, not the loudest one. Keying this
             # off the maximum looks reasonable until a real pass on this probe,
@@ -421,8 +460,9 @@ class Calibration:
             # orders of magnitude: the quietest sensors then fall under a
             # fraction-of-max threshold and get silently skipped, so the trim
             # only does half its job while still reporting success.
-            min_response = 0.02 * np.nanmedian(corrected)
-        ok = np.isfinite(corrected) & (corrected > min_response)
+            min_response = (0.02 * np.median(corrected[usable])
+                            if usable.any() else np.inf)
+        ok = usable & (corrected > min_response)
         skipped = [f"S{i+1}" for i in range(N_SENSORS) if not ok[i]]
         if ok.sum() < 2:
             return self.gain_corr, skipped
@@ -430,10 +470,15 @@ class Calibration:
         new = self.gain_corr.copy()
         new[ok, :] = self.gain_corr[ok, :] * (ref / corrected[ok])[:, None]
         self.gain_corr = new
+        # Whatever run the trim was recorded as coming from, it is now that
+        # run's factor times this one. A caller that knows what it has just
+        # applied (magnet.apply_run) writes the record back afterwards.
+        self.gain_source = None
         return self.gain_corr, skipped
 
     def clear_gain(self):
         self.gain_corr = np.ones((N_SENSORS, 3))
+        self.gain_source = None
 
     def clear_matrix(self):
         self.matrix = np.tile(np.eye(3), (N_SENSORS, 1, 1))
@@ -454,6 +499,18 @@ class Calibration:
 
         Refuses to apply a solution taken at different ranges, because the
         EEPROM holds a separate factory dataset per gain.
+
+        Sensors the solution itself calls unusable() are SKIPPED: their
+        matrix, zero and gain trim are left exactly as they were. A sensor that
+        saw nothing solves to a rank-deficient response whose "correction" is
+        a pseudo-inverse of noise, and S16's real fault solves to a gain
+        orders of magnitude from the pack with an offset of hundreds of mT.
+        Writing either into the calibration replaces a merely uncorrected
+        sensor with an actively wrong one, and clearing its magnet trim on the
+        way throws away the only correction it had.
+
+        Returns a list of lines saying what was installed and what was left
+        alone, for the caller to log.
         """
         if (solution.ranges_mt is not None
                 and not np.allclose(solution.ranges_mt, self.ranges_mt)):
@@ -461,24 +518,110 @@ class Calibration:
                 f"solution was solved at ranges {solution.ranges_mt.tolist()} "
                 f"but this calibration is set to {self.ranges_mt.tolist()}")
         _, S = solution.decompose()
-        self.matrix = np.asarray(S, float).reshape(N_SENSORS, 3, 3)
-        self.zero_mt = np.asarray(solution.b, float).reshape(N_SENSORS, 3)
-        if clear_gain:
-            self.clear_gain()
+        skipped = list(solution.unusable())
+        use = np.array([f"S{i + 1}" not in skipped for i in range(N_SENSORS)])
+        self.matrix[use] = np.asarray(S, float).reshape(N_SENSORS, 3, 3)[use]
+        self.zero_mt[use] = np.asarray(solution.b, float).reshape(N_SENSORS, 3)[use]
+        lines = [f"installed the solved matrix and offset for "
+                 f"{int(use.sum())} of {N_SENSORS} sensors"]
+        if clear_gain and use.any():
+            self.gain_corr[use] = 1.0
+            self.gain_source = None
+            lines.append("cleared the magnet gain trim for those sensors: the "
+                         "pose solve measures the same quantity")
+        if skipped:
+            lines.append(
+                f"left {', '.join(skipped)} untouched -- the solve could not "
+                f"be believed for "
+                f"{'it' if len(skipped) == 1 else 'them'}, so the previous "
+                f"zero, gain trim and matrix are still in force")
         if not solution.identified[:, 2].all():
             self.notes = (self.notes + " WARNING: solved from a single roll "
                           "direction, so the axial column (chip +Y on this "
                           "probe) came from nominal geometry, not from data. "
                           "Record an end-for-end reversed sweep to fix it.").strip()
-        return self.matrix
+            lines.append("the axial column came from nominal geometry, not "
+                         "from data (single roll direction)")
+        return lines
+
+    def set_range(self, sensor_id, range_mt):
+        """Put one sensor on another range. Returns a line saying what it did.
+
+        Changing the range is not a relabelling. zero_mt, gain_corr and matrix
+        were all measured at the OLD gain, and none of them carries over:
+
+          * The chip loads a separate factory dataset -- sensitivity AND
+            offset trims -- for each gain (docs/hardware.md, "per-gain trim
+            set"), so the residual offset and the residual gain error at the
+            new range are different quantities, not the old ones rescaled.
+          * zero_mt is stored in mT at the old V/T, and it is a mixture: part
+            is ambient field captured by the tare, which is the same number of
+            mT at any gain, and part is electrical offset, which is not.
+            Rescaling by the V/T ratio is right for neither part alone and
+            there is no way to split them after the fact.
+
+        Leaving them in place is what used to happen -- the range was assigned
+        straight into ranges_mt -- and it is the worst of the options: a zero
+        measured at 63 V/T kept being subtracted, unchanged, from readings now
+        converted at 3.78 V/T. So this sensor's zero, trim and matrix are
+        reset to neutral and the line says so. Re-tare, and re-run the gain
+        calibration, at the new range.
+
+        Setting a sensor to the range it is already on does nothing.
+        """
+        i = int(sensor_id) - 1
+        if not 0 <= i < N_SENSORS:
+            raise ValueError(f"no sensor S{sensor_id}")
+        new = float(range_mt)
+        if new not in ob.RANGE_TO_VPT:
+            raise ValueError(
+                f"{new:g} mT is not a range the SENM3Dx has. Legal values are "
+                f"{sorted(ob.RANGE_TO_VPT)} mT")
+        old = float(self.ranges_mt[i])
+        if new == old:
+            return f"S{i + 1} is already on +/-{old:g} mT; nothing changed"
+        self.ranges_mt[i] = new
+        dropped = []
+        if np.any(self.zero_mt[i]):
+            dropped.append("zero")
+        if not np.allclose(self.gain_corr[i], 1.0):
+            dropped.append("gain trim")
+            # The recorded run no longer describes all sixteen factors.
+            self.gain_source = None
+        if not np.allclose(self.matrix[i], np.eye(3)):
+            dropped.append("pose matrix")
+        self.zero_mt[i] = 0.0
+        self.gain_corr[i] = 1.0
+        self.matrix[i] = np.eye(3)
+        line = (f"S{i + 1} range +/-{old:g} -> +/-{new:g} mT "
+                f"({ob.RANGE_TO_VPT[old]:g} -> {ob.RANGE_TO_VPT[new]:g} V/T)")
+        if not dropped:
+            return line + "; it carried no zero, trim or matrix to reset"
+        one = len(dropped) == 1
+        return (line + f"; its {', '.join(dropped)} "
+                f"{'was' if one else 'were'} measured at the old gain and "
+                f"{'has' if one else 'have'} been RESET -- the chip loads a "
+                f"different factory dataset per gain, so re-tare and "
+                f"re-calibrate S{i + 1} at this range")
 
     def is_dead(self, sensor_id, axis=None):
+        """Is this sensor -- or, given `axis`, this one channel -- marked dead.
+
+        Without `axis` this answers for the whole-sensor entry only. For
+        "should this sensor be in a statistic" use live_mask(), which also
+        takes out a sensor that has lost a single axis.
+        """
         if f"S{sensor_id}" in self.dead:
             return True
         return axis is not None and f"S{sensor_id}.{axis}" in self.dead
 
     def live_mask(self):
-        return np.array([not self.is_dead(i + 1) for i in range(N_SENSORS)])
+        """(16,) bool: sensors that may take part in statistics.
+
+        A per-axis entry ("S16.Bx") takes the whole sensor out, see
+        dead_sensors().
+        """
+        return live_mask(self.dead)
 
     def summary(self):
         if np.all(self.ranges_mt == self.ranges_mt[0]):
@@ -497,6 +640,30 @@ class Calibration:
         if self.dead:
             lines.append(f"excluded: {', '.join(sorted(self.dead))}")
         return "\n".join(lines)
+
+
+def dead_sensors(dead):
+    """Dead entries -> the set of whole-sensor labels ("S16") they take out.
+
+    An entry is either a sensor ("S16") or one axis of one ("S16.Bx"), and
+    both remove the WHOLE sensor. Everything a live mask gates is built on
+    |B| or on the three-component vector, and a chip missing one axis can give
+    neither: its magnitude is short by an unknown amount and its vector points
+    the wrong way. Per-axis entries used to be accepted, saved, and then
+    honoured nowhere -- every mask compared against "S16" only -- so marking
+    one bad axis left the sensor in every median it was meant to be kept out
+    of.
+
+    The sensor part is upper-cased, so "s16" from a command line means S16
+    rather than silently matching nothing.
+    """
+    return {str(d).split(".")[0].strip().upper() for d in dead or ()} - {""}
+
+
+def live_mask(dead):
+    """(16,) bool from a collection of dead entries; see dead_sensors()."""
+    gone = dead_sensors(dead)
+    return np.array([f"S{i + 1}" not in gone for i in range(N_SENSORS)])
 
 
 # --------------------------------------------------------------------------
@@ -590,7 +757,14 @@ def bad_reason(r):
 
 
 def health_verdict(rows):
-    """Turn channel_health() rows into short per-sensor status strings."""
+    """Turn channel_health() rows into short per-sensor status strings.
+
+    "dead" and "fault" are both unusable for statistics and suggest_dead()
+    excludes both. They stay two labels because they are two different things
+    to go and look at: "dead" is a chip with a broken reference or several
+    broken channels, "fault" is exactly one bad field channel on a chip that
+    is otherwise alive -- usually one wire.
+    """
     out = {}
     for sid in range(1, N_SENSORS + 1):
         chans = [r for r in rows if r["sensor_id"] == sid]
@@ -626,9 +800,18 @@ def health_verdict(rows):
 
 
 def suggest_dead(rows):
-    """Sensors that channel_health says should be excluded from statistics."""
+    """Sensors that channel_health says should be excluded from statistics.
+
+    Both "dead" and "fault". A sensor with ONE railed, stuck or out-of-range
+    field channel used to be rated "fault" and left in: S11's Bx resting at
+    -0.91 V read as -57 mT and went into every median, peak comparison and
+    export as though it were field. One bad axis is enough to make |B| and the
+    vector wrong, so one bad axis is enough to exclude the sensor. "noisy" is
+    not excluded -- a noisy channel is still measuring.
+    """
     v = health_verdict(rows)
-    return {f"S{sid}" for sid, (state, _) in v.items() if state == "dead"}
+    return {f"S{sid}" for sid, (state, _) in v.items()
+            if state in ("dead", "fault")}
 
 
 def temperatures_c(temp_raw_by_box):
