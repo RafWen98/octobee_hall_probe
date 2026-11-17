@@ -14,15 +14,19 @@ of __init__.
 
 Like Live, this module puts a second widget somewhere else:
 
-    StagesTab      find, reference, jog, and the field map, in the tab strip
+    StagesTab      find, reference, and the field map, in the tab strip
     StageJogPane   the three axes and nothing else, in the right-hand pane --
                    because "nudge it 2 mm and watch what the field does" is a
                    thing you do while looking at the Live plot or the Machine
                    view, and it should not cost a trip through the tab strip
 
-The pane is a second face on this tab, not a second implementation. Every
-button on it calls the method the tab's own button calls, so the interlock,
-the busy check and the not-homed refusal are written once.
+The pane is the only set of jog and Go controls. The tab used to carry a
+second set of its own, so on this tab the same three axes were on screen
+twice, with two step boxes that did not follow each other. Every button on the
+pane calls back into the tab, so the interlock, the busy check and the
+not-homed refusal are still written once -- and when the side panel is hidden
+the pane moves into this tab (host_jog), so the axes are never out of reach
+here.
 """
 
 import os
@@ -33,6 +37,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from octobee.gui.estop import is_running
 from octobee.gui.sources import LiveSource
+from octobee.gui.widgets import status as gstatus
 from octobee.gui.workers import ScanWorker, StageWorker, _stage_set_for
 from octobee.motion import scan as oscan
 from octobee.motion import stage as ostage
@@ -67,6 +72,7 @@ class StagesTab(QtWidgets.QWidget):
         self._stage_worker = None
         self._scan_worker = None
         self._scan_t0 = 0.0
+        self._scan_progress = None      # (points done, of, where) while mapping
 
         lay = QtWidgets.QVBoxLayout(self)
 
@@ -111,43 +117,32 @@ class StagesTab(QtWidgets.QWidget):
         f1.addWidget(self.btn_stage_savemap, 2, 3)
         lay.addWidget(g1)
 
-        g2 = QtWidgets.QGroupBox("2. Manual control")
+        g2 = QtWidgets.QGroupBox("2. Reference and speed")
         f2 = QtWidgets.QGridLayout(g2)
-        f2.addWidget(QtWidgets.QLabel("jog step"), 0, 1)
-        f2.addWidget(QtWidgets.QLabel("move to"), 0, 4)
+        # Jog and Go are not here: they are the pane on the right, which is on
+        # screen from every tab. What stays is what that pane does not have --
+        # homing one axis at a time, which is what you want after a stop that
+        # cost one axis its position, and the speed profile.
+        self.lbl_jog_hint = QtWidgets.QLabel(
+            "Jog and Go are in the side panel on the right, on every tab "
+            "(F9 shows and hides it).")
+        self.lbl_jog_hint.setWordWrap(True)
+        self.lbl_jog_hint.setStyleSheet("color:#9aa3b2; font-size:11px;")
+        f2.addWidget(self.lbl_jog_hint, 0, 0, 1, 7)
+        # Where the jog pane goes when the side panel is hidden: see host_jog.
+        self.jog_slot = QtWidgets.QVBoxLayout()
+        self.jog_slot.setContentsMargins(0, 0, 0, 0)
+        f2.addLayout(self.jog_slot, 1, 0, 1, 7)
+        f2.addWidget(QtWidgets.QLabel("home one axis"), 2, 0)
         self.stage_rows = {}
-        for r, ax in enumerate(("x", "y", "z"), start=1):
-            lbl = QtWidgets.QLabel(ax)
-            step = QtWidgets.QDoubleSpinBox()
-            step.setRange(0.001, 100.0)
-            step.setDecimals(3)
-            step.setValue(1.0)
-            step.setSuffix(" mm")
-            minus = QtWidgets.QPushButton("−")
-            plus = QtWidgets.QPushButton("+")
-            minus.setMaximumWidth(36)
-            plus.setMaximumWidth(36)
-            target = QtWidgets.QDoubleSpinBox()
-            target.setRange(0.0, 300.0)
-            target.setDecimals(3)
-            target.setSuffix(" mm")
-            go = QtWidgets.QPushButton("Go")
-            home = QtWidgets.QPushButton("Home")
+        for c, ax in enumerate(("x", "y", "z"), start=1):
+            home = QtWidgets.QPushButton(f"Home {ax}")
             home.setToolTip("Drives this axis into its limit switch. Make sure "
                             "the probe and its cabling are clear first.")
-            minus.clicked.connect(
-                lambda _, a=ax, s=step: self.on_stage_jog(a, -s.value()))
-            plus.clicked.connect(
-                lambda _, a=ax, s=step: self.on_stage_jog(a, +s.value()))
-            go.clicked.connect(
-                lambda _, a=ax, t=target: self.on_stage_goto(a, t.value()))
             home.clicked.connect(lambda _, a=ax: self.on_stage_home([a]))
-            for c, wdg in enumerate((lbl, step, minus, plus, target, go, home)):
-                f2.addWidget(wdg, r, c)
-            self.stage_rows[ax] = {"step": step, "target": target,
-                                   "present": False,
-                                   "widgets": (lbl, step, minus, plus, target,
-                                               go, home)}
+            f2.addWidget(home, 2, c)
+            self.stage_rows[ax] = {"present": False, "home": home,
+                                   "widgets": (home,)}
 
         # A jog only reaches full speed if it is long enough to ramp up to it,
         # so the same setting is quiet at 2 mm and loud at 20. This is where
@@ -211,8 +206,8 @@ class StagesTab(QtWidgets.QWidget):
             "(or Esc) — that one is immediate and refuses all further motion "
             "until it is reset.")
         self.btn_stage_stop.clicked.connect(self.motion.stop)
-        f2.addWidget(self.btn_stage_homeall, 5, 0, 1, 3)
-        f2.addWidget(self.btn_stage_stop, 5, 5, 1, 2)
+        f2.addWidget(self.btn_stage_homeall, 2, 4)
+        f2.addWidget(self.btn_stage_stop, 2, 5, 1, 2)
         lay.addWidget(g2)
 
         g3 = QtWidgets.QGroupBox("3. Field map")
@@ -296,6 +291,58 @@ class StagesTab(QtWidgets.QWidget):
 
         self._update_scan_estimate()
         self._set_stage_controls_enabled(False)
+
+    def host_jog(self, here):
+        """Take the jog pane into this tab, or give it back to the side panel.
+
+        The window calls this when the side panel is hidden or shown. There is
+        one pane and it is always somewhere: hiding the panel to give the plot
+        the width must not leave the Stages tab with no way to move an axis.
+        Returns the pane, for the window to put back in its own column.
+        """
+        if here:
+            self.jog_slot.addWidget(self.jog_pane)
+            self.jog_pane.show()
+        self.lbl_jog_hint.setVisible(not here)
+        # The pane brings a Home all and a Stop of its own; two of each in
+        # one group box is the duplication this was written to remove.
+        self.btn_stage_homeall.setVisible(not here)
+        self.btn_stage_stop.setVisible(not here)
+        return self.jog_pane
+
+    def offer_homing(self):
+        """Ask whether to home the axes that have lost their reference.
+
+        Public because the emergency-stop reset comes here too: clearing the
+        latch gives motion back but not position, and the next thing anyone
+        has to do is home. Asking then is one click instead of a hunt.
+        """
+        self._prompt_home_if_needed()
+
+    def home_lost_axes(self):
+        """Home every axis whose position cannot be believed, in the safe order.
+
+        No question asked here: the caller has already asked it. This is what
+        "Reset and home those axes" on the emergency-stop reset comes to.
+        """
+        stages = self.session.stages
+        if stages is None:
+            return
+        names = [n for n in stages.home_sequence()
+                 if not stages[n].position_trusted]
+        if names:
+            self._home_axes(names)
+
+    def run_status(self):
+        """(text, fraction done) for a field map in flight, or None."""
+        if self._scan_progress is None or not is_running(self._scan_worker):
+            return None
+        i, n, _where = self._scan_progress
+        text = f"field map: point {i}/{n}"
+        if i:
+            left = (time.time() - self._scan_t0) / i * (n - i)
+            text += f", {gstatus.format_duration(left)} left"
+        return text, i / max(n, 1)
 
     def _set_stage_controls_enabled(self, on):
         """Connected or not. Everything finer than that is sync_controls."""
@@ -543,12 +590,9 @@ class StagesTab(QtWidgets.QWidget):
             for ax, row in self.stage_rows.items():
                 have = ax in self.session.stages.names
                 row["present"] = have
-                if have:
-                    # The soft limit, not the travel: a spin box that offers a
-                    # number the axis is not allowed to go to is an invitation
-                    # to find that out by pressing Go.
-                    lo, hi = self.session.stages[ax].limit_mm
-                    row["target"].setRange(lo, hi)
+                # The soft limit, not the travel: a box that offers a number
+                # the axis is not allowed to go to is an invitation to find
+                # that out by pressing Go.
                 self.jog_pane.set_present(ax, have,
                                           self.session.stages[ax].limit_mm
                                           if have else None)
@@ -980,12 +1024,14 @@ class StagesTab(QtWidgets.QWidget):
         self._scan_worker.progress.connect(self.on_scan_progress)
         self._scan_worker.done.connect(self.on_scan_done)
         self._scan_t0 = time.time()
+        self._scan_progress = (0, n, "")
         # Started first, for the reason given in stage_action.
         self._scan_worker.start()
         self.motion.register(self._scan_worker)
         self.sync_controls()
 
     def on_scan_progress(self, i, n, where, sem_ut):
+        self._scan_progress = (i, n, where)
         self.bar_scan.setValue(i)
         elapsed = time.time() - self._scan_t0
         eta = elapsed / max(i, 1) * (n - i)
@@ -1001,6 +1047,7 @@ class StagesTab(QtWidgets.QWidget):
             self.session.log("field map: stopping after the point in flight")
 
     def on_scan_done(self, fm, error):
+        self._scan_progress = None
         self.motion.retire(self._scan_worker)
         self.btn_scan_abort.setEnabled(False)
         self._set_snapshot_enabled(True)
@@ -1093,13 +1140,13 @@ class StageJogPane(QtWidgets.QWidget):
     Deliberately smaller than the Stages tab. There is no device list, no axis
     map and no field map here -- those are set up once and then not touched
     again. What does get touched constantly is "nudge it 2 mm and watch what
-    the field does", and until now that meant leaving whichever view you were
+    the field does", and that should not mean leaving whichever view you were
     reading to do it.
 
-    Nothing is duplicated but the widgets. Every button calls straight back
-    into StagesTab, so the emergency-stop latch, the one-move-at-a-time guard
-    and the refusal to move an unreferenced axis absolutely are each still
-    written exactly once, in the tab.
+    These are the only jog and Go controls there are. Every button calls
+    straight back into StagesTab, so the emergency-stop latch, the
+    one-move-at-a-time guard and the refusal to move an unreferenced axis
+    absolutely are each still written exactly once, in the tab.
     """
 
     AXES = ("x", "y", "z")
@@ -1114,8 +1161,8 @@ class StageJogPane(QtWidgets.QWidget):
         lay.setSpacing(4)
 
         head = QtWidgets.QLabel(
-            "Stages — the same three axes as the Stages tab, and the same "
-            "guards on them.")
+            "Stages — jog is relative and always allowed; Go needs the axis "
+            "homed.")
         head.setWordWrap(True)
         head.setStyleSheet("color:#9aa3b2; font-size:11px;")
         lay.addWidget(head)

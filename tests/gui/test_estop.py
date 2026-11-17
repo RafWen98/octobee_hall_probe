@@ -131,11 +131,12 @@ def test_gui_estop(app, workdir):
         # test, so isVisible() is False for every child either way and both
         # checks would pass without testing anything.
         check("and the reset button appears only once latched",
-              not win.btn_estop_reset.isHidden())
+              win.act_estop_reset.isVisible())
         win.motion._reason = None           # reset without opening the modal
         win._refresh_estop_ui()
         check("clearing the latch hides the reset button",
-              win.btn_estop_reset.isHidden())
+              not win.act_estop_reset.isVisible()
+              and win.strip.btn_banner_reset.isHidden())
 
         stages = FakeSet({"x": FakeStage("x"), "y": FakeStage("y")})
         win.session.stages = stages
@@ -143,7 +144,7 @@ def test_gui_estop(app, workdir):
             win.tab_stages.stage_rows[ax]["present"] = True
         win.tab_stages.sync_controls()
         check("motion controls are live before the stop",
-              win.tab_stages.stage_rows["x"]["target"].isEnabled()
+              win.tab_stages.stage_rows["x"]["home"].isEnabled()
               and win.tab_stages.btn_scan_start.isEnabled())
         # The right-hand jog pane is a second set of buttons onto the same
         # three axes. It is gated by the same call, and that is the only
@@ -163,7 +164,7 @@ def test_gui_estop(app, workdir):
         check("and latches the machine, not just the axis that was moving",
               stages.interlock.tripped is not None)
         check("motion controls go dead while latched",
-              not win.tab_stages.stage_rows["x"]["target"].isEnabled()
+              not win.tab_stages.stage_rows["x"]["home"].isEnabled()
               and not win.tab_stages.btn_scan_start.isEnabled())
         check("and so does the right-hand jog pane",
               not pane.rows["x"]["target"].isEnabled()

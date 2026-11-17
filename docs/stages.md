@@ -172,6 +172,23 @@ Reset is a separate button that only appears once latched. The stop button
 never becomes the start button: someone reaching for a stop in a hurry may
 well hit it twice, and the second press must not release the machine.
 
+#### Getting control back
+
+1. Deal with whatever made you press it.
+2. Press **Reset** — beside the red button, or in the red banner under the
+   toolbar. It asks, and says which axes have lost their position.
+3. Choose **Reset and home those axes** if the head and its cabling are clear
+   of the whole travel. If they are not, choose **Reset and allow motion**,
+   jog the head clear — jogging is relative and works straight away — and then
+   press **Home all**.
+
+Until an axis is homed, Go, a field map and a volume map are refused on it.
+A volume map that was running is saved up to the line it was stopped on.
+
+Until November 2026 step 2 could not be done: the Reset button was shown by a
+call a Qt toolbar ignores, so it never appeared, and the only way to move the
+machine again was to restart the program.
+
 #### `homed` is not the same as "knows where it is"
 
 This is the one worth internalising. The controller's homed bit means *a

@@ -69,7 +69,7 @@ def main():
                    help="start disconnected. Without this the window connects "
                         "to the carriers and the stages as soon as it opens")
     p.add_argument("--profile", action="store_true",
-                   help="start with the Profile tab measuring where the time "
+                   help="start with the Profile window measuring where the time "
                         "goes, and print a summary on exit")
     p.add_argument("--screenshot", help="render one frame to this PNG and exit "
                                         "(for headless checks)")

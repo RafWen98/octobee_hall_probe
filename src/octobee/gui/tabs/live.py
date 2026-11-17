@@ -24,9 +24,22 @@ import numpy as np
 from PyQt6 import QtWidgets
 
 from octobee.gui.constants import N_SENSORS
+from octobee.gui.widgets import status as gstatus
 from octobee.gui.widgets.plot import LivePlot
 from octobee.gui.widgets.probe3d import ProbeView3D
 from octobee.gui.widgets.sensors import SensorBars
+
+
+# What the health scan calls a sensor, as one of the window's four colours.
+# "noisy" is amber and not red because a noisy channel is still measuring.
+HEALTH_COLOUR = {
+    "ok": gstatus.COLOURS["ok"],
+    "noisy": gstatus.COLOURS["warn"],
+    "fault": gstatus.COLOURS["fail"],
+    "dead": gstatus.COLOURS["fail"],
+    "excluded": gstatus.COLOURS["fail"],
+    "unknown": gstatus.COLOURS[gstatus.IDLE],
+}
 
 
 class LiveTab(QtWidgets.QWidget):
@@ -56,13 +69,24 @@ class LiveTab(QtWidgets.QWidget):
         self.cmb_units.currentTextChanged.connect(self.refresh_units)
         top.addWidget(self.cmb_units)
         top.addSpacing(12)
+        # One button per sensor, doing two jobs: pressed in, its trace is
+        # drawn; and its colour is what the health scan last said about it.
+        # They were plain tick boxes, with the health two tabs away -- which
+        # is how S9, S10 and S11 sat dead for a morning with a full set of
+        # ticks on screen. The name is kept from then.
         self.chk_sensors = []
+        self._health = {}
+        self._dead = set()
         for s in range(N_SENSORS):
-            cb = QtWidgets.QCheckBox(f"{s+1}")
+            cb = QtWidgets.QToolButton()
+            cb.setText(f"{s+1}")
+            cb.setCheckable(True)
             cb.setChecked(True)
+            cb.setMinimumWidth(30)
             cb.toggled.connect(self.on_sensor_toggle)
             self.chk_sensors.append(cb)
             top.addWidget(cb)
+        self._restyle_sensors()
         btn_all = QtWidgets.QPushButton("all")
         btn_all.clicked.connect(lambda: self.set_all_sensors(True))
         btn_none = QtWidgets.QPushButton("none")
@@ -110,6 +134,7 @@ class LiveTab(QtWidgets.QWidget):
     def on_sensor_toggle(self, _=None):
         self.plot.set_visible_sensors(
             {i for i, cb in enumerate(self.chk_sensors) if cb.isChecked()})
+        self._restyle_sensors()
 
     def set_all_sensors(self, on):
         for cb in self.chk_sensors:
@@ -119,10 +144,38 @@ class LiveTab(QtWidgets.QWidget):
         self.on_sensor_toggle()
 
     def mark_dead(self, dead):
+        """Which sensors are excluded from the statistics, by hand or by scan."""
+        self._dead = {str(d).split(".")[0] for d in dead}
+        self._restyle_sensors()
+
+    def set_health(self, verdict):
+        """Adopt one health scan: {sensor id: (state, why)}, or None for none."""
+        self._health = dict(verdict or {})
+        self._restyle_sensors()
+
+    def sensor_state(self, sensor_id):
+        """(state, why) for one sensor, as its button shows it."""
+        state, why = self._health.get(sensor_id, ("unknown", "not scanned yet"))
+        if f"S{sensor_id}" in self._dead and state in ("ok", "noisy", "unknown"):
+            # Excluded by hand, or still inside the scan's two-scan hold.
+            state, why = "excluded", why or "excluded from the statistics"
+        return state, why
+
+    def _restyle_sensors(self):
         for s, cb in enumerate(self.chk_sensors):
-            bad = f"S{s+1}" in dead
-            cb.setStyleSheet("color:#c05050;" if bad else "")
-            cb.setToolTip("excluded: railed or stuck channels" if bad else "")
+            state, why = self.sensor_state(s + 1)
+            colour = HEALTH_COLOUR.get(state, HEALTH_COLOUR["unknown"])
+            shown = cb.isChecked()
+            cb.setStyleSheet(
+                f"QToolButton {{ border:1px solid {colour}; border-bottom:4px "
+                f"solid {colour}; border-radius:3px; padding:2px 4px; "
+                f"background:{'#262b38' if shown else '#12141a'}; "
+                f"color:{'#d5d9e2' if shown else '#5b6372'}; }}")
+            cb.setToolTip(
+                f"S{s+1}: {state}" + (f" — {why}" if why else "")
+                + "\n\nClick to " + ("hide" if shown else "show")
+                + " its trace. The colour is the health scan's verdict, "
+                  "whether or not the trace is shown.")
 
     def draw(self, recent):
         """Paint the traces from the samples we are handed."""

@@ -317,15 +317,24 @@ class SweepPlan:
         That is the price of never reversing into a line, and it is included
         here rather than discovered overnight.
         """
+        return float(sum(self.line_durations_s(accel_mm_s2)))
+
+    def line_durations_s(self, accel_mm_s2=None):
+        """What each line costs, in seconds, in the order they are run.
+
+        Separate from duration_s() so a run in progress can say how much is
+        left: the lines are not the same length, so "lines done over lines
+        planned" is a poor clock.
+        """
         a = float(self.accel_mm_s2 if accel_mm_s2 is None else accel_mm_s2)
         v = otim.clamp_velocity(self.speed_mm_s)
         back = otim.clamp_velocity(otim.MAX_VEL_MM_S)
-        total = 0.0
+        out = []
         for ln in self.lines:
             reach = abs(ln.to_mm - ln.from_mm)
-            total += otim.move_time_s(reach, v, a) + self.settle_s
-            total += otim.move_time_s(reach, back, a)
-        return total
+            out.append(otim.move_time_s(reach, v, a) + self.settle_s
+                       + otim.move_time_s(reach, back, a))
+        return out
 
     def rows(self):
         """How many log rows this will produce, roughly."""

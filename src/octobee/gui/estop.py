@@ -49,6 +49,9 @@ class MotionControl(QtCore.QObject):
     """The emergency stop, the graded stop, and the motion-worker registry."""
 
     changed = QtCore.pyqtSignal()      # latch or busy state moved
+    # The latch was reset and the operator asked for the axes that lost their
+    # position to be homed in the same breath. The Stages tab does the homing.
+    home_requested = QtCore.pyqtSignal()
 
     def __init__(self, session, parent=None):
         """`parent` is the widget modal dialogs are shown over."""
@@ -204,17 +207,33 @@ class MotionControl(QtCore.QObject):
                   "— check that whatever caused the stop is actually dealt "
                   "with, and that the head is where you think it is.")
         if lost:
-            detail += ("\n\nThese axes will still refuse absolute moves until "
-                       "they are homed, because an immediate stop can lose "
-                       "steps:\n\n  "
-                       + "\n  ".join(f"{n}: {why}" for n, why in lost))
+            detail += ("\n\nThese axes will still refuse absolute moves — Go, "
+                       "a field map, a volume map — until they are homed, "
+                       "because an immediate stop can lose steps. Jogging is "
+                       "relative and works straight away.\n\n  "
+                       + "\n  ".join(f"{n}: {why}" for n, why in lost)
+                       + "\n\nHoming drives each of them into its limit "
+                         "switch across the whole travel. Only choose it if "
+                         "the probe head and its cabling are clear of the "
+                         "entire range of movement; otherwise reset, jog the "
+                         "head clear, and press Home all afterwards.")
         box.setInformativeText(detail)
         go = box.addButton("Reset and allow motion",
                            QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Stay stopped",
-                      QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        # Getting control back after a stop is two steps -- clear the latch,
+        # then home -- and the second one used to be left for the operator to
+        # work out from a line in the Log. Offered here, where the question
+        # is being asked anyway.
+        go_home = (box.addButton("Reset and home those axes",
+                                 QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+                   if lost else None)
+        stay = box.addButton("Stay stopped",
+                             QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(stay)
+        box.setEscapeButton(stay)
         box.exec()
-        if box.clickedButton() is not go:
+        clicked = box.clickedButton()
+        if clicked is None or clicked not in (go, go_home):
             return
         was = self._reason
         self._reason = None
@@ -224,6 +243,12 @@ class MotionControl(QtCore.QObject):
         for name, why in lost:
             self.session.log(f"  {name}: absolute moves still refused — {why}")
         self.changed.emit()
+        if lost and clicked is go_home:
+            self.home_requested.emit()
+        elif lost:
+            self.session.log("  press Home all (side panel or Stages tab) "
+                             "once the head is clear, to get Go and the maps "
+                             "back")
 
     # ---- the graded stop --------------------------------------------------
 

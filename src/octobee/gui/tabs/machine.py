@@ -15,12 +15,15 @@ for the scanner, which needs to know the clearance before it commands a move.
 import itertools
 import json
 import os
+import time
 
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from octobee import machine as omach
 from octobee import record as orec
+from octobee.gui import preflight
+from octobee.gui.widgets import status as gstatus
 from octobee.gui.widgets.machine3d import MachineView3D
 from octobee.gui.workers import (
     EncoderCalibrationWorker,
@@ -42,7 +45,44 @@ VOLUME_PATTERNS = {
 
 
 
+class _Page(QtWidgets.QScrollArea):
+    """One page of the Machine tab's controls: scrolls down, never sideways.
+
+    The panel used to be a single scroll area whose width was fixed from a
+    size hint taken before the window's style sheet had been applied. The
+    styled buttons came out wider than the hint, so the panel grew a
+    horizontal scrollbar and the right-hand edge of every row was cut off.
+    Here the width is asked for again whenever the layout is: the page is
+    always at least as wide as what is in it.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.body = QtWidgets.QWidget()
+        self.lay = QtWidgets.QVBoxLayout(self.body)
+        self.setWidget(self.body)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def _width(self):
+        return (self.body.minimumSizeHint().width()
+                + self.verticalScrollBar().sizeHint().width() + 6)
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(self._width(), 160)
+
+    def sizeHint(self):
+        return QtCore.QSize(self._width(),
+                            self.body.sizeHint().height() + 6)
+
+
 class MachineTab(QtWidgets.QWidget):
+    # A volume map has ended: (where it was written or "", what went wrong or
+    # ""). For the window, which is the one that can say so on every tab.
+    map_finished = QtCore.pyqtSignal(str, str)
+
     def __init__(self, session, motion=None, parent=None):
         """Where the head is inside the coil set, and which coils are live.
 
@@ -75,6 +115,9 @@ class MachineTab(QtWidgets.QWidget):
         self._preview_at = None          # the made-up stage reading it implies
         self._preview_timer = None
         self._run_hz = 0.0              # the rate a sweep in flight is timed at
+        self._run_t0 = 0.0              # when it started
+        self._run_costs = None          # cumulative planned seconds, per line
+        self._run_progress = None       # (lines done, of, where) while sweeping
         self._enc_worker = None
         self.machine_view = MachineView3D(session.geom,
                                           profiler=session.prof)
@@ -86,8 +129,31 @@ class MachineTab(QtWidgets.QWidget):
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         outer.addWidget(split)
 
+        # Two pages rather than one long scroll. They are two jobs: saying
+        # what the machine is and where the probe sits in it, which is done
+        # once, and mapping a volume, which is done every run. In one column
+        # the buttons that start a run were under three groups of set-up and
+        # off the bottom of the screen. They share the drawing on the right,
+        # which is why these are pages of this tab and not two tabs: there is
+        # one 3D view, and both of them are about what it shows.
         panel = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.pages = QtWidgets.QTabWidget()
+        setup_page = _Page()
+        volume_page = _Page()
+        setup = setup_page.lay
+        volume = volume_page.lay
+        # The buttons that plan and start a run sit under the Volume page's
+        # scrolling part, not in it, so they are on screen whatever the
+        # height of the window.
+        run_page = QtWidgets.QWidget()
+        run_lay = QtWidgets.QVBoxLayout(run_page)
+        run_lay.setContentsMargins(0, 0, 0, 0)
+        run_lay.addWidget(volume_page, 1)
+        self.pages.addTab(setup_page, "Set-up")
+        self.pages.addTab(run_page, "Volume map")
+        lay.addWidget(self.pages, 1)
 
         note = QtWidgets.QLabel(
             "The coil file is in machine coordinates; the probe is placed by "
@@ -98,7 +164,7 @@ class MachineTab(QtWidgets.QWidget):
             "into it.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#9aa3b2; font-size:11px;")
-        lay.addWidget(note)
+        setup.addWidget(note)
 
         # ---- 1. the coil set ----
         g1 = QtWidgets.QGroupBox("1. Coil set")
@@ -134,7 +200,7 @@ class MachineTab(QtWidgets.QWidget):
             "Clearance is reported to this surface, not to the centreline.")
         self.spin_coil_radius.valueChanged.connect(self.on_machine_radius)
         f1.addWidget(self.spin_coil_radius, 2, 1)
-        lay.addWidget(g1)
+        setup.addWidget(g1)
 
         # ---- 2. currents ----
         g2 = QtWidgets.QGroupBox("2. Which coils are carrying current")
@@ -187,7 +253,7 @@ class MachineTab(QtWidgets.QWidget):
         f2.addWidget(btn_all_on, 2, 0)
         f2.addWidget(btn_all_off, 2, 1)
         f2.addWidget(hint, 2, 2, 1, 2)
-        lay.addWidget(g2)
+        setup.addWidget(g2)
 
         # ---- 3. placement ----
         g3 = QtWidgets.QGroupBox("3. Where the probe is")
@@ -244,10 +310,11 @@ class MachineTab(QtWidgets.QWidget):
         self.lbl_machine_stage.setWordWrap(True)
         self.lbl_machine_stage.setStyleSheet("color:#9aa3b2; font-size:11px;")
         f3.addWidget(self.lbl_machine_stage, 5, 0, 1, 3)
-        lay.addWidget(g3)
+        setup.addWidget(g3)
+        setup.addStretch(1)
 
-        # ---- 4. the volume to map ----
-        g4 = QtWidgets.QGroupBox("4. Volume to map")
+        # ---- the volume to map ----
+        g4 = QtWidgets.QGroupBox("1. Volume to map")
         f4 = QtWidgets.QGridLayout(g4)
         blurb = QtWidgets.QLabel(
             "Swept, not stepped: one axis runs at constant velocity while the "
@@ -445,15 +512,29 @@ class MachineTab(QtWidgets.QWidget):
         self.btn_vol_abort = QtWidgets.QPushButton("Abort")
         self.btn_vol_abort.setEnabled(False)
         self.btn_vol_abort.clicked.connect(self.on_volume_abort)
-        f4.addWidget(self.btn_vol_plan, 10, 0)
-        f4.addWidget(self.btn_vol_preview, 10, 1)
-        f4.addWidget(self.btn_vol_start, 10, 2)
-        f4.addWidget(self.btn_vol_abort, 10, 3)
+        volume.addWidget(g4)
 
+        # ---- is it ready ----
+        g5 = QtWidgets.QGroupBox("2. Ready to run?")
+        g5.setToolTip(
+            "Asked again every second. Red stops Start; amber does not, and "
+            "is repeated in the question Start asks. Each of these has been "
+            "the reason a map was wasted.")
+        f5 = QtWidgets.QVBoxLayout(g5)
+        self.ready = gstatus.CheckList()
+        f5.addWidget(self.ready)
+        volume.addWidget(g5)
+        volume.addStretch(1)
+
+        run_row = QtWidgets.QHBoxLayout()
+        run_row.setContentsMargins(6, 0, 6, 0)
+        for b in (self.btn_vol_plan, self.btn_vol_preview,
+                  self.btn_vol_start, self.btn_vol_abort):
+            run_row.addWidget(b)
+        run_lay.addLayout(run_row)
         self.bar_volume = QtWidgets.QProgressBar()
         self.bar_volume.setTextVisible(True)
-        f4.addWidget(self.bar_volume, 11, 0, 1, 4)
-        lay.addWidget(g4)
+        run_lay.addWidget(self.bar_volume)
 
         self.lbl_clearance = QtWidgets.QLabel("no coil set loaded")
         self.lbl_clearance.setWordWrap(True)
@@ -505,20 +586,8 @@ class MachineTab(QtWidgets.QWidget):
         row2.addWidget(chk_gizmo)
         row2.addStretch(1)
         lay.addLayout(row2)
-        lay.addStretch(1)
 
-        # The panel is four groups tall now and does not fit a laptop screen.
-        # Scrolled rather than squeezed: the alternative is spin boxes that
-        # shrink until the units no longer fit in them, on the tab whose whole
-        # job is getting numbers typed in correctly.
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidget(panel)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        # Wide enough for the panel's own idea of itself plus the scrollbar,
-        # so the vertical scroll never costs a horizontal one.
-        scroll.setMinimumWidth(panel.sizeHint().width() + 28)
-        split.addWidget(scroll)
+        split.addWidget(panel)
         right = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(right)
         rl.setContentsMargins(2, 2, 2, 2)
@@ -538,6 +607,63 @@ class MachineTab(QtWidgets.QWidget):
 
         self.on_volume_whole(self.chk_vol_all.isChecked())
         self.refresh_encoders()
+
+        # The checklist is about things this tab does not own -- the stream,
+        # the sensors, the stages -- and none of them announce a change, so it
+        # is simply asked again. Eleven cheap questions a second.
+        self._ready_timer = QtCore.QTimer(self)
+        self._ready_timer.timeout.connect(self.refresh_ready)
+        self._ready_timer.start(1000)
+        self.refresh_ready()
+
+    # ---- ready to run ----------------------------------------------------
+    def readiness(self):
+        """The checks in octobee/gui/preflight.py, for the plan in hand."""
+        current = self._plan is not None and self._plan_basis == self._basis()
+        head = None
+        if self.session.stages is not None:
+            try:
+                head = self.stage_mm(ignore_tracking=True)
+            except Exception:
+                head = None
+        return preflight.run_checks(
+            self.session, self.motion, plan=self._plan, plan_current=current,
+            head_mm=head)
+
+    def refresh_ready(self):
+        """Redraw the checklist. Skipped while it cannot be seen."""
+        if not self.ready.isVisible() and self.ready.checks:
+            return
+        try:
+            self.ready.set_checks(self.readiness())
+        except Exception as exc:
+            # A checklist that raises once a second is worse than none.
+            self.ready.set_checks([preflight.Check(
+                "Checks", preflight.WARN,
+                f"could not be worked out ({type(exc).__name__}: {exc})")])
+
+    def run_status(self):
+        """(text, fraction done) for a volume map in flight, or None.
+
+        The time left is the plan's own estimate for the lines still to run,
+        scaled by how the lines already run compared with theirs -- so it is
+        right from the first line, where "elapsed over lines done" would have
+        to guess that every line is the same length.
+        """
+        if self.session.volume_runner is None or self._run_progress is None:
+            return None
+        i, n, _where = self._run_progress
+        text = f"volume map: line {i}/{n}"
+        costs = self._run_costs
+        if costs is not None and len(costs) == n and n:
+            done = costs[i - 1] if i else 0.0
+            left = costs[-1] - done
+            elapsed = time.time() - self._run_t0
+            if i >= 3 and done > 0:
+                left *= min(max(elapsed / done, 0.5), 3.0)
+            text += f", {gstatus.format_duration(left)} left"
+            return text, done / max(costs[-1], 1e-9)
+        return text, i / max(n, 1)
 
     def announce(self):
         """Say what was loaded, then draw it.
@@ -1345,9 +1471,27 @@ class MachineTab(QtWidgets.QWidget):
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Volume map", str(exc))
             return
+        # Everything else worth asking before leaving the rig alone with
+        # this, in one place: see octobee/gui/preflight.py. What is red stops
+        # here; what is amber is repeated in the question below, so it is
+        # answered rather than discovered in the morning.
+        checks = self.readiness()
+        self.ready.set_checks(checks)
+        stopping = [c for c in checks if c.state == preflight.FAIL]
+        if stopping:
+            QtWidgets.QMessageBox.warning(
+                self, "Volume map",
+                "Not ready to run:\n\n" + "\n".join(
+                    f"  {c.name} — {c.detail}" for c in stopping))
+            return
+        caveats = [c for c in checks
+                   if c.state == preflight.WARN and c.name != "Way in"]
         self._stop_preview()
         hours = self._plan.duration_s() / 3600.0
         way_in = (f"WARNING: {unchecked}.\n\n" if unchecked else "")
+        if caveats:
+            way_in += ("It will run, but:\n" + "\n".join(
+                f"  {c.name} — {c.detail}" for c in caveats) + "\n\n")
         reply = QtWidgets.QMessageBox.question(
             self, "Volume map",
             f"{self._plan.describe()}.\n\n{way_in}"
@@ -1406,6 +1550,10 @@ class MachineTab(QtWidgets.QWidget):
         # sweep and a map assembled at a rate the rows were not written at
         # would have every position wrong by a growing amount.
         self._run_hz = float(self.session.out_rate)
+        self._run_t0 = time.time()
+        self._run_costs = list(itertools.accumulate(
+            self._plan.line_durations_s()))
+        self._run_progress = (0, len(self._plan.lines), "")
         self.bar_volume.setRange(0, len(self._plan.lines))
         self.bar_volume.setValue(0)
         self.btn_vol_start.setEnabled(False)
@@ -1439,6 +1587,7 @@ class MachineTab(QtWidgets.QWidget):
             self.btn_vol_abort.setEnabled(False)
 
     def on_volume_progress(self, i, n, where):
+        self._run_progress = (i, n, where)
         self.bar_volume.setValue(i)
         self.bar_volume.setFormat(f"line {i}/{n}  ({where})  "
                                   f"%p%")
@@ -1454,6 +1603,7 @@ class MachineTab(QtWidgets.QWidget):
         log = self.session.volume_log
         self.session.volume_runner = None
         self.session.volume_log = None
+        self._run_progress = None
         self._retire(self._sweep_worker)
         if float(self.session.out_rate) != self._run_hz:
             self.session.log(
@@ -1470,6 +1620,7 @@ class MachineTab(QtWidgets.QWidget):
             self.session.log(f"WARNING: volume map: {err}")
         if log is None or not log.n_rows:
             self.session.log("volume map: nothing was logged")
+            self.map_finished.emit("", err or "nothing was logged")
             if err:
                 QtWidgets.QMessageBox.warning(self, "Volume map", err)
             return
@@ -1494,6 +1645,9 @@ class MachineTab(QtWidgets.QWidget):
                 f"({type(exc).__name__}: {exc}). The data is still in memory "
                 f"-- do not close the window; free the disk or fix the path "
                 f"and it can be saved again.")
+            self.map_finished.emit(
+                "", f"the map could not be written ({exc}) -- it is still in "
+                    f"memory, do not close the window")
             QtWidgets.QMessageBox.warning(
                 self, "Volume map",
                 f"The map could not be written:\n\n{exc}\n\nIt is still in "
@@ -1504,6 +1658,7 @@ class MachineTab(QtWidgets.QWidget):
             f"volume map: {log.n_rows:,} rows over {done} lines "
             f"-> {written}" + (" (aborted)" if err or (
                 runner is not None and runner.aborted) else ""))
+        self.map_finished.emit(str(written), err or "")
 
     def _position_plan(self):
         """One line on where this map's positions will come from, per axis."""

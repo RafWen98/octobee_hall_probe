@@ -46,7 +46,41 @@ mounted. Only the person in the room can say that is clear. Until an axis is
 homed, absolute moves and field maps are refused; jogging is relative and works
 either way.
 
-### The Help tab
+### What the rig is doing, on every tab
+
+Under the toolbar there is one line that does not change with the tab:
+
+| | |
+|---|---|
+| **connection** | live and at what rate, or disconnected — and amber for demo or replay data, which is not the probe |
+| **sensors** | how many of the sixteen the health scan calls healthy, and which are excluded. Click it for the Sensors tab |
+| **stream** | samples lost since connecting. Anything but zero is a hole in whatever was being recorded |
+| **recording** | red, with a clock and the size, while a file is open |
+| **job** | a volume map or field map in flight: which line, a bar, and the time left |
+
+It exists because each of those used to be on some other tab than the one
+being watched. S9, S10 and S11 sat dead for a morning under a Live tab showing
+a full row of ticked boxes; the progress of a seven-hour map was a bar on the
+Machine tab.
+
+Below it, a **red banner** appears when something has gone wrong — a recording
+stopped by a dead stream, a map that ended early — and stays until it is
+dismissed. A latched emergency stop puts its own line there, with what to do
+next and a **Reset** button beside the words.
+
+The same information is on the **Live tab's sensor buttons**: each is green,
+amber (noisy) or red (dead, faulty or excluded) from the last health scan, and
+pressing one still shows or hides that sensor's trace. The **Log** tab counts
+the warnings and alarms written since it was last opened — `Log (3)`, amber or
+red — and colours those lines.
+
+**Side panel** (F9) hides the right-hand column — the probe head, the peak
+bars and the jog controls — to give the plot or the Machine view the width.
+The jog controls are the only ones there are; while the column is hidden they
+move into the Stages tab. **Profile** and **Help** (F1) open in windows of
+their own rather than taking a tab each.
+
+### The Help window
 
 Searchable documentation, indexed from **this README** at startup, plus a
 handful of topics about the window itself (shown in blue). Type a few words —

@@ -253,6 +253,21 @@ note), and a line cut short by a winding takes no run-in or run-out toward it.
 first, from wherever the head was left: it is checked when Start is pressed if
 the head is inside the box, and the Start dialog says so when it is not.
 
+**The tab is two pages.** *Set-up* is the coil file, the currents and where
+the probe sits; *Volume map* is the box, the plan and the run. The buttons
+that plan, fly and start a map are under the second page and do not scroll.
+
+**Ready to run?** The Volume map page carries a list that is asked again every
+second: is there a live stream, has it lost samples, are the sensors healthy,
+are the stages connected and every axis homed, is the emergency stop clear, is
+anything else running, are the encoders calibrated, is the plan current, is
+the way from where the head stands to the first line clear, and is there disk
+space for the rows. Red stops **Start** and says why; amber does not, and is
+repeated in the question Start asks — a dead sensor is a reason to know, not a
+reason to refuse. While a map runs, its line count and the time left are on
+the strip under the toolbar, on every tab, and a map that ends early raises
+the banner there.
+
 **A plan is for one pose.** Changing the pose, the winding radius, the stage
 zero, the coil file or the probe geometry discards the plan; press **Plan**
 again. A box that reaches past the stages' travel is refused at Plan.

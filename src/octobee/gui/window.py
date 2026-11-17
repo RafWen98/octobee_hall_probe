@@ -38,6 +38,7 @@ from octobee.calib import convert as ocal
 from octobee import live as olive
 from octobee import record as orec
 from octobee.motion import encoder as oenc
+from octobee.gui import preflight
 from octobee.gui.estop import MotionControl, is_running
 from octobee.gui.constants import (
     DEFAULT_VIEW_HZ,
@@ -60,6 +61,7 @@ from octobee.gui.tabs.machine import MachineTab
 from octobee.gui.tabs.stages import StagesTab
 from octobee.gui.tabs.profile import ProfileTab
 from octobee.gui.sources import DemoSource, LiveSource, ReplaySource
+from octobee.gui.widgets import status as gstatus
 from octobee.gui.widgets.log import LogPane
 from octobee.gui.widgets.sensors import SensorTable
 from octobee.gui.workers import (
@@ -118,6 +120,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # close.
         self._saved_box = None
         self._closing = False
+        # When the recording in progress was started, for the strip's clock.
+        self._rec_t0 = None
 
         # Every thread that can command motion, and the latch that
         # overrides all of them. Built before _build_ui: the toolbar's
@@ -132,6 +136,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # starting.
         self.motion.changed.connect(
             lambda: QtCore.QTimer.singleShot(0, self._sync_connection_actions))
+        self.motion.home_requested.connect(
+            lambda: QtCore.QTimer.singleShot(0, self.tab_stages.home_lost_axes))
         self._state_before_estop = None
 
         self.setWindowTitle("OCTO-BEE Hall probe")
@@ -268,6 +274,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # its "Calibrate encoders" button is dead without them, and deciding
         # that once at build time left it dead for the whole session.
         self.tab_stages.stages_changed.connect(self.tab_machine.refresh_encoders)
+        self.tab_machine.map_finished.connect(self._map_finished)
         left.addTab(self.tab_machine, "Machine")
         self.tab_export = ExportTab(
             self.session,
@@ -276,13 +283,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tab_export.snapshot_requested.connect(self.on_snapshot)
         self.tab_health.exported.connect(self.tab_export.note)
         left.addTab(self.tab_export, "Data output")
+        left.addTab(self.log_pane, "Log")
+        self.log_pane.attention.connect(self._log_attention)
+        # Profile and Help are not places work is done, so they are not in
+        # the row of places work is done: each opens in a window of its own,
+        # from the toolbar, and can sit beside the tab it is being read for.
         self.tab_profile = ProfileTab(
             self.session,
             gl_info=self.probe_pane.gl_info)
-        left.addTab(self.tab_profile, "Profile")
-        left.addTab(self.log_pane, "Log")
         self.tab_help = HelpTab(self.session)
-        left.addTab(self.tab_help, "Help")
+        self._side_windows = {}
         left.setCurrentIndex(0)
         self.tabs = left
 
@@ -299,6 +309,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Collapsible: the jog pane is the one thing here somebody may never
         # use, on a bench with no stages on it.
         right.setSizes([760, 190])
+        self.side_panel = right
 
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         split.addWidget(left)
@@ -306,7 +317,24 @@ class MainWindow(QtWidgets.QMainWindow):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([1000, 720])
-        self.setCentralWidget(split)
+        self._main_split = split
+
+        # What the rig is doing, above the tabs and outside them, for the
+        # same reason the stop button is: see RunStrip.
+        self.strip = gstatus.RunStrip()
+        self.strip.sensors_clicked.connect(
+            lambda: self.tabs.setCurrentWidget(self.table))
+        self.strip.log_clicked.connect(
+            lambda: self.tabs.setCurrentWidget(self.log_pane))
+        self.strip.job_clicked.connect(self._show_job)
+        self.strip.reset_clicked.connect(self.motion.reset)
+        centre = QtWidgets.QWidget()
+        col = QtWidgets.QVBoxLayout(centre)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        col.addWidget(self.strip)
+        col.addWidget(split, 1)
+        self.setCentralWidget(centre)
 
         self.status = self.statusBar()
         self.lbl_state = QtWidgets.QLabel("disconnected")
@@ -314,6 +342,157 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_rec = QtWidgets.QLabel("")
         for w in (self.lbl_state, self.lbl_rate, self.lbl_rec):
             self.status.addPermanentWidget(w)
+        self._sync_connection_actions()
+        self._refresh_strip()
+
+    # ---- what the rig is doing -------------------------------------------
+    def _refresh_strip(self):
+        """Bring the strip under the toolbar in line with the session.
+
+        Asked once a second and after anything that changes an answer. It
+        reads; it decides nothing.
+        """
+        strip = self.strip
+        source = self.session.source
+        if source is None:
+            strip.set_connection(
+                "connecting…" if self._connecting else "disconnected",
+                preflight.WARN if self._connecting else gstatus.IDLE)
+        elif getattr(source, "failed", False):
+            strip.set_connection("stream failed", preflight.FAIL)
+        elif isinstance(source, LiveSource):
+            strip.set_connection(
+                f"live  {source.fs_hz / 1000:g} kSPS", preflight.OK)
+        else:
+            strip.set_connection("demo / replay — not the probe",
+                                 preflight.WARN)
+
+        state, text = preflight.sensor_summary(self.session)
+        strip.set_sensors(gstatus.IDLE if source is None else state, text)
+
+        if source is None:
+            strip.set_stream(gstatus.IDLE, "stream —")
+        else:
+            gaps, lost, dropped = preflight.stream_losses(source)
+            if gaps or lost or dropped:
+                strip.set_stream(
+                    preflight.WARN,
+                    f"lost {lost} samples in {gaps} gaps"
+                    + (f", {dropped} blocks dropped" if dropped else ""))
+            else:
+                strip.set_stream(preflight.OK, "0 samples lost")
+
+        recording = (self.session.csv_rec is not None
+                     or self.session.raw_rec is not None)
+        if recording and self._rec_t0 is None:
+            self._rec_t0 = time.monotonic()
+        elif not recording:
+            self._rec_t0 = None
+        if recording:
+            size = sum(r.size_bytes for r in (self.session.csv_rec,
+                                              self.session.raw_rec)
+                       if r is not None)
+            strip.set_recording(
+                f"{gstatus.format_clock(time.monotonic() - self._rec_t0)}"
+                f"   {size / 1e6:.1f} MB")
+        else:
+            strip.set_recording("")
+
+        job = self.tab_machine.run_status() or self.tab_stages.run_status()
+        if job is not None:
+            strip.set_job(job[0], job[1])
+        elif self.motion.latched:
+            strip.set_job("STOPPED — reset needed", None, preflight.FAIL)
+        elif self.motion.busy():
+            strip.set_job("stages moving", None)
+        elif self.session.collecting is not None:
+            strip.set_job(f"collecting ({self.session.collecting})", None)
+        else:
+            strip.set_job("")
+
+        strip.set_notice(
+            f"EMERGENCY STOP — {self.motion.reason}.  To get control back: "
+            f"press Reset, confirm, then home the axes — an immediate stop "
+            f"can lose steps, so Go and the maps stay refused until each "
+            f"axis is homed. Jogging works as soon as it is reset."
+            if self.motion.latched else "", reset=self.motion.latched)
+
+    def _show_job(self):
+        """Clicking the job chip goes to where that job is run from."""
+        if self.tab_machine.run_status() is not None:
+            self.tabs.setCurrentWidget(self.tab_machine)
+        elif self.tab_stages.run_status() is not None or self.motion.busy():
+            self.tabs.setCurrentWidget(self.tab_stages)
+
+    def _map_finished(self, path, error):
+        """A volume map has ended; say so where it will be seen.
+
+        The Machine tab logs it and, on failure, raises a box over itself.
+        Neither reaches someone who walks back in and looks at whichever tab
+        was left up, so a failure also goes on the banner -- which stays.
+        """
+        if error:
+            self._alarm(f"volume map ended early — {error}"
+                        + (f". What was measured is saved to "
+                           f"{os.path.basename(path)}." if path else ""))
+        elif path:
+            self.status.showMessage(
+                f"volume map finished — {os.path.basename(path)}", 0)
+        self._refresh_strip()
+
+    def _log_attention(self, warnings, alarms):
+        """Put what the Log is holding unread on its tab.
+
+        A warning used to go to the Log and nowhere else, and the Log is a
+        tab: it was read after the run, if at all.
+        """
+        i = self.tabs.indexOf(self.log_pane)
+        n = warnings + alarms
+        self.tabs.setTabText(i, f"Log ({n})" if n else "Log")
+        colour = (gstatus.COLOURS[preflight.FAIL] if alarms
+                  else gstatus.COLOURS[preflight.WARN] if warnings else None)
+        self.tabs.tabBar().setTabTextColor(
+            i, QtGui.QColor(colour) if colour else QtGui.QColor())
+        self.tabs.setTabToolTip(
+            i, f"{warnings} warning(s) and {alarms} alarm(s) since the Log "
+               f"was last opened" if n else "")
+
+    def _toggle_side_panel(self, on):
+        """Show or hide the right-hand column: the probe head and the jog pane.
+
+        It takes a third of the window on every tab, which is right for
+        watching the field while doing something else and wrong when the
+        Machine view or the plot wants the width. The jog pane goes into the
+        Stages tab while the column is hidden, so the axes can still be
+        moved from there.
+        """
+        on = bool(on)
+        pane = self.tab_stages.host_jog(not on)
+        if on:
+            self.side_panel.addWidget(pane)
+            pane.show()
+            self.side_panel.setStretchFactor(0, 1)
+            self.side_panel.setStretchFactor(1, 0)
+            self.side_panel.setSizes([760, 190])
+        self.side_panel.setVisible(on)
+
+    def _open_side_window(self, widget, title, size):
+        """Show Profile or Help in a window of its own, made on first use."""
+        win = self._side_windows.get(title)
+        if win is None:
+            win = QtWidgets.QDialog(self)
+            win.setWindowTitle(f"OCTO-BEE — {title}")
+            win.setWindowFlag(
+                QtCore.Qt.WindowType.WindowMaximizeButtonHint, True)
+            lay = QtWidgets.QVBoxLayout(win)
+            lay.setContentsMargins(4, 4, 4, 4)
+            lay.addWidget(widget)
+            widget.show()
+            win.resize(*size)
+            self._side_windows[title] = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
 
     def _build_toolbar(self):
         tb = QtWidgets.QToolBar("main")
@@ -420,6 +599,36 @@ class MainWindow(QtWidgets.QMainWindow):
                                      "full-rate capture to .npz.")
         self.act_snapshot.triggered.connect(self.on_snapshot)
         tb.addAction(self.act_snapshot)
+        tb.addSeparator()
+
+        self.act_side = QtGui.QAction("Side panel", self)
+        self.act_side.setCheckable(True)
+        self.act_side.setChecked(True)
+        self.act_side.setShortcut(QtGui.QKeySequence("F9"))
+        self.act_side.setToolTip(
+            "Show or hide the right-hand column — the probe head, the peak "
+            "bars and the jog controls (F9). Hide it to give the plot or the "
+            "Machine view the whole width; the jog controls move into the "
+            "Stages tab meanwhile.")
+        self.act_side.toggled.connect(self._toggle_side_panel)
+        tb.addAction(self.act_side)
+        self.act_profile = QtGui.QAction("Profile", self)
+        self.act_profile.setToolTip(
+            "Where the time goes: acquisition, drawing, event-loop lag. "
+            "Opens in its own window.")
+        self.act_profile.triggered.connect(
+            lambda: self._open_side_window(self.tab_profile, "Profile",
+                                           (900, 700)))
+        tb.addAction(self.act_profile)
+        self.act_help = QtGui.QAction("Help", self)
+        self.act_help.setShortcut(QtGui.QKeySequence("F1"))
+        self.act_help.setToolTip(
+            "Search the documentation (F1). Opens in its own window, so it "
+            "can be read beside the tab it is about.")
+        self.act_help.triggered.connect(
+            lambda: self._open_side_window(self.tab_help, "Help",
+                                           (1200, 800)))
+        tb.addAction(self.act_help)
 
         self._build_estop(tb)
 
@@ -482,9 +691,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_estop_reset.setToolTip(
             "Clear the latch and allow motion again. Deliberately a separate "
             "button: releasing a machine is an act, not the absence of one.")
-        self.btn_estop_reset.setVisible(False)
+        self.btn_estop_reset.setStyleSheet(
+            "QPushButton { background:#e8c547; color:#12141a; "
+            "font-weight:bold; font-size:13px; padding:6px 14px; "
+            "border:2px solid #9a7d12; border-radius:4px; }"
+            "QPushButton:hover { background:#f5d968; }")
         self.btn_estop_reset.clicked.connect(self.motion.reset)
-        tb.addWidget(self.btn_estop_reset)
+        # Shown and hidden through the ACTION the toolbar wraps the button
+        # in, never through the button. A widget in a QToolBar belongs to the
+        # toolbar's layout, and that layout only makes room for it while its
+        # action is visible: setVisible() on the button itself was accepted
+        # and did nothing, so after an emergency stop there was no Reset on
+        # screen at all and the only way back to a machine that would move
+        # was to restart the program. The test asked the button whether it
+        # was hidden, which it was not; it was simply nowhere.
+        self.act_estop_reset = tb.addWidget(self.btn_estop_reset)
+        self.act_estop_reset.setVisible(False)
 
         self.sc_estop = QtGui.QShortcut(
             QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), self)
@@ -501,7 +723,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_estop_ui(self):
         """Make the latched state impossible to miss or to mistake."""
         latched = self.motion.latched
-        self.btn_estop_reset.setVisible(latched)
+        self.act_estop_reset.setVisible(latched)
         self.btn_estop.setText("■  STOPPED" if latched
                                else "■  EMERGENCY STOP")
         if latched:
@@ -518,6 +740,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_state.setText(self._state_before_estop or "disconnected")
             self._state_before_estop = None
         self.tab_stages.sync_controls()
+        self._refresh_strip()
 
     # ---- field map -------------------------------------------------------
     # ---- the machine around the probe ------------------------------------
@@ -596,6 +819,13 @@ class MainWindow(QtWidgets.QMainWindow):
             and not isinstance(source, LiveSource))
         self.act_disconnect.setEnabled(
             idle and source is not None and not snapshotting)
+        # One of the two is on the toolbar at a time: whichever can mean
+        # something. Both used to be there always, one of them greyed out,
+        # and telling which state the window was in meant reading which.
+        self.act_connect.setVisible(source is None)
+        self.act_disconnect.setVisible(source is not None)
+        self.act_connect.setText(
+            "Connecting…" if self._connecting else "Connect")
 
     def on_connect(self):
         if self.session.source is not None:
@@ -627,6 +857,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_worker.progress.connect(self.on_connect_progress)
         self._connecting = True
         self._connect_worker.start()
+        self._sync_connection_actions()
+        self._refresh_strip()
         # The rig is one instrument: the probe reads the field, the stages say
         # where it was read. Connecting one and not the other is a state the
         # operator has to remember to fix, and forgetting it does not announce
@@ -645,6 +877,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_connected(self, source, prev, error):
         self._connecting = False
         self.act_connect.setEnabled(True)
+        self._sync_connection_actions()
+        self._refresh_strip()
         was_automatic = self._connect_was_automatic
         self._connect_was_automatic = False
         if error:
@@ -707,6 +941,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tab_machine.refresh_encoders()
         self.session.log(f"{kind} source running at {source.fs_hz/1000:g} kSPS, "
                      f"decimating to {self.session.out_rate:g} Hz for display and CSV")
+        self.tab_live.set_health(None)
+        self._sync_connection_actions()
+        self._refresh_strip()
 
     def on_disconnect(self, _checked=False):
         # Against a running job this would close the stages under a move, or
@@ -750,6 +987,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_disconnect.setEnabled(False)
         self.act_connect.setEnabled(True)
         self.lbl_state.setText("disconnected")
+        self.tab_live.set_health(None)
+        self._sync_connection_actions()
+        self._refresh_strip()
 
     def _reset_buffers(self):
         self.session.roll = Rolling(max(4, int(self.session.out_rate * self.window_s)))
@@ -869,6 +1109,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self.session.log(f"ALARM: {msg}")
         self.status.showMessage(f"ALARM: {msg}", 0)
+        # And on the banner under the toolbar, which is where it is seen: the
+        # status bar is one line of small text at the far edge of the window.
+        self.strip.show_alarm(f"ALARM: {msg}")
 
     def _after_recorders_gone(self):
         """Bring the Record button and labels in line with the recorders.
@@ -1168,6 +1411,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Before the early return: this is what brings Connect back when a
         # volume map ends, which changes no state the motion registry sees.
         self._sync_connection_actions()
+        self._refresh_strip()
         if self.session.source is None:
             return
         recent = self.session.roll.view()
@@ -1191,6 +1435,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.session.last_health = rows
                 if self.tab_health.auto_exclude_dead():
                     self._update_auto_dead(rows)
+                # The verdict goes onto the Live tab's sensor buttons, so a
+                # sensor that has died is red on the tab that is being
+                # watched and not only in a table two tabs away.
+                self.tab_live.set_health(ocal.health_verdict(rows))
+                self._refresh_strip()
         if self.session.last_health:
             table = orec.sensor_table(self.session.cal, recent.astype(np.float64),
                                       self.session.last_health,
@@ -1199,6 +1448,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._last_table = table
 
         self.tab_live.set_dead(self.session.cal.dead)
+        self.tab_live.mark_dead(self.session.cal.dead)
         self.probe_pane.set_dead(self.session.cal.dead)
 
         # A dropped block is a hole in whatever is being recorded, so say so
@@ -1288,6 +1538,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # alarm that the last one may have left on the status bar.
             self._quiet_s = 0.0
             self.status.clearMessage()
+            self.strip.clear_alarm()
             if self.tab_export.csv_enabled():
                 p = orec.default_name("octobee", "csv", self.session.out_dir)
                 self.session.enc_datum = self._encoder_datum()
@@ -1330,8 +1581,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tab_export.set_recording_text("")
                 self._refresh_record_dot()
             self._report_saved(saved)
+            self._refresh_strip()
             return
         self._refresh_record_dot()
+        self._refresh_strip()
 
     def _close_recorder(self, attr, kind):
         """Close one recorder and say where it went; (kind, path, MB) or None.
@@ -1413,6 +1666,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_record.setIcon(self._dot_icon("#e5383b") if live
                                 else QtGui.QIcon())
         self.act_record.setText("Recording" if live else "Record")
+        # The whole button, not only the dot: twelve red pixels beside a word
+        # were being missed, in both directions.
+        btn = self._record_button()
+        if btn is not None:
+            btn.setStyleSheet(
+                "QToolButton { background:#8a1c22; color:#fff; "
+                "font-weight:bold; border:1px solid #e5383b; "
+                "border-radius:3px; padding:3px 8px; }" if live else "")
+
+    def _record_button(self):
+        """The toolbar's button for Record, or None before the toolbar exists."""
+        for tb in self.findChildren(QtWidgets.QToolBar):
+            btn = tb.widgetForAction(self.act_record)
+            if btn is not None:
+                return btn
+        return None
 
     @staticmethod
     def _dot_icon(colour, size=12):
@@ -1538,6 +1807,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_state.setText("disconnected -- press Connect to resume")
         self.act_disconnect.setEnabled(False)
         self.act_connect.setEnabled(True)
+        self._sync_connection_actions()
+        self._refresh_strip()
 
     # ---- misc UI ----------------------------------------------------------
     def on_view_rate(self):

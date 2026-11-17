@@ -114,7 +114,7 @@ stop it automatically. To go back to Phoebus, just press its start button again.
 ## The rest of the documentation
 
 Each of these was a chapter of this file. They are indexed by the
-application's Help tab, so anything written here is searchable from
+application's Help window (F1), so anything written here is searchable from
 inside the window.
 
 - **[The hardware, and what it is telling us](docs/hardware.md)** — the carriers, the gain chain, the noise you should expect

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-octobee/help.py -- the searchable index behind the GUI's Help tab.
+octobee/help.py -- the searchable index behind the GUI's Help window.
 
 Where the text comes from
 -------------------------
@@ -204,8 +204,9 @@ so does the head being rigid between poses: same cradle, same cable dress.
 Almost always one of these:
 
 * **The emergency stop is latched.** The button in the top right reads
-  **STOPPED** and a **Reset** button has appeared beside it. Nothing moves
-  until that is reset, on purpose. The Log says what tripped it.
+  **STOPPED**, a **Reset** button has appeared beside it, and a red banner
+  under the toolbar says so with a Reset of its own. Nothing moves until that
+  is reset, on purpose. The banner and the Log say what tripped it.
 * **The stages are not connected.** Press Connect — it opens the carriers and
   the stages together — or connect them from the Stages tab. Without an axis
   map in `stages.json` there is nothing to connect to; assign x/y/z once on the
@@ -250,9 +251,16 @@ Pressing it does three things:
    until you home it again. **Reset clears the latch; it does not tell the
    machine where the head is.**
 
-**Stop moving**, on the Stages tab, is the graded version: profiled, does not
-latch, nothing needs re-homing. Use that for "that is far enough" and the red
-one for "something is wrong".
+**To get control back:** press **Reset** (beside the red button, or in the
+red banner), then home. The reset question offers **Reset and home those
+axes** — choose it if the head and its cabling are clear of the whole travel.
+Otherwise choose **Reset and allow motion**, jog the head clear (jogging is
+relative and works at once), and press **Home all**. Go and the maps come back
+when each axis has been homed.
+
+**Stop moving**, in the side panel and on the Stages tab, is the graded
+version: profiled, does not latch, nothing needs re-homing. Use that for "that
+is far enough" and the red one for "something is wrong".
 
 ### What it is not
 
@@ -291,7 +299,7 @@ speed costs about 22 s on a full 300 mm traverse. Raising the *acceleration*
 while leaving the speed cap alone usually gets the time back without the peak
 speed going up.
 
-**Slow to draw** is the Profile tab's business. The 3D probe head is the most
+**Slow to draw** is the Profile window's business (toolbar). The 3D probe head is the most
 expensive thing in the window; untick **3D** on the Live tab and nothing else
 changes — acquisition, calibration and recording are unaffected.
 """.strip()),
@@ -323,7 +331,7 @@ def doc_files(root=None):
 
 
 def load_topics(readme_path=None, root=None):
-    """Every topic the Help tab offers: the window's own, then the documents'.
+    """Every topic the Help window offers: the window's own, then the documents'.
 
     Indexing the whole docs/ tree rather than one file is what makes a result
     worth reading: a topic now says it came from stages.md or calibration.md,
