@@ -39,10 +39,21 @@ match those dimensions makes the fit WORSE (0.88), which is the evidence for it.
 
 So: the separation and the geometry are right to within about 6 %. Do not take
 a clearance off this figure.
+
+The faces are read from the map you give it -- the same box and face logic as
+plot_faces.py, so any volume works -- and coloured with |B| averaged over the
+working sensors (--exclude S9,S10,S11; the sidecar's excluded sensors and any
+reading beyond their range are dropped unless --keep-all). The figure says how
+many sensors were averaged. The fit constants above were solved against ONE map
+(24 September); drawing a different map with them places the same coil, not a
+re-fitted one.
+
+The distance printed is from the winding's CENTRELINE to the box surface. The
+model has no winding radius and the real coil is a twisted saddle, so a
+clearance between copper and box is not something this can give.
 """
 
 import argparse
-import glob
 import os
 import sys
 
@@ -50,12 +61,19 @@ import numpy as np
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt                      # noqa: E402
-from matplotlib.colors import Normalize              # noqa: E402
-from matplotlib.transforms import Affine2D           # noqa: E402
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.transforms import Affine2D
 
-from octobee import machine as omach                 # noqa: E402
-from octobee import paths                            # noqa: E402
+from octobee import machine as omach
+from octobee import paths
+
+# Reading the faces out of the map, and choosing which sensors to average, is
+# the same job plot_faces.py does, so it is done once, there. It sits next to
+# this file; put this directory first so the import works however the script
+# was started.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import plot_faces as pf
 
 AXES = ("x", "y", "z")
 
@@ -106,26 +124,18 @@ def view_vec(azim, elev):
     return np.array([np.cos(a) * np.cos(e), np.sin(a) * np.cos(e), np.sin(e)])
 
 
-def load_faces(map_path, step_mm=10.0):
-    d = os.path.join(os.path.dirname(map_path), "faces")
-    out = {}
-    for f in sorted(glob.glob(os.path.join(d, "face_*.csv"))):
-        fid = os.path.basename(f)[5:-4]
-        hdr = open(f, encoding="utf-8").readline().strip().split(",")
-        arr = np.genfromtxt(f, delimiter=",", skip_header=1)
-        au, av = hdr[0][0], hdr[1][0]
-        af = [a for a in AXES if a not in (au, av)][0]
-        ue, ve = np.unique(arr[:, 0]), np.unique(arr[:, 1])
-        g = np.full((len(ve), len(ue)), np.nan)
-        for r in arr:
-            g[int(round((r[1] - ve[0]) / step_mm)),
-              int(round((r[0] - ue[0]) / step_mm))] = r[2]
-        out[fid] = dict(u=au, v=av, fixed=af, at=float(fid[1:]),
-                        ue=ue, ve=ve, grid=g)
-    return out
+def load_faces(map_path, step_mm=10.0, exclude=(), keep_all=False):
+    """The six faces of the map you were given, ready to draw.
+
+    Returns ({face id: face dict with u, v, axis, at, ue, ve, grid}, lo, hi,
+    SensorChoice), derived from `map_path` and its sidecar by plot_faces. It
+    used to read a hand-made CSV export of one old map from beside the file,
+    and so drew that map's field under whatever name was passed.
+    """
+    return pf.load_faces(map_path, step_mm, None, exclude, keep_all)
 
 
-def draw(faces, lo, hi, coil, path, title, sub, gap_mm):
+def draw(faces, lo, hi, coil, path, title, sub):
     allv = np.concatenate([f["grid"].ravel() for f in faces.values()])
     allv = allv[np.isfinite(allv)]
     norm = Normalize(vmin=allv.min(), vmax=allv.max())
@@ -165,39 +175,53 @@ def draw(faces, lo, hi, coil, path, title, sub, gap_mm):
         for k in range(len(C) - 1):
             prims.append((cd[k], "coil", (c2[k:k + 2, 0], c2[k:k + 2, 1])))
 
-        for fid, f in faces.items():
+        for f in faces.values():
             iu, iv = AXES.index(f["u"]), AXES.index(f["v"])
             ifx = 3 - iu - iv
             nrm = np.zeros(3)
-            nrm[ifx] = 1.0 if abs(f["at"] - hi[ifx]) < 1e-6 else -1.0
+            nrm[ifx] = 1.0 if f["end"] == 1 else -1.0
             if nrm @ v <= 1e-6:
                 continue
-            O = np.zeros(3); O[ifx] = f["at"]; O[iu] = lo[iu]; O[iv] = lo[iv]
-            Pu = O.copy(); Pu[iu] = hi[iu]
-            Pv = O.copy(); Pv[iv] = hi[iv]
-            quad = np.vstack([O, Pu, O + (Pu - O) + (Pv - O), Pv])
+            corner = np.zeros(3)
+            corner[ifx], corner[iu], corner[iv] = f["at"], lo[iu], lo[iv]
+            Pu = corner.copy()
+            Pu[iu] = hi[iu]
+            Pv = corner.copy()
+            Pv[iv] = hi[iv]
+            quad = np.vstack([corner, Pu, Pu + (Pv - corner), Pv])
             q2 = axono(quad, az, el)
             prims.append((quad.mean(axis=0) @ v, "face",
                           (f["grid"], q2[0], q2[1] - q2[0], q2[3] - q2[0])))
 
+        # Far to near. matplotlib draws by zorder, not by the order artists
+        # were added, so the depth order has to BE the zorder: each primitive
+        # takes its rank in the sort (its outline or inner stroke half a step
+        # above it). Fixed zorders per kind -- coil 1, faces 2 -- made the coil
+        # draw behind the box in every view, even those where it is in front.
+        # The depth of a primitive is its centre's, so this is a painter's
+        # approximation: right for a coil that lies wholly on one side of the
+        # box, as this one does, and not exact for a segment that passes
+        # across a face's plane.
         prims.sort(key=lambda t: t[0])
         pts = []
-        for _, kind, pay in prims:
+        for rank, (_, kind, pay) in enumerate(prims):
+            z = 10.0 + rank
             if kind == "coil":
                 ax.plot(pay[0], pay[1], color="#1a1a1a", lw=7.5,
-                        solid_capstyle="round", zorder=1)
+                        solid_capstyle="round", zorder=z)
                 ax.plot(pay[0], pay[1], color="#4a4a4a", lw=4.0,
-                        solid_capstyle="round", zorder=1)
+                        solid_capstyle="round", zorder=z + 0.5)
                 pts.append(np.column_stack(pay))
             else:
                 grid, o2, e1, e2 = pay
                 im = ax.imshow(grid, origin="lower", cmap=cmap, norm=norm,
                                extent=[0, 1, 0, 1], interpolation="nearest",
-                               zorder=2)
+                               zorder=z)
                 im.set_transform(Affine2D.from_values(
                     e1[0], e1[1], e2[0], e2[1], o2[0], o2[1]) + ax.transData)
                 q = np.vstack([o2, o2 + e1, o2 + e1 + e2, o2 + e2])
-                ax.plot(*np.vstack([q, q[:1]]).T, color="#111", lw=1.1, zorder=3)
+                ax.plot(*np.vstack([q, q[:1]]).T, color="#111", lw=1.1,
+                        zorder=z + 0.5)
                 pts.append(q)
 
         P2 = np.vstack(pts)
@@ -215,7 +239,8 @@ def draw(faces, lo, hi, coil, path, title, sub, gap_mm):
         org = np.array([0.90, 0.13])
         base = axono(np.zeros((1, 3)), az, el)[0]
         for k, nm in enumerate("xyz"):
-            d = np.zeros(3); d[k] = 1.0
+            d = np.zeros(3)
+            d[k] = 1.0
             vec = axono(d[None, :], az, el)[0] - base
             n2 = np.linalg.norm(vec)
             if n2 < 1e-3:
@@ -229,8 +254,8 @@ def draw(faces, lo, hi, coil, path, title, sub, gap_mm):
             vec = vec / n2 * 0.068
             ax.annotate("", xy=org + vec, xytext=org, xycoords="axes fraction",
                         textcoords="axes fraction", zorder=6,
-                        arrowprops=dict(arrowstyle="-|>", color="#c0392b", lw=1.3,
-                                        shrinkA=0, shrinkB=0))
+                        arrowprops={"arrowstyle": "-|>", "color": "#c0392b",
+                                    "lw": 1.3, "shrinkA": 0, "shrinkB": 0})
             ax.annotate(nm, xy=org + vec * 1.4, xycoords="axes fraction",
                         fontsize=10, color="#c0392b", ha="center", va="center",
                         zorder=6)
@@ -275,18 +300,18 @@ def main(argv=None):
     p.add_argument("--label", default="C1")
     p.add_argument("--step", type=float, default=10.0)
     p.add_argument("--out", default=None)
+    pf.add_sensor_args(p)
     a = p.parse_args(argv)
+    exclude = pf.exclude_from_args(p, a)
 
-    faces = load_faces(a.map, a.step)
+    try:
+        faces, lo, hi, choice = load_faces(a.map, a.step, exclude, a.keep_all)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if len(faces) != 6:
         print(f"expected six faces, found {len(faces)}", file=sys.stderr)
         return 2
-    lo = np.array([min(f["ue"].min() if f["u"] == ax else
-                       f["ve"].min() if f["v"] == ax else f["at"]
-                       for f in faces.values()) for ax in AXES])
-    hi = np.array([max(f["ue"].max() if f["u"] == ax else
-                       f["ve"].max() if f["v"] == ax else f["at"]
-                       for f in faces.values()) for ax in AXES])
 
     coil_file = a.coil or omach.MachineConfig.load_or_default(
         paths.config(omach.CONFIG_NAME), on_error=print).coil_file
@@ -302,7 +327,9 @@ def main(argv=None):
         return 2
     coil = coil_in_rig(np.asarray(hits[0].points_mm, float))
 
-    # closest approach from the winding to the box SURFACE, not its centre
+    # closest approach from the winding's centreline vertices to the box
+    # SURFACE, not its centre. Vertices, not the segments between them, and
+    # no winding radius: a centreline distance, labelled as one below.
     d = np.maximum(np.maximum(lo - coil, coil - hi), 0.0)
     gap = float(np.linalg.norm(d, axis=1).min())
 
@@ -311,15 +338,18 @@ def main(argv=None):
                                 stem + "_in_machine.png")
     sub = (f"{hi[0]-lo[0]:.0f} x {hi[1]-lo[1]:.0f} x {hi[2]-lo[2]:.0f} mm "
            f"measured volume and coil {a.label}, both in rig millimetres - "
-           f"nearest winding {gap:.0f} mm from the box surface - {stem}")
+           f"winding centreline {gap:.0f} mm from the box surface - "
+           f"{choice.text} - {stem}")
     path = draw(faces, lo, hi, coil, out,
-                "What we measured, and where the coil is", sub, gap)
+                "What we measured, and where the coil is", sub)
     print(f"wrote {path}  ({os.path.getsize(path)/1e6:.1f} MB)")
     print(f"mount post at rig ({POST_MM[0]:.0f}, {POST_MM[1]:.0f}, {POST_MM[2]:.0f}) mm")
     print(f"coil spans rig x {coil[:,0].min():.0f}..{coil[:,0].max():.0f}  "
           f"y {coil[:,1].min():.0f}..{coil[:,1].max():.0f}  "
           f"z {coil[:,2].min():.0f}..{coil[:,2].max():.0f}")
-    print(f"nearest winding to the measured surface: {gap:.0f} mm")
+    print(f"nearest winding CENTRELINE to the measured surface: {gap:.0f} mm "
+          f"(no winding radius subtracted)")
+    print(f"colour: {choice.text}")
     return 0
 
 
