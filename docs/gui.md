@@ -237,11 +237,18 @@ no calibration changes.
 ### Diagnostics stay on screen
 
 The per-sensor table and the Diagnostics tab report all 64 raw channels, and
-sensors whose channels are railed or stuck are excluded from every statistic,
-scale and export automatically. A chip whose **VCM reference** is broken counts
-as dead even when its other channels look plausible, because every axis it
-reports is quoted relative to that reference — which is exactly how S16
-presents on this probe.
+sensors whose channels are railed, stuck or resting outside the 0.06–4.60 V a
+working chip can output are excluded from every statistic, scale and export
+automatically — a sensor with even one such channel, since a chip missing an
+axis cannot give |B|. A chip whose **VCM reference** is broken counts as dead
+even when its other channels look plausible, because every axis it reports is
+quoted relative to that reference — which is how S16 presented on this probe
+before its ribbon was repaired, and how S9 did in October 2026.
+
+Exclusion needs the same verdict on two health scans running (about four
+seconds), so a healthy sensor railing for a moment under a strong magnet is
+not dropped. Entries put in `dead` by hand, in `calibration.json`, are kept
+whatever the scan says.
 
 Read the VCM rows first when hunting noise. VCM carries no field, so noise on it
 is analogue pickup in the cabling and grounding rather than a sensor problem.

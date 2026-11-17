@@ -241,6 +241,28 @@ inside it. The lines that survived are drawn in green and the ones that did not
 in dim red, because the carved shape only reads as a shape next to what it was
 carved out of.
 
+**The moves between lines are held to the same grid.** A sweep spends half its
+time not sweeping — going from the end of one line to the start of the next —
+and those moves used to be straight, checked against nothing: where a line had
+been cut in two by a winding, the head went from one piece to the other through
+it. Now a move between lines is direct only when the whole box it spans is
+clear. Otherwise the way round is found on the grid and taken one axis at a
+time, a line with no clear way to it is dropped (and counted in the plan's
+note), and a line cut short by a winding takes no run-in or run-out toward it.
+**Fly it** flies these moves too. The one move that cannot be planned is the
+first, from wherever the head was left: it is checked when Start is pressed if
+the head is inside the box, and the Start dialog says so when it is not.
+
+**A plan is for one pose.** Changing the pose, the winding radius, the stage
+zero, the coil file or the probe geometry discards the plan; press **Plan**
+again. A box that reaches past the stages' travel is refused at Plan.
+
+**Stop moving** and the emergency stop both end a running volume map, and an
+abort is honoured during the positioning moves as well as during a line. A
+line that times out, never starts or stops short of its end ends the map with
+an error rather than being counted as swept; what was logged up to then is
+saved.
+
 **The whole probe is tested, not the head.** The square tube runs the length of
 the probe back to its zero point, and it is what meets a coil first — a plan
 that only checked the sensors would drive the tube into a winding while

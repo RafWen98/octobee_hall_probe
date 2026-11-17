@@ -64,6 +64,11 @@ class MagnetPassPlot(QtWidgets.QWidget):
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("left", "|B|", units="mT")
         self.plot.setLabel("bottom", "position", units="mm")
+        # The unit already carries its prefix. Left on, pyqtgraph adds one of
+        # its own on top and rescales the ticks to match, so a 0.6 mT peak was
+        # labelled "600" on an axis reading "mmT".
+        for side in ("left", "bottom"):
+            self.plot.getAxis(side).enableAutoSIPrefix(False)
         # Named at creation but NOT added to the legend: sixteen entries is a
         # block of text across the top quarter of the plot, over the traces it
         # is labelling, and twelve of the sixteen are the faint ones nobody is

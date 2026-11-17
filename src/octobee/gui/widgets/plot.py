@@ -57,6 +57,11 @@ class LivePlot(QtWidgets.QWidget):
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("bottom", "time", units="s")
         self.plot.setLabel("left", "B", units="mT")
+        # The unit already carries its prefix. Left on, pyqtgraph adds one of
+        # its own on top and rescales the ticks to match, so a 0.6 mT peak was
+        # labelled "600" on an axis reading "mmT".
+        # Time stays automatic: seconds carry no prefix of their own.
+        self.plot.getAxis("left").enableAutoSIPrefix(False)
         self.plot.setDownsampling(auto=True, mode="peak")
         self.plot.setClipToView(True)
         self.legend = self.plot.addLegend(colCount=4, labelTextSize="7pt")

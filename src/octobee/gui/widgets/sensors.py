@@ -27,6 +27,10 @@ class SensorBars(QtWidgets.QWidget):
         self.plot = ProfiledPlot("Qt paint (peak bars)", profiler)
         self.plot.showGrid(y=True, alpha=0.25)
         self.plot.setLabel("left", "peak |B|", units="mT")
+        # The unit already carries its prefix. Left on, pyqtgraph adds one of
+        # its own on top and rescales the ticks to match, so a 0.6 mT peak was
+        # labelled "600" on an axis reading "mmT".
+        self.plot.getAxis("left").enableAutoSIPrefix(False)
         self.window_s = 0.5
         self.plot.setTitle(f"peak |B| per sensor, last {self.window_s:g} s",
                            size="9pt")

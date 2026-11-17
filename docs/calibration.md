@@ -771,8 +771,9 @@ narrowest corner the part offers.
 There used to be a code reason to stay bipolar as well, and there is not any
 more. A unipolar 0–5 V range puts 0 V at −32768, so true volts are
 `counts*vpc + 2.5`; `Layout.volts_per_count` carried no such offset term, so
-every raw channel would have read 2.5 V low and `PLAUSIBLE_V = (-0.5, 5.5)` in
-`channel_health()` would have called all 64 healthy channels broken. Field
+every raw channel would have read 2.5 V low and the plausible-voltage window
+in `channel_health()` (then -0.5..5.5 V, now the datasheet's 0.06..4.60 V)
+would have called all 64 healthy channels broken. Field
 readings would have survived — subtracting VCM cancels the pedestal — which is
 what made it dangerous: the diagnostics would scream while the numbers looked
 fine.
