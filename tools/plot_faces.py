@@ -100,6 +100,8 @@ def line_faces(path, lo, hi):
 
     faces = {}
     for i, ln in enumerate(lines):
+        if ln.get("part") == "slice":
+            continue                 # an interior x-z slice, not a face
         for ax, at in (ln.get("fixed") or {}).items():
             if ax not in AXES:
                 continue

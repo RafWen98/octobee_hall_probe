@@ -589,3 +589,71 @@ def test_sweep_refuses_an_unhomed_rig():
     except ostage.MotionInterlocked as exc:
         why = str(exc)
     check("and so does a latched emergency stop", "stop" in why, why[:120])
+
+
+def test_plan_surface_with_xz_slices():
+    """The box's six faces, then smaller x-z rectangles inside it."""
+    print("\nsurface plus x-z slices")
+    v = osweep.Volume((0.0, 0.0, 0.0), (300.0, 300.0, 300.0), step_mm=10.0,
+                      sweep="x")
+    shell = osweep.plan(v, shell=True)
+    p = osweep.plan(v, shell=True, slices=3, slice_inset_mm=50.0)
+    faces = [ln for ln in p.lines if ln.part == "box"]
+    cuts = [ln for ln in p.lines if ln.part == "slice"]
+    check("the faces are exactly the plain shell's",
+          len(faces) == len(shell), f"{len(faces)} vs {len(shell)}")
+    check("three planes, spread symmetrically along y",
+          p.slices["at_mm"] == [80.0, 150.0, 220.0], str(p.slices["at_mm"]))
+    check("each rectangle is inset 50 mm on every side in x and z",
+          p.slices["rect_mm"] == {"x": [50.0, 250.0], "z": [50.0, 250.0]},
+          str(p.slices["rect_mm"]))
+    check("21 lines per plane, swept along x at each z of the rectangle",
+          len(cuts) == 3 * 21
+          and all(ln.sweep == "x" and ln.start_mm == 50.0
+                  and ln.stop_mm == 250.0 and 50.0 <= ln.fixed["z"] <= 250.0
+                  for ln in cuts), f"{len(cuts)} slice lines")
+    check("and every slice line holds y at one of the planes",
+          {ln.fixed["y"] for ln in cuts} == {80.0, 150.0, 220.0})
+    check("the sidecar says which lines are slices",
+          p.to_dict()["lines"][-1]["part"] == "slice"
+          and p.to_dict()["slices"]["plane"] == "x-z")
+
+    # A sweep axis that does not lie in the plane is replaced by one that does.
+    vy = osweep.Volume((0.0, 0.0, 0.0), (300.0, 300.0, 300.0), step_mm=10.0,
+                       sweep="y")
+    cuts_y = [ln for ln in osweep.plan(vy, shell=True, slices=3,
+                                       slice_inset_mm=50.0).lines
+              if ln.part == "slice"]
+    check("sweeping y, the x-z slices are swept along x instead",
+          cuts_y and all(ln.sweep == "x" for ln in cuts_y))
+
+    # A reachable mask cuts slice lines the same way it cuts faces, and only
+    # within the rectangle.
+    mask = np.ones(v.shape, bool)
+    mask[14:17, :, :] = False                  # a wall across x = 140..160
+    cut = osweep.plan(v, reachable=mask, shell=True, slices=3,
+                      slice_inset_mm=50.0)
+    pieces = [ln for ln in cut.lines if ln.part == "slice"]
+    check("a blocked band splits every slice line in two, inside the rectangle",
+          len(pieces) == 2 * 63
+          and all(ln.start_mm >= 50.0 and ln.stop_mm <= 250.0 for ln in pieces)
+          and all(ln.stop_mm <= 130.0 or ln.start_mm >= 170.0
+                  for ln in pieces), f"{len(pieces)} pieces")
+
+    # Too much inset, or a box too thin to have an inside: no slices, said so.
+    full = osweep.plan(v, shell=True, slices=3)
+    full_cuts = [ln for ln in full.lines if ln.part == "slice"]
+    check("with no inset each slice is a whole x-z plane across the box",
+          full.slices["rect_mm"] == {"x": [0.0, 300.0], "z": [0.0, 300.0]}
+          and all(ln.start_mm == 0.0 and ln.stop_mm == 300.0
+                  for ln in full_cuts)
+          and {ln.fixed["z"] for ln in full_cuts}
+          == set(np.arange(10.0, 300.0, 10.0)),
+          "the z = 0 and z = 300 rows are the faces' own lines")
+    none = osweep.plan(v, shell=True, slices=3, slice_inset_mm=150.0)
+    check("an inset that leaves no rectangle plans no slices and says so",
+          none.slices is None and len(none) == len(shell)
+          and "no x-z slices" in none.describe())
+    flat = osweep.Volume((0.0, 0.0, 0.0), (300.0, 10.0, 300.0), step_mm=10.0)
+    check("nor does a box with no inside along y",
+          osweep.plan(flat, shell=True, slices=3).slices is None)

@@ -79,6 +79,8 @@ def read_faces(map_path, step_mm):
         lines = json.load(fh)["lines"]
     keep = []
     for i, ln in enumerate(lines):
+        if ln.get("part") == "slice":
+            continue                 # interior: a check on the fill, not input
         for ax, at in (ln.get("fixed") or {}).items():
             k = AXES.index(ax)
             if min(abs(float(at) - lo[k]), abs(float(at) - hi[k])) < 1.0:

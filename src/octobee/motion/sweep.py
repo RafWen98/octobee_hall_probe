@@ -192,8 +192,13 @@ class SweepLine:
     """
 
     def __init__(self, sweep, start_mm, stop_mm, fixed, run_in_mm=0.0,
-                 run_out_mm=0.0):
+                 run_out_mm=0.0, part="box"):
         self.sweep = sweep
+        # "box" for the filled box or its six faces, "slice" for a plane
+        # inside it. Stored per line so a tool reading the map back never has
+        # to guess from the positions which lines are boundary and which are
+        # interior -- fill_volume.py must not take a slice for a face.
+        self.part = str(part)
         self.start_mm = float(start_mm)
         self.stop_mm = float(stop_mm)
         self.fixed = dict(fixed)
@@ -221,7 +226,8 @@ class SweepLine:
     def to_dict(self):
         return {"sweep": self.sweep, "start_mm": self.start_mm,
                 "stop_mm": self.stop_mm, "fixed": dict(self.fixed),
-                "run_in_mm": self.run_in_mm, "run_out_mm": self.run_out_mm}
+                "run_in_mm": self.run_in_mm, "run_out_mm": self.run_out_mm,
+                "part": self.part}
 
 
 class SweepPlan:
@@ -229,8 +235,9 @@ class SweepPlan:
 
     def __init__(self, volume, lines, speed_mm_s=DEFAULT_SPEED_MM_S,
                  log_hz=DEFAULT_LOG_HZ, settle_s=DEFAULT_SETTLE_S,
-                 skipped=0, note=""):
+                 skipped=0, note="", slices=None):
         self.volume = volume
+        self.slices = dict(slices) if slices else None
         self.lines = list(lines)
         self.speed_mm_s = float(speed_mm_s)
         self.log_hz = float(log_hz)
@@ -284,7 +291,7 @@ class SweepPlan:
         return {"volume": self.volume.to_dict(),
                 "speed_mm_s": self.speed_mm_s, "log_hz": self.log_hz,
                 "settle_s": self.settle_s, "skipped": self.skipped,
-                "note": self.note,
+                "note": self.note, "slices": self.slices,
                 "lines": [ln.to_dict() for ln in self.lines]}
 
 
@@ -300,34 +307,102 @@ def _runs(mask):
 
 
 def _face_rasters(volume, shell):
-    """(sweep axis, first stepping axis, second) for each raster to run.
+    """(sweep axis, first stepping axis, second, restrict, part) per raster.
 
     Filling a volume is one raster: sweep one axis, step the other two over
     every node. Mapping only its OUTSIDE is six, one per face, and each has to
     be swept in the plane of its own face -- the two faces perpendicular to
     the usual sweep axis cannot be swept along it at all. Each entry says which
-    axis runs and which two step; the caller restricts the stepping axes to
-    the face.
+    axis runs and which two step; `restrict` maps a stepping axis to the node
+    indices it is limited to, or the swept axis to the (first, last) node of
+    its span, and an axis it does not name uses every node.
     """
     sweep = volume.sweep
     a, b = volume.step_axes
     if not shell:
-        return [(sweep, a, b, None)]
+        return [(sweep, a, b, {}, "box")]
     # Four faces parallel to the sweep axis: pin one stepping axis to each end
     # and step the other across. Then two faces perpendicular to it, swept
     # along `a` with `b` stepping, pinned at each end of the sweep axis.
     out = []
     for pinned, across in ((a, b), (b, a)):
-        for end in (0, -1):
-            out.append((sweep, pinned, across, (pinned, end)))
-    for end in (0, -1):
-        out.append((a, sweep, b, (sweep, end)))
+        n = volume.shape[AXES.index(pinned)]
+        for end in (0, n - 1):
+            out.append((sweep, pinned, across, {pinned: [end]}, "box"))
+    n = volume.shape[AXES.index(sweep)]
+    for end in (0, n - 1):
+        out.append((a, sweep, b, {sweep: [end]}, "box"))
     return out
+
+
+def slice_planes(volume, count, inset_mm, normal="y"):
+    """Where `count` planes square to `normal` sit inside the box, and how big.
+
+    The planes are spread evenly through the box -- for three, a quarter, a
+    half and three quarters of the way along `normal` -- and each is a
+    rectangle smaller than the face it is parallel to by `inset_mm` on every
+    side. Everything is snapped to the volume's own grid: the reachable mask
+    is worked out on that grid and a line off it could not be cut by it. A
+    plane that snaps onto a face would only measure the face twice, so it is
+    dropped, as is a second plane snapping onto the same node.
+
+    Returns (node indices along `normal`, {in-plane axis: (first, last) node}),
+    or ([], {}) when the inset leaves no rectangle or the box is too thin to
+    have an inside.
+    """
+    count = int(count)
+    if count <= 0:
+        return [], {}
+    if normal not in AXES:
+        raise ValueError(f"slice normal must be one of {AXES}, got {normal!r}")
+    k = max(0, int(math.floor(float(inset_mm) / volume.step_mm + 0.5)))
+    rect = {}
+    for ax in AXES:
+        if ax == normal:
+            continue
+        n = volume.shape[AXES.index(ax)]
+        if n - 1 - 2 * k < 1:
+            return [], {}
+        rect[ax] = (k, n - 1 - k)
+    n = volume.shape[AXES.index(normal)]
+    # Halves round toward the middle, so the set stays symmetric about it:
+    # three planes in 0..300 on a 10 mm grid land at 80, 150, 220 rather
+    # than 80, 150, 230.
+    mid = (n - 1) / 2.0
+    at = sorted({int(math.floor(t + 0.5)) if t <= mid
+                 else int(math.ceil(t - 0.5))
+                 for t in (j * (n - 1) / (count + 1)
+                           for j in range(1, count + 1))})
+    at = [i for i in at if 0 < i < n - 1]
+    if not at:
+        return [], {}
+    return at, rect
+
+
+def _slice_rasters(volume, count, inset_mm, normal):
+    """The rasters for the planes slice_planes() places, one per plane.
+
+    Each plane is swept along the volume's own sweep axis where that lies in
+    the plane, and along the first in-plane axis otherwise; the other in-plane
+    axis steps.
+    """
+    at, rect = slice_planes(volume, count, inset_mm, normal)
+    if not at:
+        return []
+    in_plane = [a for a in AXES if a != normal]
+    sweep = volume.sweep if volume.sweep in in_plane else in_plane[0]
+    other = in_plane[1] if sweep == in_plane[0] else in_plane[0]
+    o0, o1 = rect[other]
+    return [(sweep, normal, other,
+             {normal: [i], other: list(range(o0, o1 + 1)), sweep: rect[sweep]},
+             "slice")
+            for i in at]
 
 
 def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
          log_hz=DEFAULT_LOG_HZ, settle_s=DEFAULT_SETTLE_S, accel_mm_s2=20.0,
-         travel_mm=None, min_span_mm=None, shell=False):
+         travel_mm=None, min_span_mm=None, shell=False, slices=0,
+         slice_inset_mm=0.0, slice_normal="y"):
     """Turn a Volume into the lines that will actually be swept.
 
     `reachable` is a boolean array of `volume.shape` -- machine.reachable_grid's
@@ -344,6 +419,14 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
     the interior -- and it is five or six times fewer lines, which is the
     difference between an evening and a week.
 
+    `slices` adds that many planes INSIDE the box, square to `slice_normal`
+    (y by default, so they lie in x-z), each inset from the box by
+    `slice_inset_mm` on every side -- see slice_planes(). With `shell` that is
+    the box's surface plus a few cuts through it: the faces fix the interior
+    of a current-free field, and the cuts are measured values of that
+    interior to check the reconstruction against. Their lines are tagged
+    part="slice" so nothing reading the map back takes them for faces.
+
     `travel_mm` is {axis: (lo, hi)}; the run-up and run-down are fitted into
     whatever it leaves outside the box, and silently shortened where it does
     not. A line with no room to ramp is still swept -- it just measures its own
@@ -354,19 +437,16 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
     span_floor = (volume.step_mm if min_span_mm is None else float(min_span_mm))
     reachable = None if reachable is None else np.asarray(reachable)
 
+    rasters = (_face_rasters(volume, shell)
+               + _slice_rasters(volume, slices, slice_inset_mm, slice_normal))
     lines, skipped, seen = [], 0, set()
-    for axis, first_ax, second_ax, pin in _face_rasters(volume, shell):
+    for axis, first_ax, second_ax, restrict, part in rasters:
         along = volume.nodes(axis)
-        firsts = range(volume.shape[AXES.index(first_ax)])
-        seconds = range(volume.shape[AXES.index(second_ax)])
-        if pin is not None:
-            pin_ax, pin_at = pin
-            n = volume.shape[AXES.index(pin_ax)]
-            at = pin_at % n
-            if pin_ax == first_ax:
-                firsts = [at]
-            elif pin_ax == second_ax:
-                seconds = [at]
+        a0, a1 = restrict.get(axis, (0, len(along) - 1))
+        firsts = restrict.get(first_ax,
+                              range(volume.shape[AXES.index(first_ax)]))
+        seconds = restrict.get(second_ax,
+                               range(volume.shape[AXES.index(second_ax)]))
         for i1 in firsts:
             for i2 in seconds:
                 idx = {first_ax: i1, second_ax: i2}
@@ -376,12 +456,14 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
                     continue          # the faces share their edges
                 seen.add(key)
                 if reachable is None:
-                    spans = [(0, len(along) - 1)]
+                    spans = [(a0, a1)]
                 else:
                     sel = [slice(None)] * 3
                     for k, v in idx.items():
                         sel[AXES.index(k)] = v
-                    spans = _runs(reachable[tuple(sel)])
+                    sel[AXES.index(axis)] = slice(a0, a1 + 1)
+                    spans = [(a0 + s0, a0 + s1)
+                             for s0, s1 in _runs(reachable[tuple(sel)])]
                 if not spans:
                     skipped += 1
                     continue
@@ -395,11 +477,33 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
                     run_in = max(0.0, min(ramp, start - lo_t))
                     run_out = max(0.0, min(ramp, hi_t - stop))
                     lines.append(SweepLine(axis, start, stop, fixed,
-                                           run_in, run_out))
+                                           run_in, run_out, part))
     note = ("the outside of the box" if shell else "the whole box, filled")
+    slice_doc = None
+    if int(slices) > 0:
+        at, rect = slice_planes(volume, slices, slice_inset_mm, slice_normal)
+        in_plane = "-".join(a for a in AXES if a != slice_normal)
+        if at:
+            slice_doc = {
+                "normal": slice_normal, "plane": in_plane,
+                "at_mm": [float(volume.nodes(slice_normal)[i]) for i in at],
+                "rect_mm": {ax: [float(volume.nodes(ax)[i0]),
+                                 float(volume.nodes(ax)[i1])]
+                            for ax, (i0, i1) in rect.items()},
+                "inset_mm": float(next(iter(rect.values()))[0]
+                                  * volume.step_mm)}
+            dims = " x ".join(f"{v[1] - v[0]:g}"
+                              for v in slice_doc["rect_mm"].values())
+            note += (f" plus {len(at)} {in_plane} slice(s) of {dims} mm at "
+                     f"{slice_normal} = "
+                     + ", ".join(f"{v:g}" for v in slice_doc["at_mm"]) + " mm")
+        else:
+            note += (f" (no {in_plane} slices: the inset or the box leaves no "
+                     f"room for them on a {volume.step_mm:g} mm grid)")
     note += (", cut to the space the probe body actually fits in"
              if reachable is not None else ", coils ignored")
-    return SweepPlan(volume, lines, speed_mm_s, log_hz, settle_s, skipped, note)
+    return SweepPlan(volume, lines, speed_mm_s, log_hz, settle_s, skipped, note,
+                     slices=slice_doc)
 
 
 class Aborted(RuntimeError):

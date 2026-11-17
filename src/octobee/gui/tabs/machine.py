@@ -29,6 +29,15 @@ from octobee.motion import encoder as oenc
 from octobee.motion import stage as ostage
 from octobee.motion import sweep as osweep
 
+# The sweep patterns the volume panel offers: label -> (shell, with slices).
+# The first is the default.
+VOLUME_PATTERNS = {
+    "outer surface + x–z slices": (True, True),
+    "outer surface": (True, False),
+    "filled box": (False, False),
+}
+
+
 
 class MachineTab(QtWidgets.QWidget):
     def __init__(self, session, parent=None):
@@ -305,17 +314,48 @@ class MachineTab(QtWidgets.QWidget):
         self.spin_vol_speed.valueChanged.connect(self.on_volume_edited)
         f4.addWidget(self.spin_vol_speed, 5, 1)
 
-        self.chk_vol_shell = QtWidgets.QCheckBox("outer surface only")
-        self.chk_vol_shell.setChecked(True)
-        self.chk_vol_shell.setToolTip(
-            "Map the six faces of the box rather than filling it — each swept "
-            "in its own plane, so the two faces across the sweep axis are run "
-            "along a different one. For a field in a current-free region the "
-            "boundary determines the interior, so this is not a poor relation "
-            "of the filled version; it is five or six times fewer lines, "
-            "which is the difference between an evening and a week.")
-        self.chk_vol_shell.toggled.connect(self.on_volume_edited)
-        f4.addWidget(self.chk_vol_shell, 4, 2, 1, 2)
+        self.cmb_vol_pattern = QtWidgets.QComboBox()
+        self.cmb_vol_pattern.addItems(list(VOLUME_PATTERNS))
+        self.cmb_vol_pattern.setToolTip(
+            "outer surface: map the six faces of the box rather than filling "
+            "it — each swept in its own plane, so the two faces across the "
+            "sweep axis are run along a different one. For a field in a "
+            "current-free region the boundary determines the interior, so "
+            "this is not a poor relation of the filled version; it is five "
+            "or six times fewer lines, which is the difference between an "
+            "evening and a week.\n\n"
+            "outer surface + x–z slices: the same six faces, then a few full "
+            "x–z planes through the inside of the box, spread evenly along y. "
+            "They are measured interior values to check a reconstruction from "
+            "the faces against.\n\n"
+            "filled box: every line through the whole volume.")
+        self.cmb_vol_pattern.currentIndexChanged.connect(self.on_volume_edited)
+        f4.addWidget(self.cmb_vol_pattern, 4, 2, 1, 2)
+
+        f4.addWidget(QtWidgets.QLabel("x–z slices"), 6, 0)
+        self.spin_vol_slices = QtWidgets.QSpinBox()
+        self.spin_vol_slices.setRange(1, 20)
+        self.spin_vol_slices.setValue(3)
+        self.spin_vol_slices.setSuffix(" planes")
+        self.spin_vol_slices.setToolTip(
+            "How many x–z planes to sweep inside the box. They are spread "
+            "evenly along y — three sit a quarter, half and three quarters of "
+            "the way through — and snapped to the grid step.")
+        self.spin_vol_slices.valueChanged.connect(self.on_volume_edited)
+        f4.addWidget(self.spin_vol_slices, 6, 1)
+        self.spin_vol_inset = QtWidgets.QDoubleSpinBox()
+        self.spin_vol_inset.setRange(0.0, 500.0)
+        self.spin_vol_inset.setDecimals(1)
+        self.spin_vol_inset.setValue(0.0)
+        self.spin_vol_inset.setPrefix("inset ")
+        self.spin_vol_inset.setSuffix(" mm")
+        self.spin_vol_inset.setToolTip(
+            "0 mm (the default) makes each slice a full x–z plane right across "
+            "the box. Anything more shrinks it by that much on every side, in "
+            "x and in z — 50 mm on the 300 mm box gives 200 × 200 mm. "
+            "Rounded to the grid step.")
+        self.spin_vol_inset.valueChanged.connect(self.on_volume_edited)
+        f4.addWidget(self.spin_vol_inset, 6, 2, 1, 2)
 
         self.chk_vol_avoid = QtWidgets.QCheckBox("keep clear of the coils")
         self.chk_vol_avoid.setChecked(True)
@@ -326,7 +366,7 @@ class MachineTab(QtWidgets.QWidget):
             "the head: the square tube runs the length of the probe back to "
             "its zero point, and that is what hits things first.")
         self.chk_vol_avoid.toggled.connect(self.on_volume_edited)
-        f4.addWidget(self.chk_vol_avoid, 6, 0, 1, 2)
+        f4.addWidget(self.chk_vol_avoid, 7, 0, 1, 2)
         self.spin_vol_margin = QtWidgets.QDoubleSpinBox()
         self.spin_vol_margin.setRange(0.0, 500.0)
         self.spin_vol_margin.setDecimals(1)
@@ -340,7 +380,7 @@ class MachineTab(QtWidgets.QWidget):
             "the pose is uncertain by, because a clearance computed from a "
             "pose measured with a tape is only as good as the tape was.")
         self.spin_vol_margin.valueChanged.connect(self.on_volume_edited)
-        f4.addWidget(self.spin_vol_margin, 6, 2, 1, 2)
+        f4.addWidget(self.spin_vol_margin, 7, 2, 1, 2)
 
         self.lbl_encoders = QtWidgets.QLabel("")
         self.lbl_encoders.setWordWrap(True)
@@ -371,14 +411,14 @@ class MachineTab(QtWidgets.QWidget):
             "0.41% into x that way.\n\n"
             "Clamped to whatever room the axis actually has, from where it is "
             "standing. The run says so if it had to shorten it.")
-        f4.addWidget(self.btn_vol_encoders, 7, 0)
-        f4.addWidget(self.spin_enc_span, 7, 1)
-        f4.addWidget(self.lbl_encoders, 7, 2, 1, 2)
+        f4.addWidget(self.btn_vol_encoders, 8, 0)
+        f4.addWidget(self.spin_enc_span, 8, 1)
+        f4.addWidget(self.lbl_encoders, 8, 2, 1, 2)
 
         self.lbl_volume = QtWidgets.QLabel("")
         self.lbl_volume.setWordWrap(True)
         self.lbl_volume.setStyleSheet("color:#9aa3b2; font-size:11px;")
-        f4.addWidget(self.lbl_volume, 8, 0, 1, 4)
+        f4.addWidget(self.lbl_volume, 9, 0, 1, 4)
 
         self.btn_vol_plan = QtWidgets.QPushButton("Work out the path")
         self.btn_vol_plan.clicked.connect(self.on_volume_plan)
@@ -395,14 +435,14 @@ class MachineTab(QtWidgets.QWidget):
         self.btn_vol_abort = QtWidgets.QPushButton("Abort")
         self.btn_vol_abort.setEnabled(False)
         self.btn_vol_abort.clicked.connect(self.on_volume_abort)
-        f4.addWidget(self.btn_vol_plan, 9, 0)
-        f4.addWidget(self.btn_vol_preview, 9, 1)
-        f4.addWidget(self.btn_vol_start, 9, 2)
-        f4.addWidget(self.btn_vol_abort, 9, 3)
+        f4.addWidget(self.btn_vol_plan, 10, 0)
+        f4.addWidget(self.btn_vol_preview, 10, 1)
+        f4.addWidget(self.btn_vol_start, 10, 2)
+        f4.addWidget(self.btn_vol_abort, 10, 3)
 
         self.bar_volume = QtWidgets.QProgressBar()
         self.bar_volume.setTextVisible(True)
-        f4.addWidget(self.bar_volume, 10, 0, 1, 4)
+        f4.addWidget(self.bar_volume, 11, 0, 1, 4)
         lay.addWidget(g4)
 
         self.lbl_clearance = QtWidgets.QLabel("no coil set loaded")
@@ -731,6 +771,14 @@ class MachineTab(QtWidgets.QWidget):
         return osweep.Volume(lo, [a + b for a, b in zip(lo, size)],
                              step_mm=step, sweep=axis)
 
+    def _pattern(self):
+        """The plan() arguments for the chosen sweep pattern."""
+        shell, slices = VOLUME_PATTERNS[self.cmb_vol_pattern.currentText()]
+        return {"shell": shell,
+                "slices": self.spin_vol_slices.value() if slices else 0,
+                "slice_inset_mm": self.spin_vol_inset.value(),
+                "slice_normal": "y"}
+
     def on_volume_whole(self, on):
         """Whole travel or a typed box: show the numbers either way.
 
@@ -762,6 +810,9 @@ class MachineTab(QtWidgets.QWidget):
         """
         self._reachable = None
         self._plan = None
+        with_slices = self._pattern()["slices"] > 0
+        self.spin_vol_slices.setEnabled(with_slices)
+        self.spin_vol_inset.setEnabled(with_slices)
         self.btn_vol_preview.setEnabled(False)
         self.btn_vol_start.setEnabled(False)
         self._stop_preview()
@@ -775,7 +826,7 @@ class MachineTab(QtWidgets.QWidget):
         self.machine_view.set_volume(
             self.session.machine.pose.flange_path_mm(vol.corners_mm()))
         rough = osweep.plan(vol, speed_mm_s=self.spin_vol_speed.value(),
-                            shell=self.chk_vol_shell.isChecked())
+                            **self._pattern())
         self.lbl_volume.setText(
             f"{vol.describe()} — not planned yet. Ignoring the coils it "
             f"would be {rough.describe()}.")
@@ -827,7 +878,7 @@ class MachineTab(QtWidgets.QWidget):
             speed_mm_s=self.spin_vol_speed.value(),
             log_hz=self.session.out_rate,
             travel_mm=self.session.machine.pose.travel_mm,
-            shell=self.chk_vol_shell.isChecked())
+            **self._pattern())
         pose = self.session.machine.pose
         dropped = self._dropped_points(vol)
         self.machine_view.set_volume(pose.flange_path_mm(vol.corners_mm()))
@@ -866,7 +917,7 @@ class MachineTab(QtWidgets.QWidget):
         if self._reachable is None:
             return None
         whole = osweep.plan(vol, speed_mm_s=self.spin_vol_speed.value(),
-                            shell=self.chk_vol_shell.isChecked())
+                            **self._pattern())
         kept = {(line.sweep, tuple(sorted(line.fixed.items())),
                  round(line.start_mm, 6), round(line.stop_mm, 6))
                 for line in self._plan.lines}

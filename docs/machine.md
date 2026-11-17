@@ -206,13 +206,30 @@ a hardware one — the axes will do 10. The head is on the end of a cantilever a
 this is the only measurement taken while the thing taking it is moving, so there
 is nothing to be gained by hurrying it.
 
-*Outer surface only* maps the six faces of the box instead of filling it, each
+*Pattern* picks what is swept. **Outer surface** maps the six faces of the box instead of filling it, each
 swept in its own plane — the two faces across the sweep axis are run along a
 different one, which is why a line carries its own sweep axis rather than taking
 the volume's. For a field in a current-free region the boundary values determine
 the interior, so this is not a poor relation of the filled version. It is also
 five or six times fewer lines: the whole envelope on a 10 mm grid is 182 lines
 against 961, about **4.6 hours** at 5 mm/s where filling it would be a day.
+
+**Outer surface + x–z slices** sweeps the same six faces, then a few full x–z
+planes through the inside of the box. *x–z slices* sets how many (three by
+default, at a quarter, half and three quarters of the way along y). *inset*
+shrinks each plane by that much on every side; it is 0 by default, so each plane
+spans the whole box (300 × 300 mm on the whole envelope). Everything snaps to the
+grid step, so three planes in a 0–300 mm box sit at y = 80, 150 and 220 mm. On
+the whole envelope at 10 mm that is 87 extra lines (the two edge lines of each
+plane are already swept as part of the faces), about 269 in all and roughly
+**6.8 hours**.
+The slices are not needed to reconstruct the field: the faces already fix the
+interior. They are measured interior values to check that reconstruction
+against. Each line in the sidecar carries `"part": "box"` or `"part": "slice"`,
+and `tools/plot_faces.py` and `tools/fill_volume.py` skip the slices when they
+assemble the faces. **Filled box** sweeps every line through the volume.
+
+The default pattern is **outer surface + x–z slices**.
 
 ### Cutting the volume to the shape of the space
 

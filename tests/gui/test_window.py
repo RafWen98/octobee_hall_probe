@@ -439,6 +439,32 @@ def _check_machine_volume(win, app):
     check("stopping it hands the drawing back to the real stage reading",
           tab._preview is None and tab._preview_at is None)
 
+    # The surface-plus-slices pattern: switching to it drops the plan, and
+    # planning again adds x-z rectangles inside the box to the faces.
+    check("the surface-plus-slices pattern is the default",
+          tab.cmb_vol_pattern.currentText().startswith("outer surface + "))
+    tab.cmb_vol_pattern.setCurrentText("outer surface")
+    tab.chk_vol_avoid.setChecked(False)
+    tab.on_volume_plan()
+    app.processEvents()
+    faces_only = len(tab._plan.lines)
+    check("the slice controls are idle with the faces-only pattern",
+          not tab.spin_vol_slices.isEnabled())
+    tab.cmb_vol_pattern.setCurrentText("outer surface + x–z slices")
+    check("choosing it enables them and invalidates the plan",
+          tab.spin_vol_slices.isEnabled() and tab._plan is None)
+    tab.spin_vol_inset.setValue(50.0)
+    tab.chk_vol_avoid.setChecked(False)
+    tab.on_volume_plan()
+    app.processEvents()
+    cuts = [ln for ln in tab._plan.lines if ln.part == "slice"]
+    check("planning it adds x-z slices inside the box",
+          len(cuts) > 0 and len(tab._plan.lines) > faces_only
+          and all(0.0 < ln.fixed["y"] < 300.0 for ln in cuts)
+          and "x-z slice" in tab.lbl_volume.text(),
+          tab.lbl_volume.text()[:120])
+    tab.chk_vol_avoid.setChecked(True)
+
     # Nothing to run against: there are no stages in this test, and starting
     # anyway is the failure that would drive an unconnected rig.
     check("starting a map with no stages connected is refused",
