@@ -71,10 +71,12 @@ class HealthTab(QtWidgets.QWidget):
 
     def analyse(self):
         raw = self._raw_arrays()
-        if raw is None:
+        source = self.session.source
+        # Both: the raw history used to survive a disconnect, and the analysis
+        # below reads the converter constants off the source.
+        if raw is None or source is None:
             self.health_text.setPlainText("no data -- connect first")
             return
-        source = self.session.source
         rows = ocal.channel_health(raw, source.vpc, source.hosts,
                                    source.volt_offset)
         self.session.last_health = rows

@@ -139,7 +139,98 @@ def test_crash_handler(app, workdir):
           and boxes[2] is boxes[0],
           "three boxes for three faults reads as the freeze it replaces")
     parent.close()
-    check("repeated faults are all logged", handler.count == 3,
+    check("repeated faults are all counted", handler.count == 3,
           f"count {handler.count}")
-    check("every one of them reaches the log",
-          open(handler.path, encoding="utf-8").read().count("again") >= 3)
+    text = open(handler.path, encoding="utf-8").read()
+    check("the same fault from the same line is written in full only once",
+          text.count("Traceback") == 1,
+          f"{text.count('Traceback')} tracebacks for three identical faults")
+
+
+class _FakeWindow(QtWidgets.QMainWindow):
+    """What the handler sees of MainWindow: a `session` with a `log`."""
+
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+        self.session = type("S", (), {"log": self.lines.append})()
+
+
+def _raise_at_a_line(kind):
+    raise kind("x")
+
+
+def test_crash_log_is_bounded(app, workdir):
+    """A fault in a 50 ms timer must not grow the log without limit.
+
+    One such bug wrote a full traceback per tick and the file reached 3.5 GB.
+    """
+    print("\ncrash log bounds")
+    now = [0.0]
+    win = _FakeWindow()
+    handler = CrashHandler(path=os.path.join(workdir, "bounded.log"),
+                           window=win)
+    handler._clock = lambda: now[0]
+
+    def fire(kind=ValueError):
+        try:
+            _raise_at_a_line(kind)
+        except kind:
+            handler(*sys.exc_info())
+
+    for _ in range(5000):
+        now[0] += 0.05                       # 250 s of a 50 ms timer
+        fire()
+    text = open(handler.path, encoding="utf-8").read()
+    check("5000 repeats write one full traceback", text.count("Traceback") == 1,
+          f"{text.count('Traceback')}")
+    notes = text.count("repeated")
+    check("and only a one-line tally about once a minute, not one per repeat",
+          1 <= notes <= 5, f"{notes} tally lines")
+    check("the file stays small", os.path.getsize(handler.path) < 20_000,
+          f"{os.path.getsize(handler.path)} bytes")
+    check("a different exception type at the same line is a different fault",
+          (fire(KeyError), open(handler.path, encoding="utf-8").read()
+           .count("Traceback"))[1] == 2)
+    handler.finish()
+    text = open(handler.path, encoding="utf-8").read()
+    check("session end writes the tally still owed",
+          text.rstrip().endswith("[session end]") or "[session end]" in text)
+    check("the Log tab is told once per distinct fault, through session.log",
+          len(win.lines) == 2 and "INTERNAL ERROR" in win.lines[0],
+          f"{len(win.lines)} lines")
+    win.close()
+
+    # A window whose log raises must not make the handler raise.
+    class Bad(QtWidgets.QMainWindow):
+        @property
+        def session(self):
+            raise RuntimeError("torn down")
+    bad = Bad()
+    h2 = CrashHandler(path=os.path.join(workdir, "bad.log"), window=bad)
+    try:
+        raise ValueError("q")
+    except ValueError:
+        try:
+            h2(*sys.exc_info())
+            survived = True
+        except Exception:
+            survived = False
+    check("the handler never raises itself", survived)
+    bad.close()
+
+    # Rotation: an oversized file from an earlier session is moved aside once.
+    big = os.path.join(workdir, "big.log")
+    with open(big, "wb") as fh:
+        fh.truncate(21 * 1024 * 1024)
+    with open(big + ".1", "w") as fh:
+        fh.write("older")
+    CrashHandler(path=big).rotate()
+    check("an oversized log is rotated to .1, replacing the older copy",
+          not os.path.exists(big) and os.path.getsize(big + ".1") > 20 * 1024 * 1024)
+    small = os.path.join(workdir, "small.log")
+    with open(small, "w") as fh:
+        fh.write("x")
+    CrashHandler(path=small).rotate()
+    check("a small log is left alone",
+          os.path.exists(small) and not os.path.exists(small + ".1"))

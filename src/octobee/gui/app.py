@@ -130,7 +130,10 @@ def main():
             app.quit()
         QtCore.QTimer.singleShot(1200, shoot)
 
-    sys.exit(app.exec())
+    rc = app.exec()
+    # Tally any fault that was still repeating when the window closed.
+    crash.finish()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

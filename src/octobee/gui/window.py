@@ -67,6 +67,11 @@ from octobee.gui.workers import (
     SnapshotWorker,
 )
 
+# Threads that would not finish before the window closed. A QThread destroyed
+# while it is running aborts the process, so one that outlives its window is
+# kept referenced here instead.
+_ORPHANED_THREADS = []
+
 # ==========================================================================
 # main window
 # ==========================================================================
@@ -89,14 +94,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_table = None
         self._last_health_t = 0.0
         self._last_dropped = 0
-        self._machine_key = None
-        self._machine_quiet = False
-        self._machine_travel_taken = False
         self._connect_worker = None
         self._snap_worker = None
         self._connect_was_automatic = False
         self._connecting = False
-        self._magnet_wizard = None
+        # What the stream is doing, for the two ways it can fail without
+        # raising: a source that reports an error, and one that simply goes
+        # quiet. See on_tick.
+        self._stream_errors_seen = set()
+        self._last_rows_t = time.monotonic()
+        # The dead set is two things that used to be one: what a person (or
+        # calibration.json) said was dead, which only a person changes, and
+        # what the health scan thinks, which comes and goes. cal.dead is their
+        # union. See _update_auto_dead.
+        self._dead_cal = None
+        self._dead_manual = set()
+        self._dead_auto = set()
+        self._dead_candidates = set()
         # The "here is where it went" box, and the one state in which it must
         # not appear: closing the window stops a running recording on the way
         # out, and a dialog raised during teardown is a window that will not
@@ -110,6 +124,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # window exists, and both go through this.
         self.motion = MotionControl(self.session, parent=self)
         self.motion.changed.connect(self._refresh_estop_ui)
+        # Deferred to the event loop, not called from the signal. register()
+        # emits before the caller has start()ed the worker, and busy() drops
+        # any registered worker that is not running yet -- so asking it
+        # synchronously from here would un-register the very job that is
+        # starting.
+        self.motion.changed.connect(
+            lambda: QtCore.QTimer.singleShot(0, self._sync_connection_actions))
         self._state_before_estop = None
 
         self.setWindowTitle("OCTO-BEE Hall probe")
@@ -378,6 +399,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_tare = QtGui.QAction("Zero (tare)", self)
         self.act_tare.setToolTip("Take 2 s of ambient data and store it as the "
                                  "zero point of every axis of every sensor.")
+        # start_collect refuses a tare while a volume map is running, which
+        # is where the check has to live: this button is only one of its callers.
         self.act_tare.triggered.connect(lambda: self.tab_calib.start_collect("tare", 2.0))
         tb.addAction(self.act_tare)
 
@@ -535,8 +558,55 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_was_automatic = True
         self.on_connect()
 
+    def _running_now(self):
+        """What is moving the machine or measuring with it, in words, or None.
+
+        Connect, Disconnect and Snapshot all take the carriers' stream or the
+        stages away from whoever has them. A field map is capturing from the
+        carriers itself; a volume sweep and a stage job are driving the axes.
+        Doing any of those underneath them does not fail loudly -- the map
+        just contains rows from a stream that was torn down and rebuilt, or the
+        stages close under a move.
+        """
+        return self.tab_stages.what_is_running()
+
+    def _refuse_while_running(self, action):
+        """True, after saying why, if `action` must not happen right now."""
+        what = self._running_now()
+        if what is None:
+            return False
+        self.session.log(f"{action} refused: {what} is running. Wait for it "
+                         f"to finish, or stop it first.")
+        return True
+
+    def _sync_connection_actions(self):
+        """Keep Connect and Disconnect honest about what is going on.
+
+        The handlers refuse on their own; this is so the buttons also LOOK
+        unavailable, and so Connect comes back by itself when a field map
+        ends. It used to stay greyed out after one, while the log said
+        "press Connect".
+        """
+        idle = self._running_now() is None
+        source = self.session.source
+        snapshotting = is_running(self._snap_worker)
+        self.act_connect.setEnabled(
+            idle and not self._connecting and not snapshotting
+            and not isinstance(source, LiveSource))
+        self.act_disconnect.setEnabled(
+            idle and source is not None and not snapshotting)
+
     def on_connect(self):
         if self.session.source is not None:
+            return
+        # Against a field map this would start a ConnectWorker on carriers the
+        # scan is capturing from; against a snapshot, on carriers it has taken
+        # off the stream and is about to put back on their own clock.
+        if self._refuse_while_running("connect"):
+            return
+        if is_running(self._snap_worker):
+            self.session.log("connect refused: a snapshot is still being "
+                             "captured")
             return
         # A second attempt while the first is still in flight would start a
         # second worker against the same carriers -- and the automatic connect
@@ -579,7 +649,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if error:
             self.lbl_state.setText("disconnected")
             self.session.log(f"connect failed: {error}")
-            if was_automatic:
+            if self._closing:
+                # The window is going away; a box raised now is one that
+                # nobody can answer and that holds the close up.
+                pass
+            elif was_automatic:
                 self.session.log(
                     "the automatic connect is the only thing that failed -- "
                     "everything that does not need the carriers still works, "
@@ -607,6 +681,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_source(self, source, kind):
         self.session.source = source
+        self._stream_errors_seen = set()
+        self._last_rows_t = time.monotonic()
+        self.status.clearMessage()
+        # A tare or magnet pass started on the old stream would otherwise
+        # finish on this one, averaging two connections into one zero.
+        self.tab_calib.abandon_collection("the stream was replaced")
         # Measure the running state, not the startup: building the window and
         # bringing up the GL context stalls the loop once, and leaving that in
         # the numbers makes a healthy session look blocked.
@@ -627,9 +707,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.log(f"{kind} source running at {source.fs_hz/1000:g} kSPS, "
                      f"decimating to {self.session.out_rate:g} Hz for display and CSV")
 
-    def on_disconnect(self):
+    def on_disconnect(self, _checked=False):
+        # Against a running job this would close the stages under a move, or
+        # take the stream from a map that is capturing from it.
+        if self._refuse_while_running("disconnect"):
+            return
+        self._disconnect()
+
+    def _disconnect(self):
+        """Everything Disconnect does, without the refusal.
+
+        closeEvent comes here directly: by then it has already waited for the
+        workers as long as it is willing to, and a worker wedged inside a DLL
+        call must not also stop the carriers' clock being put back.
+        """
         if self.act_record.isChecked():
             self.act_record.setChecked(False)
+        self.tab_calib.abandon_collection("the stream was disconnected")
+        # The history belongs to the stream that is going away. Left in place
+        # it let the Diagnostics button analyse a source that no longer
+        # exists, which raised.
+        self.raw_hist = None
+        self.raw_hist_n = 0
         if self.session.source is not None:
             self.session.source.stop()
             self.session.source = None
@@ -707,29 +806,81 @@ class MainWindow(QtWidgets.QMainWindow):
             enc_columns=int(
                 getattr(self.session.source, "enc_columns", 0) or 0))
 
-    def _roll_over_csv(self, what):
-        """Close the CSV in progress and open a fresh one with a new header."""
+    def _roll_over_csv(self, what, reason=None):
+        """Close the CSV in progress and open a fresh one with a new header.
+
+        `reason` is what the new file's header says it continues because of;
+        by default that is a changed `what`.
+
+        Written so that a failure leaves a state the rest of the window can
+        read. session.csv_rec is cleared BEFORE the old file is closed, so a
+        close that raises (disk full) cannot leave it pointing at a closed
+        file for every later tick to write into; and a continuation that
+        cannot be opened ends the CSV recording visibly instead.
+        """
         if self.session.csv_rec is None:
             return
         old = self.session.csv_rec
         rows = old.n_rows
-        old.close()
+        self.session.csv_rec = None
+        try:
+            old.close()
+        except Exception as exc:
+            self.session.log(
+                f"WARNING: could not close {os.path.basename(old.path)} "
+                f"cleanly ({type(exc).__name__}: {exc}) -- it may be "
+                f"incomplete")
         path = orec.default_name("octobee", "csv", self.session.out_dir)
         # The datum is deliberately NOT retaken here. The encoder stream is
         # not reset by a calibration change, so the counts carry straight on;
         # keeping the original datum is what makes the position columns of the
         # two files continue each other rather than restart at the same place.
-        self.session.csv_rec = self._new_csv_recorder(
-            path,
-            {"hosts": ",".join(self.session.source.hosts) if self.session.source else "",
-             "stream_rate_hz": self.session.source.fs_hz if self.session.source else 0.0,
-             "continues": os.path.basename(old.path),
-             "rolled_over_because": f"{what} changed"})
+        # (A caller that DID reset the stream retakes it first, after the reset.)
+        try:
+            self.session.csv_rec = self._new_csv_recorder(
+                path,
+                {"hosts": ",".join(self.session.source.hosts) if self.session.source else "",
+                 "stream_rate_hz": self.session.source.fs_hz if self.session.source else 0.0,
+                 "continues": os.path.basename(old.path),
+                 "rolled_over_because": reason or f"{what} changed"})
+        except Exception as exc:
+            self.session.csv_rec = None
+            self._alarm(
+                f"CSV recording stopped: {what} changed and the new file "
+                f"could not be opened ({type(exc).__name__}: {exc}). "
+                f"{os.path.basename(old.path)} holds the data up to "
+                f"{rows} rows.")
+            self._after_recorders_gone()
+            return
         self.session.log(
             f"{what} changed while recording: closed {os.path.basename(old.path)} "
             f"at {rows} rows and started {os.path.basename(path)}, so each file "
-            f"matches the calibration named in its own header. The raw .bin is "
+            f"matches the settings named in its own header. The raw .bin is "
             f"unaffected -- it holds counts, which no calibration changes.")
+
+    def _alarm(self, msg):
+        """Say something went wrong in a way that cannot be missed or blocked on.
+
+        Status bar and Log, never a dialog: this happens at 3 a.m. with
+        nobody there, and a modal would sit on top of whatever else needed
+        the event loop. The status bar message has no timeout, so whoever
+        comes back to the screen sees it.
+        """
+        self.session.log(f"ALARM: {msg}")
+        self.status.showMessage(f"ALARM: {msg}", 0)
+
+    def _after_recorders_gone(self):
+        """Bring the Record button and labels in line with the recorders.
+
+        For when a recorder ended by itself rather than by the button, which
+        used to leave "REC" and a ticked button over a file that was no
+        longer being written.
+        """
+        if (self.session.csv_rec is None and self.session.raw_rec is None
+                and self.act_record.isChecked()):
+            self.act_record.setChecked(False)      # on_record(False) does the rest
+        self._refresh_record_dot()
+        self._update_rec_label()
 
     # ---- the acquisition tick --------------------------------------------
     def on_tick(self):
@@ -738,11 +889,14 @@ class MainWindow(QtWidgets.QMainWindow):
         with self.session.prof.time("acquisition tick (total)"):
             with self.session.prof.time("  socket read + decode"):
                 blocks = self.session.source.read()
+            # Looked at on every tick, not only on empty ones: a source that
+            # reports an error while still delivering some data is the one
+            # that goes on writing a file nobody should trust.
+            self._watch_source()
             if not blocks or blocks[0].shape[0] == 0:
-                if getattr(self.session.source, "error", None):
-                    self.session.log(f"stream error: {self.session.source.error}")
-                    self.session.source.error = None
+                self._watch_stall()
                 return
+            self._last_rows_t = time.monotonic()
             self.session.prof.note("samples per acquisition tick", blocks[0].shape[0])
 
             with self.session.prof.time("  keep raw history"):
@@ -798,6 +952,79 @@ class MainWindow(QtWidgets.QMainWindow):
                 with self.session.prof.time("  magnet/tare collect"):
                     self.tab_calib.collect_block(b, grouped)
 
+    # How long a recording may sit with no rows arriving before it is stopped.
+    # Long enough to ride out a slow block at 20 kSPS, short enough that a dead
+    # stream does not run all night under a "REC" that looks healthy.
+    STALL_S = 5.0
+
+    def _watch_source(self):
+        """Log a stream error once, and stop a recording it has made untrustworthy.
+
+        This used to log "stream error" on every 50 ms tick for as long as
+        the error stayed set: 20 lines a second, which flushes the whole
+        4000-line Log history in about three minutes -- and meanwhile nothing
+        stopped the recording, so "REC" stayed up over frozen row counts.
+        """
+        source = self.session.source
+        err = getattr(source, "error", None)
+        failed = bool(getattr(source, "failed", False))
+        if err:
+            if err not in self._stream_errors_seen:
+                self._stream_errors_seen.add(err)
+                self.session.log(f"stream error: {err}")
+            source.error = None
+        if not (err or failed):
+            return
+        if failed and "<failed>" not in self._stream_errors_seen:
+            self._stream_errors_seen.add("<failed>")
+            self.session.log("stream failed: the source has stopped delivering")
+        self._stop_recording_with_alarm(
+            f"the stream reported an error ({err or 'source failed'})")
+
+    def _watch_stall(self):
+        """Stop a recording that has had no rows for STALL_S seconds."""
+        if self.session.csv_rec is None and self.session.raw_rec is None:
+            self._last_rows_t = time.monotonic()
+            return
+        quiet = time.monotonic() - self._last_rows_t
+        if quiet >= self.STALL_S:
+            self._stop_recording_with_alarm(
+                f"no data has arrived for {quiet:.0f} s")
+
+    def _stop_recording_with_alarm(self, why):
+        """Stop the recording through the normal path, loudly."""
+        if self.session.csv_rec is None and self.session.raw_rec is None:
+            return
+        self._alarm(f"recording stopped -- {why}. What was written up to "
+                    f"now is saved; start Record again once the stream is "
+                    f"back.")
+        # The button, so on_record(False) closes, sidecars and reports exactly
+        # as a person pressing it would. The "saved to" box it raises is
+        # non-blocking.
+        self.act_record.setChecked(False)
+        self._after_recorders_gone()
+
+    def _resync_encoders(self, why):
+        """The encoder decimator is out of step with the field one: restart both.
+
+        The field decimator has already been fed this tick and the encoder one
+        has not, so from here on the counts would lag the field by this tick's
+        samples for the rest of the session -- written into the file under
+        position columns that look perfectly fine. Rebuilding both puts them
+        back on the same sample. That also starts a fresh unwrapping basis, so
+        an open CSV is rolled over: its datum belonged to the old one.
+        """
+        first = "encoder resync" not in self._stream_errors_seen
+        self._stream_errors_seen.add("encoder resync")
+        if first:
+            self.session.log(f"WARNING: {why} -- restarting the encoder and "
+                             f"field decimators together so they stay in step")
+        self.session.new_decimator()
+        if self.session.csv_rec is not None:
+            self.session.enc_datum = self._encoder_datum()
+            self._roll_over_csv("the encoder alignment",
+                                reason=f"encoders resynchronised: {why}")
+
     def _tick_encoders(self, n_samples):
         """Continuous, decimated encoder counts for this tick's rows, or None.
 
@@ -809,15 +1036,21 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         source, stream = self.session.source, self.session.enc_stream
         raw = getattr(source, "enc", None)
-        if stream is None or raw is None:
+        if stream is None:
+            return None
+        if raw is None:
+            # The source has encoder columns but handed none over for rows it
+            # did hand over for the field.
+            self._resync_encoders("a tick arrived with no encoder rows")
             return None
         if raw.shape[0] != n_samples:
             # The source promises these are the same rows; if that ever stops
             # being true the honest thing is to drop them rather than log a
-            # position against the wrong sample.
-            self.session.log(
-                f"WARNING: {raw.shape[0]} encoder rows against {n_samples} "
-                f"analogue rows on one tick -- encoder positions dropped")
+            # position against the wrong sample -- and to start both
+            # decimators again, since this tick fed only one of them.
+            self._resync_encoders(
+                f"{raw.shape[0]} encoder rows against {n_samples} analogue "
+                f"rows on one tick")
             return None
         with self.session.prof.time("  unwrap + decimate encoders"):
             return self.session.enc_decimator.push(stream.push(raw))
@@ -907,6 +1140,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return out
 
     def on_slow_tick(self):
+        # Before the early return: this is what brings Connect back when a
+        # volume map ends, which changes no state the motion registry sees.
+        self._sync_connection_actions()
         if self.session.source is None:
             return
         recent = self.session.roll.view()
@@ -929,17 +1165,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.session.source.volt_offset)
                 self.session.last_health = rows
                 if self.tab_health.auto_exclude_dead():
-                    dead = ocal.suggest_dead(rows)
-                    if dead != self.session.cal.dead:
-                        self.session.cal.dead = dead
-                        self.tab_live.mark_dead(dead)
-                        if dead:
-                            self.session.log(
-                                f"excluding {', '.join(sorted(dead))}: "
-                                + "; ".join(
-                                    f"{k} {v[1]}" for k, v in
-                                    ocal.health_verdict(rows).items()
-                                    if v[0] == "dead"))
+                    self._update_auto_dead(rows)
         if self.session.last_health:
             table = orec.sensor_table(self.session.cal, recent.astype(np.float64),
                                       self.session.last_health,
@@ -973,6 +1199,56 @@ class MainWindow(QtWidgets.QMainWindow):
             for k, v in st.items()))
         self._update_rec_label()
 
+    def _update_auto_dead(self, rows):
+        """Fold one health scan into cal.dead without losing what a person set.
+
+        This used to assign cal.dead = suggest_dead(rows), which REPLACED the
+        set on every scan: entries loaded from calibration.json -- including
+        per-axis ones like "S16.Bx" that the scan can never produce -- were
+        wiped within a second of connecting, and the next Save calibration
+        wrote the wipe to disk. So the set the person gave is kept apart, and
+        cal.dead is that plus whatever the scan currently believes.
+
+        Hysteresis, symmetric: a sensor is excluded once it looks dead on two
+        consecutive scans, and re-included once it has looked healthy on two
+        consecutive scans. One 1 s window of a healthy sensor railing under a
+        strong magnet therefore does not drop it, and a sensor sitting on the
+        threshold does not flip cal.dead -- and with it the live mask the gain
+        trim and the statistics use -- every scan. Symmetric rather than
+        "re-include at once" because the cost is only one more scan period of
+        delay, and flapping in and out is the thing being avoided.
+        """
+        cal = self.session.cal
+        if cal is not self._dead_cal:
+            # A different calibration object -- loaded from file -- brings its
+            # own hand-entered set, and nothing the scan found belongs to it.
+            self._dead_cal = cal
+            self._dead_manual = set(cal.dead)
+            self._dead_auto = set()
+            self._dead_candidates = set()
+        seen = ocal.suggest_dead(rows)
+        previous, self._dead_candidates = self._dead_candidates, set(seen)
+        entering = seen & previous
+        staying = self._dead_auto & (seen | previous)
+        auto = entering | staying
+        dead = self._dead_manual | auto
+        added = auto - self._dead_auto
+        dropped = self._dead_auto - auto
+        self._dead_auto = auto
+        if dead == cal.dead:
+            return
+        cal.dead = dead
+        self.tab_live.mark_dead(dead)
+        if added:
+            self.session.log(
+                f"excluding {', '.join(sorted(added))}: "
+                + "; ".join(f"{k} {v[1]}" for k, v in
+                            ocal.health_verdict(rows).items()
+                            if v[0] == "dead"))
+        if dropped:
+            self.session.log(f"re-including {', '.join(sorted(dropped))}: "
+                             f"healthy on two scans in a row")
+
     # ---- collection (tare, magnet pass) ----------------------------------
     # ---- Earth-field roll calibration ------------------------------------
     # ---- calibration state -----------------------------------------------
@@ -983,6 +1259,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.session.source is None:
                 self.act_record.setChecked(False)
                 return
+            # A fresh recording starts a fresh stall clock, and clears the
+            # alarm that the last one may have left on the status bar.
+            self._last_rows_t = time.monotonic()
+            self.status.clearMessage()
             if self.tab_export.csv_enabled():
                 p = orec.default_name("octobee", "csv", self.session.out_dir)
                 self.session.enc_datum = self._encoder_datum()
@@ -1013,17 +1293,42 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"WARNING: {csv_rec.n_unpaired} of {csv_rec.n_rows} rows "
                     f"were written with no encoder counts against them -- "
                     f"their position columns are blank")
-            for rec, kind in ((self.session.csv_rec, "CSV"), (self.session.raw_rec, "raw")):
-                if rec is not None:
-                    p = rec.close()
-                    size = os.path.getsize(p) / 1e6 if os.path.exists(p) else 0
-                    self.tab_export.note(f"{p}  ({size:.2f} MB, {kind})")
-                    saved.append((kind, p, size))
-            self.session.csv_rec = None
-            self.session.raw_rec = None
-            self.tab_export.set_recording_text("")
+            try:
+                # Each recorder on its own: a CSV that cannot be closed (disk
+                # full) must not leave the raw file open with no sidecar, and
+                # neither may be left on the session pointing at a dead file.
+                for attr, kind in (("csv_rec", "CSV"), ("raw_rec", "raw")):
+                    got = self._close_recorder(attr, kind)
+                    if got is not None:
+                        saved.append(got)
+            finally:
+                self.tab_export.set_recording_text("")
+                self._refresh_record_dot()
             self._report_saved(saved)
+            return
         self._refresh_record_dot()
+
+    def _close_recorder(self, attr, kind):
+        """Close one recorder and say where it went; (kind, path, MB) or None.
+
+        The session attribute is cleared before the close, so a close that
+        raises still leaves nothing for the next tick to write into.
+        """
+        rec = getattr(self.session, attr)
+        setattr(self.session, attr, None)
+        if rec is None:
+            return None
+        try:
+            p = rec.close()
+            size = os.path.getsize(p) / 1e6 if os.path.exists(p) else 0
+        except Exception as exc:
+            self.session.log(
+                f"WARNING: could not close the {kind} recording "
+                f"{getattr(rec, 'path', '?')} cleanly "
+                f"({type(exc).__name__}: {exc}) -- it may be incomplete")
+            return None
+        self.tab_export.note(f"{p}  ({size:.2f} MB, {kind})")
+        return kind, p, size
 
     def _encoder_datum(self):
         """Where the counts arriving now sit against the controllers.
@@ -1160,6 +1465,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tab_export.set_recording_text(txt)
 
     def on_snapshot(self):
+        # Snapshot stops the stream. During a sweep or a tare that is the
+        # measurement being taken away from it, with nothing to say so.
+        if self._refuse_while_running("snapshot"):
+            return
+        if (self.session.volume_runner is not None
+                or self.session.collecting is not None):
+            self.session.log("snapshot refused: a volume map or a "
+                             "tare/magnet/roll collection is running on the "
+                             "stream, and a snapshot would stop it")
+            return
         if not isinstance(self.session.source, LiveSource):
             QtWidgets.QMessageBox.information(
                 self, "Snapshot",
@@ -1173,6 +1488,8 @@ class MainWindow(QtWidgets.QMainWindow):
                      f"own clock, and capturing {secs:g} s losslessly")
         self.session.source.stop()
         self.session.source = None
+        self.raw_hist = None
+        self.raw_hist_n = 0
         self.act_snapshot.setEnabled(False)
         self.lbl_state.setText("snapshot in progress...")
         self._snap_worker = SnapshotWorker(self.session.hosts, secs, path,
@@ -1188,7 +1505,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_snapshot.setEnabled(True)
         if error:
             self.session.log(f"snapshot failed: {error}")
-            QtWidgets.QMessageBox.critical(self, "Snapshot failed", error)
+            if not self._closing:
+                QtWidgets.QMessageBox.critical(self, "Snapshot failed", error)
         else:
             size = os.path.getsize(path) / 1e6
             self.tab_export.note(f"{path}  ({size:.2f} MB raw, {fs_hz/1e3:g} kSPS)")
@@ -1210,28 +1528,81 @@ class MainWindow(QtWidgets.QMainWindow):
                      if on else "view resumed")
 
     def on_out_rate(self):
-        self.session.out_rate = float(self.cmb_out.currentData())
+        new = float(self.cmb_out.currentData())
+        if new == self.session.out_rate:
+            return
+        if self.session.volume_runner is not None:
+            # A map's rows are decimated at the rate it started with, and the
+            # Machine tab already warns that the map would be wrong. Refuse,
+            # and put the combo back without calling this slot again.
+            self.cmb_out.blockSignals(True)
+            self.cmb_out.setCurrentIndex(
+                self.cmb_out.findData(self.session.out_rate))
+            self.cmb_out.blockSignals(False)
+            self.session.log(
+                f"output rate change to {new:g} Hz refused: a volume map is "
+                f"running and its rows are at {self.session.out_rate:g} Hz. "
+                f"Change it when the map is done.")
+            return
+        self.session.out_rate = new
         self.session.roll.resize(max(4, int(self.session.out_rate * self.window_s)))
         self.session.new_decimator()
         self.session.log(f"output rate {self.session.out_rate:g} Hz "
                      f"(decimation {self.session.decim()}x from the stream)")
+        if self.session.csv_rec is not None:
+            # The open file keeps the rate, samples-per-row and encoder datum
+            # it was opened with, so carrying on into it would advance t_s at
+            # the old rate under a header that says so, and make the absolute
+            # position columns jump by however far the counter had moved --
+            # with nothing in the file to show it. A new file, whose header
+            # describes its own rows. The datum is taken AFTER new_decimator():
+            # that call starts a new count basis.
+            self.session.enc_datum = self._encoder_datum()
+            self._roll_over_csv("the output rate")
+            self._log_encoder_columns()
 
     def on_window(self, v):
         self.window_s = float(v)
         self.session.roll.resize(max(4, int(self.session.out_rate * self.window_s)))
+
+    def _finish_background_threads(self):
+        """Wait, bounded, for the connect and snapshot threads before closing.
+
+        Only the motion workers used to be waited on. Closing during the ~30 s
+        connect left its streamers running and the carriers' sample-rate
+        divider unrestored, because the source it was about to deliver was
+        never received; closing during a snapshot destroyed a QThread that was
+        still running, which takes the process down.
+
+        The connect cannot be cancelled, so it is waited for, and the result it
+        emits is taken here so that _disconnect() can stop the source and put
+        the clock back. A snapshot restores the clock itself before it ends.
+        """
+        worker = self._connect_worker
+        if self._connecting:
+            if is_running(worker) and not worker.wait(40000):
+                self.session.log("closing while a connect is still in "
+                                 "progress and not answering")
+            else:
+                # done() is emitted from the worker's thread and waits in the
+                # queue for an event loop that is blocked in here; it may also
+                # have been emitted before the thread finished, so this runs
+                # whether or not the wait was needed.
+                QtWidgets.QApplication.processEvents()
+        snap = self._snap_worker
+        if is_running(snap) and not snap.wait(60000):
+            # Still running: dropping our reference would destroy a live
+            # QThread. Park it where it outlives the window.
+            _ORPHANED_THREADS.append(snap)
 
     def closeEvent(self, ev):
         if self.session.prof.enabled:
             print(self.session.prof.text())
             print(f"\nevent loop lag: mean {self.session.lag.mean_ms:.1f} ms, "
                   f"worst {self.session.lag.max_ms:.0f} ms -- {self.session.lag.verdict()}")
-        # Before the recording is stopped, not after: stopping it is what
-        # would otherwise raise the "saved to" box, and that box would then be
-        # asking to be dismissed by a window that is already going away. The
-        # path is still in the Log and on the Data output tab.
-        self._closing = True
-        if self.act_record.isChecked():
-            self.act_record.setChecked(False)
+        # The question comes FIRST. The recording used to be stopped before it
+        # was asked, so answering Cancel left a window that looked untouched
+        # with its recording silently closed.
         if self.motion.busy():
             # Ask before walking away from a moving machine. Closing used to
             # go straight through to stages.close(), which does not stop
@@ -1250,10 +1621,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.StandardButton.Cancel)
             if reply != QtWidgets.QMessageBox.StandardButton.Close:
                 # Still open, and still a window someone will record from.
-                self._closing = False
                 ev.ignore()
                 return
+        # Going ahead from here. Before the recording is stopped, not after:
+        # stopping it is what would otherwise raise the "saved to" box, and
+        # that box would then be asking to be dismissed by a window that is
+        # already going away. The path is still in the Log and on the Data
+        # output tab.
+        self._closing = True
+        if self.act_record.isChecked():
+            self.act_record.setChecked(False)
+        if self.motion.busy():
             self.motion.trigger("the window was closed while a job was running")
+        self._finish_background_threads()
         for w in self.motion.all_workers():
             if is_running(w):
                 # Bounded: a worker wedged inside a DLL call must not stop the
@@ -1267,5 +1647,5 @@ class MainWindow(QtWidgets.QMainWindow):
             # close() stops each axis on the way out; see Stage.close.
             self.session.stages.close()
             self.session.stages = None
-        self.on_disconnect()
+        self._disconnect()
         super().closeEvent(ev)

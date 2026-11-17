@@ -60,12 +60,21 @@ class Session:
         err = self.config_errors.append
 
         self.geom = pgeom.Geometry.load_or_default(args.geometry, on_error=err)
+        cal_errors = []
+
+        def cal_err(msg):
+            cal_errors.append(msg)
+            err(msg)
+
         self.cal = ocal.Calibration.load_or_default(args.calibration,
-                                                    on_error=err)
+                                                    on_error=cal_err)
         # "Present and readable", not merely "present" -- a file that exists
-        # and failed to parse must not be reported as loaded.
+        # and failed to parse must not be reported as loaded. Judged by the
+        # calibration's own errors only: config_errors also holds geometry and
+        # machine problems, and a bad geometry file made the report claim no
+        # calibration had been found.
         self.cal_from_file = (os.path.exists(args.calibration)
-                              and not self.config_errors)
+                              and not cal_errors)
 
         # The machine the probe is measuring inside: which coils, which of them
         # are live, and where the head sits among them. Loaded before the UI so

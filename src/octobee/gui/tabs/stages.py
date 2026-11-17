@@ -31,6 +31,7 @@ import time
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from octobee.gui.estop import is_running
 from octobee.gui.sources import LiveSource
 from octobee.gui.workers import ScanWorker, StageWorker, _stage_set_for
 from octobee.motion import scan as oscan
@@ -433,12 +434,47 @@ class StagesTab(QtWidgets.QWidget):
                          f"on-axis accuracy is ~47 um rather than <5 um")
 
         self._stage_pending = stages
-        self.stage_action("connect", work)
+        if not self.stage_action("connect", work):
+            self._undo_pending_connect()
+
+    def _undo_pending_connect(self):
+        """Put Connect back as it was when stage_action refused to run.
+
+        The pending set and the disabled button are both taken before the
+        action is asked for, and a refusal (e-stop latched, a job running) used
+        to leave them taken: nothing was in flight to ever finish and clear
+        them, so after an e-stop pressed while disconnected the stages could
+        not be connected again until the program was restarted.
+        """
+        self._stage_pending = None
+        self.btn_stage_connect.setEnabled(True)
+
+    def what_is_running(self):
+        """What is moving the machine or measuring with it, or None.
+
+        By motion.busy() first, not by asking the scan thread: a worker
+        reports done() from inside run(), so for a moment after it has been
+        retired it still says it is running, and anything that re-enabled
+        itself on "the map has ended" would stay grey.
+        """
+        if self.motion.busy():
+            return ("a field map" if is_running(self._scan_worker)
+                    else "a stage job or sweep")
+        if self.session.volume_runner is not None:
+            return "a volume map"
+        return None
 
     def on_stage_disconnect(self):
         if self._scan_worker is not None and self._scan_worker.isRunning():
             QtWidgets.QMessageBox.information(
                 self, "Stages", "A field map is running. Abort it first.")
+            return
+        # Closing the stages stops no move -- it takes the controllers away
+        # from a StageWorker or a sweep that is in the middle of one.
+        what = self.what_is_running()
+        if what is not None:
+            self.session.log(f"stages: close refused -- {what} is running. "
+                             f"Stop it first.")
             return
         if self.session.stages is not None:
             self.session.stages.close()
@@ -453,20 +489,29 @@ class StagesTab(QtWidgets.QWidget):
         self.stages_changed.emit()
 
     def stage_action(self, what, fn):
-        """Run one blocking stage command in a worker, one at a time."""
+        """Run one blocking stage command in a worker, one at a time.
+
+        Returns True if it was started and False if it was refused, so that a
+        caller which prepared state for it can undo that.
+        """
         if self.motion.latched:
             self.session.log(f"stages: {what} refused — emergency stop is latched "
                          f"({self.motion.reason}). Reset it first.")
-            return
+            return False
         if self.motion.busy():
             self.session.log("stages: busy — wait for the current move to finish")
-            return
+            return False
         self._stage_worker = StageWorker(what, fn)
         self._stage_worker.progress.connect(self.session.log)
         self._stage_worker.done.connect(self.on_stage_action_done)
-        self.motion.register(self._stage_worker)
+        # Started before it is registered: register() announces the change, a
+        # handler of that announcement asks motion.busy(), and busy() drops a
+        # registered worker that is not running yet -- which un-registered
+        # the job it was supposed to be counting.
         self._stage_worker.start()
+        self.motion.register(self._stage_worker)
         self.sync_controls()
+        return True
 
     def on_stage_action_done(self, what, error):
         self.motion.retire(self._stage_worker)
@@ -935,8 +980,9 @@ class StagesTab(QtWidgets.QWidget):
         self._scan_worker.progress.connect(self.on_scan_progress)
         self._scan_worker.done.connect(self.on_scan_done)
         self._scan_t0 = time.time()
-        self.motion.register(self._scan_worker)
+        # Started first, for the reason given in stage_action.
         self._scan_worker.start()
+        self.motion.register(self._scan_worker)
         self.sync_controls()
 
     def on_scan_progress(self, i, n, where, sem_ut):
@@ -964,11 +1010,25 @@ class StagesTab(QtWidgets.QWidget):
         self.sync_controls()
         if error:
             self.session.log(f"field map failed: {error}")
+        # Saved BEFORE the warning, not after. The warning is modal, so with it
+        # first a partial map from a scan that failed at 3 a.m. stayed in memory
+        # until somebody came and clicked OK -- and if the save then raised,
+        # the map was gone with nothing on disk.
+        if fm is not None and len(fm):
+            self._save_field_map(fm)
+        if error:
             QtWidgets.QMessageBox.warning(self, "Field map", error)
-        if fm is None or not len(fm):
+
+    def _save_field_map(self, fm):
+        try:
+            path = fm.save(os.path.join(
+                self.session.out_dir, time.strftime("fieldmap_%Y%m%d_%H%M%S")))
+        except Exception as exc:
+            self.session.log(
+                f"field map: COULD NOT SAVE {len(fm)} points "
+                f"({type(exc).__name__}: {exc}) -- the map is lost when this "
+                f"window closes")
             return
-        path = fm.save(os.path.join(
-            self.session.out_dir, time.strftime("fieldmap_%Y%m%d_%H%M%S")))
         sem = np.array([s.get("sem_ut", np.nan) for s in fm.stats])
         self.session.log(
             f"field map: {len(fm)} of {fm.meta['n_requested']} points, "
@@ -1021,7 +1081,9 @@ class StagesTab(QtWidgets.QWidget):
         stages = _stage_set_for(mapping)
         self._stage_pending = stages
         self.btn_stage_connect.setEnabled(False)
-        self.stage_action("connect", lambda emit: stages.open())
+        if not self.stage_action("connect", lambda emit: stages.open()):
+            self._undo_pending_connect()
+            return False
         return True
 
 

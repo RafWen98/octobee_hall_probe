@@ -310,7 +310,41 @@ class CalibrationTab(QtWidgets.QWidget):
                 f"wrong range is invisible on screen and simply rescales "
                 f"everything.")
 
+    def _volume_map_running(self, what):
+        """True, after saying why, if `what` would change the calibration mid-map.
+
+        A volume map records the calibration id it started with in its
+        metadata, once. A tare, a range, a gain trim or a loaded calibration
+        during the sweep changes the conversion under rows that are still
+        arriving, and nothing in the finished map says so. So these are refused
+        up front, before anything is applied: refusing afterwards would mean
+        undoing a change that has already reached the stream.
+        """
+        if self.session.volume_runner is None:
+            return False
+        self.session.log(f"{what} refused: a volume map is running, and it "
+                         f"recorded the calibration it started with. Change "
+                         f"the calibration when the map has finished.")
+        return True
+
+    def abandon_collection(self, why):
+        """Drop a tare, roll sweep or magnet pass that was in progress.
+
+        Called when the stream under it goes away. The collection counts
+        samples, not seconds, so left alone it would carry on from wherever it
+        got to on the NEXT connection and average two streams into one result.
+        """
+        c = self.session.collecting
+        if c is None:
+            return
+        self.session.collecting = None
+        if c["what"] == "magnet":
+            self.btn_magnet.setChecked(False)
+        self.session.log(f"{c['what']} collection abandoned: {why}")
+
     def start_collect(self, what, seconds):
+        if what == "tare" and self._volume_map_running("zeroing"):
+            return
         if self.session.source is None:
             self.session.log("not connected")
             return
@@ -381,6 +415,9 @@ class CalibrationTab(QtWidgets.QWidget):
         trim, silently. Collecting the uncorrected field in the first place
         means there is nothing to invert.
         """
+        if self._volume_map_running("zeroing"):
+            # Started before the map, finished during it.
+            return
         z = self.session.cal.tare(data)
         self.session.log(f"zeroed on {data.shape[0]} points; "
                      f"largest offset removed {np.abs(z).max():.4f} mT "
@@ -470,6 +507,8 @@ class CalibrationTab(QtWidgets.QWidget):
     def on_apply_roll(self):
         if self.session.pose_solution is None:
             return
+        if self._volume_map_running("applying the roll calibration"):
+            return
         sol = self.session.pose_solution
         warn = []
         if not sol.identified[:, 2].all():
@@ -500,7 +539,7 @@ class CalibrationTab(QtWidgets.QWidget):
         self.session.log("roll calibration applied: matrix + offsets installed, "
                      f"magnet gain trim cleared; gain spread was "
                      f"{(np.nanmax(g)-np.nanmin(g))*100:.2f} %")
-        self.chk_vcm.setChecked(self.session.cal.subtract_vcm)
+        self._show_vcm_state()
         self.calibration_changed.emit("the roll calibration")
         self.refresh_cal_report()
 
@@ -528,7 +567,20 @@ class CalibrationTab(QtWidgets.QWidget):
             self.session.log(f"loaded sweep {sw.tag} from {os.path.basename(f)}")
         self._refresh_sweep_label()
 
+    def _show_vcm_state(self):
+        """Make the checkbox show the calibration, without acting on it.
+
+        setChecked() fires on_vcm_toggle, which emits calibration_changed; the
+        caller emits it again straight after, so a recording rolled over twice
+        in a row and left an empty file between the two.
+        """
+        self.chk_vcm.blockSignals(True)
+        self.chk_vcm.setChecked(self.session.cal.subtract_vcm)
+        self.chk_vcm.blockSignals(False)
+
     def on_clear_tare(self):
+        if self._volume_map_running("clearing the zero"):
+            return
         self.session.cal.clear_tare()
         self.session.log("zero cleared")
         self.calibration_changed.emit("the zero point")
@@ -574,6 +626,8 @@ class CalibrationTab(QtWidgets.QWidget):
 
     def on_apply_gain(self):
         if self.session.magnet_peaks is None:
+            return
+        if self._volume_map_running("applying the gain trim"):
             return
         w = None
         if self.chk_geom.isChecked():
@@ -623,12 +677,19 @@ class CalibrationTab(QtWidgets.QWidget):
             box.setVisible(bool(on))
 
     def on_clear_gain(self):
+        if self._volume_map_running("clearing the gain trim"):
+            return
         self.session.cal.clear_gain()
         self.session.log("gain trim cleared")
         self.calibration_changed.emit("the gain trim")
         self.refresh_cal_report()
 
     def on_range_changed(self, row, value):
+        if self._volume_map_running(f"changing the S{row+1} range"):
+            # The table's combo has already moved; put it back (set_ranges
+            # does not signal).
+            self._set_ranges(self.session.cal.ranges_mt)
+            return
         self.session.cal.ranges_mt[row] = value
         self.session.log(f"S{row+1} range set to +/-{value:g} mT "
                      f"({ob.RANGE_TO_VPT[value]:g} V/T)")
@@ -636,6 +697,9 @@ class CalibrationTab(QtWidgets.QWidget):
         self.refresh_cal_report()
 
     def on_vcm_toggle(self, on):
+        if self._volume_map_running("changing VCM subtraction"):
+            self._show_vcm_state()
+            return
         self.session.cal.subtract_vcm = bool(on)
         if not on:
             self.session.log("WARNING: VCM subtraction off -- readings now include "
@@ -691,6 +755,8 @@ class CalibrationTab(QtWidgets.QWidget):
                 + (f", archived as {os.path.basename(kept)}" if kept else ""))
 
     def on_load_cal(self):
+        if self._volume_map_running("loading a calibration"):
+            return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Load calibration", ".", "JSON (*.json)")
         if not path:
@@ -709,7 +775,7 @@ class CalibrationTab(QtWidgets.QWidget):
             return
         self.session.cal = cal
         self._set_ranges(self.session.cal.ranges_mt)
-        self.chk_vcm.setChecked(self.session.cal.subtract_vcm)
+        self._show_vcm_state()
         self.calibration_changed.emit("the whole calibration")
         self.refresh_cal_report()
         self.session.log(f"calibration loaded from {path}")
@@ -727,7 +793,22 @@ class CalibrationTab(QtWidgets.QWidget):
             f"'Reload geometry'.")
 
     def on_reload_geometry(self):
-        self.session.geom = pgeom.Geometry.load_or_default(self.session.args.geometry)
+        problems = []
+        geom = pgeom.Geometry.load_or_default(self.session.args.geometry,
+                                              on_error=problems.append)
+        if problems:
+            # A typo in the file used to substitute the nominal geometry and
+            # then log "geometry reloaded", which is the opposite of what
+            # happened. The nominal one is a guess about which chip is on which
+            # face; the geometry already in use is at least the one that was
+            # read from a file.
+            for msg in problems:
+                self.session.log(f"WARNING: {msg}")
+            self.session.log("geometry NOT reloaded -- keeping the geometry "
+                             "already in use. Fix the file and press Reload "
+                             "again.")
+            return
+        self.session.geom = geom
         self.session.probe_cloud = None
         # The 3D views, the plot and the sensor table all draw geometry.
         self.geometry_changed.emit()
