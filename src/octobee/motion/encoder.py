@@ -122,6 +122,25 @@ WRAP = 1 << 32
 CALIBRATION_SPAN_MM = 100.0
 CALIBRATION_POINTS = 11
 
+# How many times each axis is run over its span. One run cannot say how
+# repeatable it is: y came back 1.1% apart between two runs of the old
+# procedure and nothing in either run said so. Three passes is the least that
+# gives a spread worth quoting; they alternate direction through the points so
+# that a drift in time is not mistaken for a scale.
+CALIBRATION_PASSES = 3
+
+# How far below each target the axis is parked before it is sent there, so
+# that every reading is taken after an approach from the same side. Backlash
+# then becomes a constant offset instead of a slope error. Clamped to a tenth
+# of an axis's travel, so a very short axis is not asked for more than it has.
+APPROACH_MM = 2.0
+
+# Passes of the same axis that disagree by more than this are not a
+# measurement, and the result is not written to stages.json. 500 ppm is 0.05%,
+# or 0.15 mm across a 300 mm axis: tight enough to be useful and well clear of
+# the 0.1% the axes-agree check is run at.
+PASS_SPREAD_LIMIT_PPM = 500.0
+
 # Under this there is no span worth fitting over, whatever was asked for.
 MIN_CALIBRATION_SPAN_MM = 5.0
 
@@ -529,3 +548,100 @@ def fit_scale(counts_before, counts_after, moved_mm,
     return fit.column, fit.counts_per_mm, (
         f"column {fit.column}, {fit.counts_per_mm:+,.1f} counts/mm from "
         f"{moved_mm:g} mm")
+
+
+def nonlinearity_um(positions_mm, counts_col):
+    """How far a straight line is from the best parabola, in micrometres.
+
+    The scale is one number for the whole axis. If the axis is not linear --
+    a leadscrew with a pitch error that builds up along it, a mount that
+    flexes -- then the scale depends on which stretch it was measured over,
+    which is what a "wrong" scale that changes with the span looks like. This
+    is the largest gap between the line the scale describes and a quadratic
+    through the same points, over the span covered. Near the residual means
+    the axis is straight; far above it means a single number cannot describe
+    it. Returns None when there are too few distinct points to ask.
+    """
+    pos = np.asarray(positions_mm, dtype=float).ravel()
+    c = np.asarray(counts_col, dtype=float).ravel()
+    if len(pos) < 4 or len(np.unique(np.round(pos, 3))) < 4:
+        return None
+    line = np.polyfit(pos, c, 1)
+    quad = np.polyfit(pos, c, 2)
+    xs = np.linspace(pos.min(), pos.max(), 101)
+    gap = np.max(np.abs(np.polyval(quad, xs) - np.polyval(line, xs)))
+    return float(gap / abs(line[0]) * 1000.0)
+
+
+def _line_with_error(x, y):
+    """(slope, intercept, slope standard error, rms residual) of y on x."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    design = np.column_stack([x, np.ones_like(x)])
+    (slope, intercept), *_ = np.linalg.lstsq(design, y, rcond=None)
+    resid = y - design @ np.array([slope, intercept])
+    sxx = float(np.sum((x - x.mean()) ** 2))
+    rms = float(np.sqrt(np.mean(resid ** 2)))
+    if n > 2 and sxx > 0:
+        se = float(np.sqrt(np.sum(resid ** 2) / (n - 2) / sxx))
+    else:
+        se = None
+    return float(slope), float(intercept), se, rms
+
+
+def fit_reference(tape_mm, controller_mm, counts):
+    """Fit an axis against a length that is not the axis's own.
+
+    `tape_mm` is what a ruler, dial indicator or similar said at each
+    standstill, `controller_mm` is what the controller reported, and `counts`
+    is the (n, columns) counter block read at the same stops. Everything else
+    in this module compares the encoder with the controller, and both are on
+    the same motor, so a leadscrew or a unit conversion that is wrong is wrong
+    in both and cannot show. This is the one place a number from outside comes
+    in.
+
+    Returns a dict, or {"why": ...} when it cannot:
+      controller_factor      true mm per controller mm. 1.000 means the stage
+                             travels what it says it does.
+      controller_factor_se   its standard error from the scatter of the
+                             readings -- the honest limit on what the ruler
+                             could resolve
+      counts_per_mm          counts per TRUE millimetre, signed like the
+                             encoder column is wired
+      counts_per_mm_se_rel   its standard error as a fraction
+      tape_residual_mm       rms scatter of the readings about the line
+      column, n
+    The sign of the tape is ignored: a ruler read from the other end is a fact
+    about the ruler.
+    """
+    tape = np.asarray(tape_mm, dtype=float).ravel()
+    ctrl = np.asarray(controller_mm, dtype=float).ravel()
+    c = np.asarray(counts, dtype=float)
+    if len(tape) != len(ctrl) or len(tape) != len(c):
+        return {"why": "tape, controller and counts do not have the same "
+                       "number of readings"}
+    if len(tape) < 3:
+        return {"why": "a scale checked against a ruler needs at least three "
+                       "readings"}
+    if not np.isfinite(tape).all():
+        return {"why": "a ruler reading was not a number"}
+    drive = fit_axis(ctrl, c)
+    if not drive:
+        return {"why": drive.why}
+    a, _b, a_se, resid = _line_with_error(ctrl, tape)
+    k, _k0, k_se, _ = _line_with_error(tape, c[:, drive.column])
+    if abs(a) < 1e-9:
+        return {"why": "the ruler did not move while the controller did"}
+    sign = 1.0 if drive.counts_per_mm >= 0 else -1.0
+    return {
+        "column": int(drive.column),
+        "controller_factor": float(abs(a)),
+        "controller_factor_se": None if a_se is None else float(a_se),
+        "counts_per_mm": float(sign * abs(k)),
+        "counts_per_mm_se_rel": (None if k_se is None or not k
+                                 else float(k_se / abs(k))),
+        "tape_residual_mm": float(resid),
+        "n": int(len(tape)),
+        "span_mm": float(ctrl.max() - ctrl.min()),
+    }

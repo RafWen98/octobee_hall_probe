@@ -764,6 +764,7 @@ def test_sweep_stops_when_a_line_does_not_run(workdir):
     print("\nlines that do not complete")
     v = osweep.Volume((0.0, 0.0, 0.0), (20.0, 0.0, 0.0), step_mm=10.0,
                       sweep="x")
+    travel = dict.fromkeys("xyz", (0.0, 300.0))
 
     # An axis that takes the command and goes nowhere.
     rig = _Rig()
@@ -771,7 +772,7 @@ def test_sweep_stops_when_a_line_does_not_run(workdir):
     rig.axes["x"].move_to = (lambda mm, timeout_s=None, wait=True:
                              real(mm, wait=wait) if wait else None)
     log = osweep.SweepLog()
-    runner = osweep.SweepRunner(rig, osweep.plan(v), log,
+    runner = osweep.SweepRunner(rig, osweep.plan(v, travel_mm=travel), log,
                                 log_fn=lambda _m: None)
     try:
         runner.run()
@@ -794,7 +795,8 @@ def test_sweep_stops_when_a_line_does_not_run(workdir):
             raise ostage.MoveAborted("aborted")
 
     rig.move_to = move_to
-    runner = osweep.SweepRunner(rig, osweep.plan(v), osweep.SweepLog(),
+    runner = osweep.SweepRunner(rig, osweep.plan(v, travel_mm=travel),
+                                osweep.SweepLog(),
                                 log_fn=lambda _m: None)
     flag = {"n": 0}
 
@@ -807,3 +809,175 @@ def test_sweep_stops_when_a_line_does_not_run(workdir):
           calls and calls[0] is abort)
     check("and an abort during it ends the sweep with nothing swept",
           runner.aborted and done == 0)
+
+
+def test_plan_edges_only():
+    """An outline of the box: its twelve edges and nothing else."""
+    print("\nedges only")
+    v = osweep.Volume((0.0, 0.0, 0.0), (300.0, 200.0, 100.0), step_mm=10.0,
+                      sweep="x")
+    travel = {"x": (0.0, 300.0), "y": (0.0, 300.0), "z": (0.0, 300.0)}
+    p = osweep.plan(v, edges=True, shell=True, slices=3, travel_mm=travel)
+    check("fifteen lines: all twelve edges, three of them twice",
+          len(p) == 15, f"{len(p)} lines")
+    lo, hi = {"x": 0.0, "y": 0.0, "z": 0.0}, {"x": 300.0, "y": 200.0,
+                                              "z": 100.0}
+    check("each runs the whole length of its axis, no overshoot",
+          all(ln.start_mm == lo[ln.sweep] and ln.stop_mm == hi[ln.sweep]
+              and ln.run_in_mm == 0.0 and ln.run_out_mm == 0.0
+              for ln in p.lines))
+    check("every one of the twelve edges is covered",
+          len({(ln.sweep, tuple(sorted(ln.fixed.items())))
+               for ln in p.lines}) == 12
+          and all(all(at in (lo[k], hi[k]) for k, at in ln.fixed.items())
+                  for ln in p.lines))
+    check("one continuous path: each line starts where the last one ended",
+          all(a.end() == b.approach() for a, b in zip(p.lines, p.lines[1:])),
+          "a gap means a move off the outline")
+    check("which means some edges run backwards",
+          any(ln.reverse for ln in p.lines)
+          and all(ln.to_mm < ln.from_mm for ln in p.lines if ln.reverse))
+    check("no settle at the corners",
+          p.settle_s == 0.0, str(p.settle_s))
+    check("tagged as edges, shell and slices ignored",
+          all(ln.part == "edge" for ln in p.lines) and p.slices is None
+          and "continuous path" in p.describe())
+    one_way = sum(abs(ln.to_mm - ln.from_mm) for ln in p.lines)
+    check("and no time is charged for return moves after the first line",
+          p.duration_s() < 1.2 * (one_way / p.speed_mm_s
+                                  + abs(p.lines[0].to_mm
+                                        - p.lines[0].from_mm) / 5.0),
+          f"{p.duration_s():.0f} s for {one_way:.0f} mm")
+
+    flat = osweep.Volume((0.0, 0.0, 0.0), (300.0, 0.0, 100.0), step_mm=10.0)
+    fp = osweep.plan(flat, edges=True)
+    check("a flat box is still one continuous path, with no zero-length lines",
+          all(ln.span_mm > 0 for ln in fp.lines)
+          and all(a.end() == b.approach()
+                  for a, b in zip(fp.lines, fp.lines[1:]))
+          and len({(ln.sweep, tuple(sorted(ln.fixed.items())))
+                   for ln in fp.lines}) == 4)
+
+    mask = np.ones(v.shape, bool)
+    mask[14:17, 0, 0] = False                  # a coil across one x edge
+    cut = osweep.plan(v, edges=True, reachable=mask)
+    check("a coil across an edge splits it and says the path is broken",
+          len(cut) == 16 and "broken" in cut.describe(), cut.describe())
+
+
+def test_edge_trace_runs_without_moves_between_lines():
+    """The outline is driven as one path: no move between one line and the next."""
+    print("\nrunning the edge trace")
+    rig = _Rig(speed=200.0)
+    v = osweep.Volume((0.0, 0.0, 0.0), (20.0, 20.0, 20.0), step_mm=10.0)
+    p = osweep.plan(v, edges=True, speed_mm_s=200.0, log_hz=500.0)
+    rig["x"].move_to(7.0)                  # somewhere off the outline
+    moves = []
+    real_move_to = rig.move_to
+
+    def counting_move_to(timeout_s=None, settle_s=0.0, **coords):
+        moves.append(dict(coords))
+        real_move_to(timeout_s=timeout_s, settle_s=settle_s, **coords)
+
+    rig.move_to = counting_move_to
+    log = osweep.SweepLog(pgeom.Geometry(), {"why": "a test"})
+    runner = osweep.SweepRunner(rig, p, log, log_fn=lambda _m: None)
+    runner.run()
+    check("every line of the outline was run", runner.lines_done == len(p),
+          f"{runner.lines_done} of {len(p)}")
+    check("only the first line needed a move to its start",
+          len(moves) == 1 and moves[0] == p.lines[0].approach(),
+          f"{len(moves)} approach move(s)")
+    check("and the probe finishes at the end of the path",
+          all(abs(rig.position()[k] - mm) < 1e-6
+              for k, mm in p.lines[-1].end().items()), str(rig.position()))
+
+
+def test_a_box_past_the_travel_is_refused_before_anything_moves():
+    """x from 100, size 300 is x = 400: say so, and do not move at all."""
+    print("\na box past the end of the travel")
+    v = osweep.Volume((100.0, 0.0, 0.0), (400.0, 300.0, 300.0), step_mm=50.0)
+    travel = dict.fromkeys("xyz", (0.0, 300.0))
+    why = v.outside(travel)
+    check("the box says which axis it leaves the travel on, and by how much",
+          len(why) == 1 and why[0].startswith("x:") and "400" in why[0],
+          str(why))
+    check("a box inside the travel has nothing to say",
+          osweep.Volume.whole_travel(travel).outside(travel) == [])
+
+    rig = _Rig(speed=200.0)
+    rig["x"].move_to(7.0)
+    p = osweep.plan(v, edges=True, speed_mm_s=200.0)
+    check("the plan knows it reaches x = 400",
+          p.reach_mm()["x"] == (100.0, 400.0), str(p.reach_mm()))
+    runner = osweep.SweepRunner(rig, p, osweep.SweepLog(pgeom.Geometry(), {}),
+                                log_fn=lambda _m: None)
+    try:
+        runner.run()
+        refused = ""
+    except ValueError as exc:
+        refused = str(exc)
+    check("the runner refuses it up front",
+          "nothing was moved" in refused and "x needs 100...400" in refused,
+          refused[:120])
+    check("and nothing moved",
+          rig.position() == {"x": 7.0, "y": 0.0, "z": 0.0}
+          and runner.lines_done == 0, str(rig.position()))
+
+
+def test_crash_safe_parts(workdir):
+    """The log writes .csv parts as it goes, and they hold the same rows."""
+    print("\ncrash-safe .csv parts")
+    rig = _Rig(speed=40.0)
+    v = osweep.Volume((10.0, 0.0, 0.0), (60.0, 60.0, 0.0), step_mm=20.0,
+                      sweep="x")
+    p = osweep.plan(v, speed_mm_s=40.0, log_hz=500.0, settle_s=0.0,
+                    travel_mm=dict.fromkeys("xyz", (0.0, 300.0)))
+    pose = omach.Placement(x_mm=1000.0, rot_z_deg=90.0)
+    log = osweep.SweepLog(pgeom.Geometry(), {"why": "a test"})
+    parts = os.path.join(workdir, "vol_parts")
+    said = []
+    log.keep_parts(parts, 500.0, pose, every_rows=200, log_fn=said.append)
+    runner = osweep.SweepRunner(rig, p, log, log_fn=lambda _m: None)
+    stop = threading.Event()
+
+    def tick():
+        while not stop.is_set():
+            if runner.logging:
+                rows = np.zeros((10, pgeom.N_SENSORS, 3), dtype=np.float32)
+                rows[:, 0, 0] = rig["x"].position_mm / 1000.0
+                log.add_block(rows, time.time() - 10 / 500.0,
+                              runner.line_index)
+            time.sleep(0.02)
+
+    feeder = threading.Thread(target=tick, daemon=True)
+    feeder.start()
+    runner.run()
+    stop.set()
+    feeder.join(timeout=2.0)
+    log.checkpoint(force=True)          # what the GUI does if the save fails
+    log.finish_parts()
+
+    files = sorted(f for f in os.listdir(parts) if f.endswith(".csv"))
+    check("parts were written during the run", len(files) >= 2,
+          f"{files} {said[-1:]}")
+    check("with no half-written files left behind",
+          not [f for f in os.listdir(parts) if f.endswith(".tmp")])
+    tables = [np.loadtxt(os.path.join(parts, f), delimiter=",", skiprows=1,
+                         ndmin=2) for f in files]
+    got = np.concatenate(tables)
+    t_s, pos, machine, b_mt, line_index, _in_span, _c = log.assemble(500.0,
+                                                                     pose)
+    check("together they hold every row, once", len(got) == log.n_rows,
+          f"{len(got)} vs {log.n_rows}")
+    check("with the same times, lines and field",
+          np.allclose(got[:, 0], t_s, atol=2e-6)
+          and np.array_equal(got[:, 1].astype(int), line_index)
+          and np.allclose(got[:, 9], b_mt[:, 0, 0], rtol=1e-6))
+    check("and the same positions as the full map",
+          np.allclose(got[:, 3:6], pos, atol=2e-5, equal_nan=True)
+          and np.allclose(got[:, 6:9], machine, atol=2e-5, equal_nan=True))
+
+    log.drop_parts()
+    check("and they are removed once the full map is safe",
+          not os.path.exists(parts))
