@@ -10,7 +10,10 @@ it produces.
 
 import numpy as np
 
-from octobee.gui.workers import EncoderCalibrationWorker
+from octobee.gui.workers import (
+    EncoderCalibrationWorker,
+    EncoderReferenceWorker,
+)
 from octobee.motion import encoder as oenc
 from tests.helpers import (
     check,
@@ -94,7 +97,7 @@ def _run(stages, span_mm=100.0, points=11):
     # The settle exists so a reading is not taken mid-move. These carriages
     # arrive instantly, so it is only wall-clock time here.
     worker.SETTLE_S = 0.0
-    worker.FRESH_TIMEOUT_S = 0.0
+    worker.STABLE_TIMEOUT_S = 0.0
     out = {}
     worker.message.connect(lambda m: out.setdefault("msgs", []).append(m))
     worker.done.connect(lambda f, e: out.update(found=f, error=e))
@@ -129,16 +132,22 @@ def test_a_stage_that_stops_short_no_longer_poisons_the_scale():
     check("every axis is left where it was found",
           all(abs(stages[a].true_mm - starts[a]) < 0.1 for a in starts),
           str({a: round(stages[a].true_mm, 3) for a in starts}))
-    # The span recorded is the one the carriage actually covered, not the one
-    # it was sent over -- 100 mm less the undershoot at each end. That is the
-    # right number to keep: it is the span the scale was measured across.
-    check("the run records the span it really covered, and its point count",
-          abs(found["x"]["span_mm"] - (100.0 - 2 * 0.0814)) < 1e-3
-          and found["x"]["points"] == 11, str(found["x"]))
-    check("the log says what each direction measured",
-          sum("out  ->" in m for m in msgs) == 3
-          and sum("back ->" in m for m in msgs) == 3,
+    # Every point is approached from below, so a stage that stops short does
+    # so by the same amount at both ends and the span it covered is the span
+    # it was sent over. (Approached from both sides it lost the undershoot at
+    # each end, and the recorded span was 0.16 mm short.)
+    check("the run records the span, the points and the passes",
+          abs(found["x"]["span_mm"] - 100.0) < 1e-3
+          and found["x"]["points"] == 11 and found["x"]["passes"] == 3,
+          str(found["x"]))
+    check("the log says what each pass measured",
+          sum("pass 1/3 ->" in m for m in msgs) == 3
+          and sum("pass 3/3 ->" in m for m in msgs) == 3,
           f"{len(msgs)} messages")
+    check("a clean run is called repeatable and is not warned about",
+          all(found[a]["repeatable"] for a in found)
+          and not any("WARNING" in m for m in msgs),
+          "; ".join(m for m in msgs if "WARNING" in m) or "no warnings")
 
 
 def test_the_span_is_clamped_to_the_room_the_axis_has():
@@ -161,10 +170,12 @@ def test_the_span_is_clamped_to_the_room_the_axis_has():
           found["x"]["span_mm"] == 100.0, str(found["x"]["span_mm"]))
     check("an axis at the top uses the room below it",
           found["y"]["span_mm"] == 100.0, str(found["y"]["span_mm"]))
+    # 40 mm of travel less the 2 mm kept below the lowest point so that it
+    # too can be approached from below.
     check("an axis with less travel than asked for uses what it has",
-          abs(found["z"]["span_mm"] - 40.0) < 1e-6, str(found["z"]["span_mm"]))
+          abs(found["z"]["span_mm"] - 38.0) < 1e-6, str(found["z"]["span_mm"]))
     check("and says so rather than quietly shortening the run",
-          any("room for 40 mm" in m for m in msgs),
+          any("room for 38 mm" in m for m in msgs),
           "; ".join(m for m in msgs if "room" in m) or "nothing said")
 
     lo_cmd = min(stages["x"].commanded)
@@ -198,7 +209,7 @@ def test_a_stream_with_no_counts_is_reported_not_fitted():
     worker = EncoderCalibrationWorker(stages, lambda: None, span_mm=50.0,
                                       points=5)
     worker.SETTLE_S = 0.0
-    worker.FRESH_TIMEOUT_S = 0.0
+    worker.STABLE_TIMEOUT_S = 0.0
     out = {}
     worker.done.connect(lambda f, e: out.update(found=f, error=e))
     worker.run()
@@ -225,10 +236,138 @@ def test_two_axes_on_one_column_is_refused():
     worker = EncoderCalibrationWorker(stages, both_columns, span_mm=50.0,
                                       points=5)
     worker.SETTLE_S = 0.0
-    worker.FRESH_TIMEOUT_S = 0.0
+    worker.STABLE_TIMEOUT_S = 0.0
     out = {}
     worker.done.connect(lambda f, e: out.update(found=f, error=e))
     worker.run()
     check("neither column is picked", not out["found"], str(out["found"]))
     check("and the reason is that they cannot be told apart",
           "cannot be told apart" in out["error"], out["error"])
+
+
+def test_every_reading_is_taken_after_an_approach_from_below():
+    """Backlash becomes a constant, not a slope, and the readings can be
+    compared with a ruler. Checked from the stage's side: the move that
+    brought it to each standstill must have been upward, on the passes that
+    go down the points as well as the ones that go up."""
+    print("\napproach direction")
+    stages = FakeStages({"x": FakeAxis(150.0)})
+    ax = stages["x"]
+    ax.last_dir = None
+    real_move = ax.move_to
+
+    def move_to(mm, **kw):
+        before = ax.true_mm
+        real_move(mm, **kw)
+        ax.last_dir = "up" if ax.true_mm > before else "down"
+
+    ax.move_to = move_to
+    seen = []
+    base = _counts_from(stages)
+
+    def read():
+        seen.append(ax.last_dir)
+        return base()
+
+    worker = EncoderCalibrationWorker(stages, read, span_mm=100.0, points=5,
+                                      axes=["x"], passes=3)
+    worker.SETTLE_S = 0.0
+    worker.STABLE_TIMEOUT_S = 0.0
+    out = {}
+    worker.done.connect(lambda f, e: out.update(found=f, error=e))
+    worker.run()
+    check("the run succeeded", "x" in out["found"], out["error"])
+    check("it read at every one of the 15 standstills",
+          len(seen) >= 15, f"{len(seen)} reads")
+    check("and every one was reached by moving up",
+          set(seen) == {"up"}, str(sorted(set(seen), key=str)))
+
+
+def test_a_scale_that_changes_between_passes_is_not_called_repeatable():
+    """y came back 1.1% apart between two runs and nothing said so."""
+    print("\npass spread")
+    stages = FakeStages({"x": FakeAxis(150.0)})
+    ax = stages["x"]
+
+    def read():
+        # 22 moves a pass: a park and a visit for each of 11 points.
+        k = (len(ax.commanded) - 1) // 22
+        return np.array([BASE["x"] + SCALE["x"] * (1 + 0.002 * k) * ax.true_mm,
+                         0.0, 0.0])
+
+    worker = EncoderCalibrationWorker(stages, read, span_mm=100.0, points=11,
+                                      axes=["x"], passes=3)
+    worker.SETTLE_S = 0.0
+    worker.STABLE_TIMEOUT_S = 0.0
+    out = {}
+    msgs = []
+    worker.message.connect(msgs.append)
+    worker.done.connect(lambda f, e: out.update(found=f, error=e))
+    worker.run()
+    spec = out["found"]["x"]
+    check("the passes disagree by about 0.4% (2 x 0.2%)",
+          3500 < spec["pass_spread_ppm"] < 4500, str(spec["pass_spread_ppm"]))
+    check("and the run says it is not repeatable",
+          spec["repeatable"] is False, str(spec["repeatable"]))
+    check("in words, with the limit",
+          any("WARNING" in m and "not a repeatable scale" in m for m in msgs),
+          "; ".join(msgs[-2:]))
+
+
+class RulerAxis(FakeAxis):
+    """An axis whose millimetre is 0.4% longer than the controller says."""
+    FACTOR = 1.004
+    ZERO = 3.0
+
+
+def test_the_ruler_finds_a_controller_whose_millimetre_is_wrong():
+    """What encoder-against-controller cannot see: both are wrong together."""
+    print("\nruler check")
+    stages = FakeStages({"x": RulerAxis(150.0)})
+    ax = stages["x"]
+    worker = EncoderReferenceWorker(stages, _counts_from(stages), axis="x",
+                                    span_mm=200.0, points=7)
+    worker.SETTLE_S = 0.0
+    worker.STABLE_TIMEOUT_S = 0.0
+    asked = []
+
+    def answer(axis, i, n, ctrl):
+        asked.append((i, n, ctrl))
+        # The ruler: a different zero, and a millimetre 0.4% longer.
+        worker.supply(RulerAxis.ZERO + RulerAxis.FACTOR * ax.position_mm)
+
+    worker.ask.connect(answer)
+    out = {}
+    worker.done.connect(lambda r, e: out.update(result=r, error=e))
+    worker.run()
+    r = out["result"]
+    check("it finished", r is not None, out["error"])
+    check("it asked for every reading, in order",
+          [a[0] for a in asked] == list(range(7)) and asked[0][1] == 7,
+          str([a[0] for a in asked]))
+    check("the controller's millimetre is found to be 0.4% short",
+          abs(r["controller_factor"] - 1.004) < 1e-6,
+          f"{r['controller_factor']:.6f}")
+    # Counts follow the true position, which the controller reports as it is.
+    check("and a true millimetre is fewer counts than the controller's",
+          abs(r["counts_per_mm"] - 14_400.0 / 1.004) < 0.5,
+          f"{r['counts_per_mm']:,.1f}")
+    check("the axis is back where it was found",
+          abs(ax.true_mm - 150.0) < 1e-9, str(ax.true_mm))
+
+
+def test_the_ruler_check_stops_when_the_operator_does():
+    print("\nruler check, cancelled")
+    stages = FakeStages({"x": FakeAxis(150.0)})
+    worker = EncoderReferenceWorker(stages, _counts_from(stages), axis="x",
+                                    span_mm=100.0, points=5)
+    worker.SETTLE_S = 0.0
+    worker.STABLE_TIMEOUT_S = 0.0
+    worker.ask.connect(lambda *a: worker.supply(None))
+    out = {}
+    worker.done.connect(lambda r, e: out.update(result=r, error=e))
+    worker.run()
+    check("nothing is reported", out["result"] is None, str(out["result"]))
+    check("and it says it stopped", "stopped" in out["error"], out["error"])
+    check("the axis is put back",
+          abs(stages["x"].true_mm - 150.0) < 1e-9, str(stages["x"].true_mm))

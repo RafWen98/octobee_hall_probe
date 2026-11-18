@@ -183,3 +183,45 @@ def test_the_scale_keeps_the_sign_the_axis_is_wired_with():
           fit.column == 0, str(fit.column))
     check("the spec that gets stored carries the sign",
           fit.to_spec()["counts_per_mm"] < 0, str(fit.to_spec()))
+
+
+def test_a_straight_axis_is_straight_and_a_bent_one_is_not():
+    print("\nnonlinearity")
+    pos = np.linspace(0, 200, 11)
+    straight = BASE_COUNTS + TRUE_SCALE * pos
+    bent = straight + 0.0004 * TRUE_SCALE * (pos - 100.0) ** 2 / 10.0
+    check("a line has nothing to say about curvature",
+          oenc.nonlinearity_um(pos, straight) < 1e-6,
+          str(oenc.nonlinearity_um(pos, straight)))
+    got = oenc.nonlinearity_um(pos, bent)
+    check("a bend is reported in micrometres", got > 10.0, f"{got:.1f} um")
+    check("and too few points are not asked",
+          oenc.nonlinearity_um(pos[:3], straight[:3]) is None)
+
+
+def test_fitting_against_a_ruler_separates_the_controller_from_the_encoder():
+    print("\nfit against a ruler")
+    ctrl = np.linspace(20, 220, 7)
+    true = 1.01 * ctrl                                    # 1% long
+    counts = _counts(true, scale=TRUE_SCALE)
+    # A ruler read from the other end, with a different zero.
+    tape = 500.0 - true
+    r = oenc.fit_reference(tape, ctrl, counts)
+    check("a ruler that counts backwards still gives the factor",
+          abs(r["controller_factor"] - 1.01) < 1e-9,
+          f"{r['controller_factor']:.9f}")
+    check("and counts per true mm, with the wiring's sign",
+          abs(r["counts_per_mm"] - TRUE_SCALE) < 1e-6,
+          f"{r['counts_per_mm']:,.3f}")
+    check("a perfect ruler has no scatter and no error bar",
+          r["tape_residual_mm"] < 1e-9, str(r["tape_residual_mm"]))
+
+    rng = np.random.default_rng(3)
+    noisy = oenc.fit_reference(true + rng.normal(0, 0.3, len(true)), ctrl,
+                               counts)
+    check("a ruler read to 0.3 mm says how well it could resolve the factor",
+          noisy["controller_factor_se"] is not None
+          and 0 < noisy["controller_factor_se"] < 0.01,
+          str(noisy["controller_factor_se"]))
+    check("too few readings are refused with a reason",
+          "three" in oenc.fit_reference(tape[:2], ctrl[:2], counts[:2])["why"])
