@@ -201,7 +201,7 @@ reachable region is worked out at. It is **not** how finely the swept axis is
 sampled: that is the output rate against the sweep speed, and at 500 Hz and
 10 mm/s it is a sample every 20 µm.
 
-*Sweep speed* is capped at **5 mm/s**, which is a measurement limit rather than
+*Sweep speed* is capped at **6 mm/s** (default 5), which is a measurement limit rather than
 a hardware one — the axes will do 10. The head is on the end of a cantilever and
 this is the only measurement taken while the thing taking it is moving, so there
 is nothing to be gained by hurrying it.
@@ -230,6 +230,20 @@ and `tools/plot_faces.py` and `tools/fill_volume.py` skip the slices when they
 assemble the faces. **Filled box** sweeps every line through the volume.
 
 The default pattern is **outer surface + x–z slices**.
+
+**Edges only — check the travel** traces the outline of the box as one
+continuous path: each line starts where the last one ended, with no return
+moves, no pause at the corners and no overshoot past them. A box has eight
+corners with three edges each, so no path can cover every edge exactly once;
+this one covers all twelve and runs three of them twice (the fewest possible),
+fifteen lines and about 16 minutes on the whole envelope at 5 mm/s. Half the
+edges are run backwards, which a map never does because of backlash, and which
+does not matter for a check. Run it before a long map to watch the probe go round the box you
+actually meant. **Stop now** halts the axes at once, including during the drive
+to the start of a line, which is the long move and the one where a wrong travel
+shows itself. It is a profiled stop, so the positions stay trusted and what was
+logged is still written. The global Stop and the emergency stop (Esc) also end
+the sweep thread, not only the move in progress.
 
 ### Cutting the volume to the shape of the space
 
@@ -290,6 +304,16 @@ in `captures/` as `volume_<timestamp>.npz` with a `.json` sidecar:
 | `in_span` | row is inside the measured span, not in a ramp |
 | `counts` | raw quadrature counts, unwrapped, one row per field sample |
 | `poll_t_s`, `poll_mm` | every raw controller read, so the fallback can be redone |
+
+**In case of a crash.** The `.npz` is only written at the end, so while the
+sweep runs a `.csv` part is saved every 100,000 rows (`CHECKPOINT_ROWS` in
+`motion/sweep.py`) into `volume_<timestamp>_parts/`, next to where the map will
+go. Parts are cut between lines, written in the background (about a second and
+~63 MB each), and each one is complete on its own: `t_s, line, in_span`, rig
+and machine x/y/z, then `sNN_b{x,y,z}_mT` for all 16 sensors, then the raw
+counts. A crash loses at most the rows since the last part. Once the `.npz`
+is written the parts folder is deleted; if that save fails, the last rows go
+into a final part and the folder is kept.
 
 ### Where position comes from
 

@@ -72,6 +72,7 @@ counts and the raw polls are both stored, so either can be redone.
 import json
 import math
 import os
+import threading
 import time
 
 import numpy as np
@@ -87,7 +88,7 @@ AXES = ("x", "y", "z")
 # on the end of a cantilever, and a sweep is the one thing here that measures
 # while the thing it is measuring with is moving.
 DEFAULT_SPEED_MM_S = 5.0
-MAX_SPEED_MM_S = 5.0
+MAX_SPEED_MM_S = 6.0
 
 # Rows per second written to the log. The physics has nothing above a few Hz
 # once the probe is moving at centimetres per second, and 100 Hz at 10 mm/s is a
@@ -163,6 +164,24 @@ class Volume:
                           self.lo_mm[2] if not (i & 1) else self.hi_mm[2]]
                          for i in range(8)])
 
+    def outside(self, travel_mm):
+        """Where this box leaves `travel_mm` ({axis: (lo, hi)}), as sentences.
+
+        Empty when it fits. Checked when the box is planned, so a box typed
+        past the end of an axis is refused with the numbers in front of you,
+        rather than by the stage itself once the probe is already moving.
+        """
+        out = []
+        for i, a in enumerate(AXES):
+            if a not in (travel_mm or {}):
+                continue
+            lo, hi = (float(v) for v in travel_mm[a])
+            if self.lo_mm[i] < lo - 1e-9 or self.hi_mm[i] > hi + 1e-9:
+                out.append(f"{a}: the box runs {self.lo_mm[i]:g}..."
+                           f"{self.hi_mm[i]:g} mm, but the axis only goes "
+                           f"{lo:g}...{hi:g} mm")
+        return out
+
     def describe(self):
         return (f"{self.size_mm[0]:g}x{self.size_mm[1]:g}x{self.size_mm[2]:g} mm "
                 f"from ({self.lo_mm[0]:g}, {self.lo_mm[1]:g}, "
@@ -192,8 +211,15 @@ class SweepLine:
     """
 
     def __init__(self, sweep, start_mm, stop_mm, fixed, run_in_mm=0.0,
-                 run_out_mm=0.0, part="box"):
+                 run_out_mm=0.0, part="box", reverse=False):
         self.sweep = sweep
+        # Run from stop down to start rather than up. Only the edge trace
+        # does this: it is one continuous path round the box, and a path that
+        # goes round a corner has to come back down the far side. A map's
+        # lines never do -- see "Every line still runs the same way" above.
+        # start_mm < stop_mm either way; this only changes which end is
+        # driven to first.
+        self.reverse = bool(reverse)
         # "box" for the filled box or its six faces, "slice" for a plane
         # inside it. Stored per line so a tool reading the map back never has
         # to guess from the positions which lines are boundary and which are
@@ -212,22 +238,30 @@ class SweepLine:
     @property
     def from_mm(self):
         """Where the stage is actually commanded to start, ramp included."""
+        if self.reverse:
+            return self.stop_mm + self.run_out_mm
         return self.start_mm - self.run_in_mm
 
     @property
     def to_mm(self):
         """Where the stage is actually commanded to stop, ramp included."""
+        if self.reverse:
+            return self.start_mm - self.run_in_mm
         return self.stop_mm + self.run_out_mm
 
     def approach(self):
         """The full coordinate dict for the start of this line."""
         return {**self.fixed, self.sweep: self.from_mm}
 
+    def end(self):
+        """The full coordinate dict for where this line finishes."""
+        return {**self.fixed, self.sweep: self.to_mm}
+
     def to_dict(self):
         return {"sweep": self.sweep, "start_mm": self.start_mm,
                 "stop_mm": self.stop_mm, "fixed": dict(self.fixed),
                 "run_in_mm": self.run_in_mm, "run_out_mm": self.run_out_mm,
-                "part": self.part}
+                "part": self.part, "reverse": self.reverse}
 
 
 class SweepPlan:
@@ -265,11 +299,32 @@ class SweepPlan:
         v, a = otim.clamp_velocity(self.speed_mm_s), float(accel_mm_s2)
         back = otim.clamp_velocity(otim.MAX_VEL_MM_S)
         total = 0.0
+        prev = None
         for ln in self.lines:
             reach = abs(ln.to_mm - ln.from_mm)
             total += otim.move_time_s(reach, v, a) + self.settle_s
-            total += otim.move_time_s(reach, back, a)
+            # Getting to the start of the line, from wherever the last one
+            # ended: the axes move together, so the longest of them sets it.
+            # Before the first line nobody knows where the stage is, so it is
+            # charged a line's length, as a raster's return would be.
+            if prev is None:
+                gap = reach
+            else:
+                to = ln.approach()
+                gap = max(abs(to[k] - prev.get(k, to[k])) for k in to)
+            total += otim.move_time_s(gap, back, a)
+            prev = ln.end()
         return total
+
+    def reach_mm(self):
+        """{axis: (lowest, highest)} the plan will command, ramps included."""
+        out = {}
+        for ln in self.lines:
+            for where in (ln.approach(), ln.end()):
+                for a, v in where.items():
+                    lo, hi = out.get(a, (v, v))
+                    out[a] = (min(lo, v), max(hi, v))
+        return out
 
     def rows(self):
         """How many log rows this will produce, roughly."""
@@ -304,6 +359,76 @@ def _runs(mask):
     starts = np.concatenate([[0], breaks + 1])
     stops = np.concatenate([breaks, [len(idx) - 1]])
     return [(int(idx[a]), int(idx[b])) for a, b in zip(starts, stops)]
+
+
+# One continuous path over all twelve edges of a box, as corners (x, y, z),
+# each 0 for the low end of that axis and 1 for the high one.
+#
+# Every corner of a box has three edges, an odd number, so no path covers
+# each edge exactly once -- that needs at most two odd corners and a box has
+# eight. The fewest edges that must be run twice is three, and this route
+# repeats exactly three (marked *): the bottom face, up one edge, the top face,
+# then down, across and up the three remaining verticals.
+EDGE_ROUTE = (
+    (0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 0),     # bottom face
+    (0, 0, 1),                                                  # up
+    (1, 0, 1), (1, 1, 1), (0, 1, 1), (0, 0, 1),                 # top face
+    (1, 0, 1),                                                  # * again
+    (1, 0, 0),                                                  # down
+    (1, 1, 0),                                                  # * again
+    (1, 1, 1),                                                  # up
+    (0, 1, 1),                                                  # * again
+    (0, 1, 0),                                                  # down
+)
+
+
+def _edge_lines(volume, reachable, span_floor):
+    """The box's outline as one continuous path, corner to corner.
+
+    Run before a long map, it drives the probe round exactly what the map is
+    about to cover -- the cheapest way to find out the travel or the box was
+    typed wrong. Each line starts where the last one ended, so the stage never
+    goes back for a return move: the path is the outline and nothing else.
+    That means half the edges are run backwards, which a map would never do
+    (backlash), and is fine for a check.
+
+    No run-up or run-down past the corners: overshooting a corner is exactly
+    what a check of the travel must not do.
+
+    Where `reachable` cuts an edge, only its clear parts are kept, and the
+    path is no longer continuous there -- the stage then drives between the
+    pieces as it would between any two lines. Returns (lines, skipped, cut).
+    """
+    lines, skipped, cut = [], 0, 0
+    top = {a: volume.shape[AXES.index(a)] - 1 for a in AXES}
+    for c0, c1 in zip(EDGE_ROUTE[:-1], EDGE_ROUTE[1:]):
+        k = next(i for i in range(3) if c0[i] != c1[i])
+        axis = AXES[k]
+        if top[axis] == 0:
+            continue              # a flat box: this edge has no length
+        idx = {AXES[i]: c0[i] * top[AXES[i]] for i in range(3) if i != k}
+        fixed = {a: float(volume.nodes(a)[v]) for a, v in idx.items()}
+        reverse = c1[k] < c0[k]
+        along = volume.nodes(axis)
+        if reachable is None:
+            spans = [(0, len(along) - 1)]
+        else:
+            sel = [slice(None)] * 3
+            for a, v in idx.items():
+                sel[AXES.index(a)] = v
+            spans = _runs(reachable[tuple(sel)])
+            if spans != [(0, len(along) - 1)]:
+                cut += 1
+        if reverse:
+            spans = spans[::-1]
+        for s0, s1 in spans:
+            start, stop = float(along[s0]), float(along[s1])
+            if stop - start < span_floor - 1e-9:
+                skipped += 1
+                continue
+            lines.append(SweepLine(axis, start, stop, fixed, 0.0, 0.0,
+                                   "edge", reverse=reverse))
+    return lines, skipped, cut
 
 
 def _face_rasters(volume, shell):
@@ -402,7 +527,7 @@ def _slice_rasters(volume, count, inset_mm, normal):
 def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
          log_hz=DEFAULT_LOG_HZ, settle_s=DEFAULT_SETTLE_S, accel_mm_s2=20.0,
          travel_mm=None, min_span_mm=None, shell=False, slices=0,
-         slice_inset_mm=0.0, slice_normal="y"):
+         slice_inset_mm=0.0, slice_normal="y", edges=False):
     """Turn a Volume into the lines that will actually be swept.
 
     `reachable` is a boolean array of `volume.shape` -- machine.reachable_grid's
@@ -427,6 +552,12 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
     interior to check the reconstruction against. Their lines are tagged
     part="slice" so nothing reading the map back takes them for faces.
 
+    `edges` traces only the box's outline, ignoring `shell` and `slices`: one
+    continuous path over all twelve edges (see EDGE_ROUTE), to check the
+    travel and the box are what was meant before committing hours to them.
+    No settle at the corners and no overshoot past them. Its lines are
+    tagged part="edge".
+
     `travel_mm` is {axis: (lo, hi)}; the run-up and run-down are fitted into
     whatever it leaves outside the box, and silently shortened where it does
     not. A line with no room to ramp is still swept -- it just measures its own
@@ -437,9 +568,18 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
     span_floor = (volume.step_mm if min_span_mm is None else float(min_span_mm))
     reachable = None if reachable is None else np.asarray(reachable)
 
-    rasters = (_face_rasters(volume, shell)
-               + _slice_rasters(volume, slices, slice_inset_mm, slice_normal))
+    edge_cut = 0
+    if edges:
+        rasters = []
+        slices = 0
+        settle_s = 0.0
+    else:
+        rasters = (_face_rasters(volume, shell)
+                   + _slice_rasters(volume, slices, slice_inset_mm,
+                                    slice_normal))
     lines, skipped, seen = [], 0, set()
+    if edges:
+        lines, skipped, edge_cut = _edge_lines(volume, reachable, span_floor)
     for axis, first_ax, second_ax, restrict, part in rasters:
         along = volume.nodes(axis)
         a0, a1 = restrict.get(axis, (0, len(along) - 1))
@@ -478,7 +618,12 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
                     run_out = max(0.0, min(ramp, hi_t - stop))
                     lines.append(SweepLine(axis, start, stop, fixed,
                                            run_in, run_out, part))
-    note = ("the outside of the box" if shell else "the whole box, filled")
+    note = ("the outline of the box, one continuous path" if edges
+            else "the outside of the box" if shell
+            else "the whole box, filled")
+    if edge_cut:
+        note += (f" -- broken where the coils cut {edge_cut} edge(s), so the "
+                 f"stage drives between the pieces")
     slice_doc = None
     if int(slices) > 0:
         at, rect = slice_planes(volume, slices, slice_inset_mm, slice_normal)
@@ -598,6 +743,20 @@ class SweepRunner:
             time.sleep(POLL_S)
         return self.counts_now
 
+    def _already_at(self, coords, tol_mm=0.002):
+        """True if every named axis is within `tol_mm` of `coords` now.
+
+        2 um: well under the step anything is planned on and well over the
+        ~1 um the controller settles to. A failed read answers False, which
+        only means the ordinary move is made.
+        """
+        try:
+            where = self.stages.position()
+            return all(abs(float(where[k]) - float(v)) <= tol_mm
+                       for k, v in coords.items())
+        except Exception:
+            return False
+
     def _poll(self, index):
         try:
             where = self.stages.position()
@@ -626,6 +785,25 @@ class SweepRunner:
                 "sweep would have no origin -- home them first: "
                 + "; ".join(f"{n} ({why})" for n, why in unhomed))
 
+        # Every position the plan will command, against what each axis allows,
+        # before anything moves. Each move checks itself too, but that check
+        # fires with the probe already part way round: the plan has driven to
+        # its first corner and then finds the second one is off the end.
+        outside = []
+        for a, (lo, hi) in self.plan.reach_mm().items():
+            if a not in self.stages.names:
+                continue
+            lim_lo, lim_hi = (float(v) for v in self.stages[a].limit_mm)
+            if lo < lim_lo - 1e-9 or hi > lim_hi + 1e-9:
+                outside.append(f"{a} needs {lo:g}...{hi:g} mm, the axis "
+                               f"allows {lim_lo:g}...{lim_hi:g} mm")
+        if outside:
+            raise ValueError(
+                "the sweep leaves what the axes are allowed to use, so "
+                "nothing was moved: " + "; ".join(outside)
+                + ". Tick 'the whole travel', or bring 'from' + 'size' "
+                  "inside it.")
+
         # What each axis is normally set to, so it can be put back however the
         # sweep ends. Read once: these are the profiles the rig arrived with.
         normal = {a: self.stages[a].vel_params for a in AXES
@@ -642,9 +820,16 @@ class SweepRunner:
                 st = self.stages[axis]
                 accel = self.accel_mm_s2 or normal[axis][1]
                 # 1. get there at the ordinary speed, and let it stop ringing.
+                # Unless it is there already: on a continuous path (the edge
+                # trace) every line starts where the last one ended, and a
+                # zero-length move still costs a wait for "stopped" at every
+                # corner. Judged from where the stage IS, not from where the
+                # last line was meant to end -- a line stopped short by its
+                # timeout ends somewhere else, and then the move is needed.
                 st.set_vel_params(*normal[axis])
-                self.stages.move_to(settle_s=self.plan.settle_s,
-                                    **line.approach())
+                if not self._already_at(line.approach()):
+                    self.stages.move_to(settle_s=self.plan.settle_s,
+                                        **line.approach())
                 if should_abort and should_abort():
                     self.aborted = True
                     break
@@ -681,7 +866,7 @@ class SweepRunner:
                             break
                         time.sleep(POLL_S)
                     deadline = time.monotonic() + otim.move_timeout_s(
-                        line.to_mm - line.from_mm, speed, accel)
+                        abs(line.to_mm - line.from_mm), speed, accel)
                     while not self.aborted:
                         self._poll(i)
                         if not st.moving:
@@ -700,6 +885,9 @@ class SweepRunner:
                     self.logging = False
                     self._poll(i)
                 self.lines_done = i + 1
+                # Between lines, standing still: the only place a part can be
+                # cut without splitting a line between files.
+                self.log.checkpoint()
                 if on_progress:
                     on_progress(i + 1, len(self.plan.lines), line)
                 if self.aborted:
@@ -715,6 +903,12 @@ class SweepRunner:
         self.log_fn(f"sweep: {self.lines_done} of {len(self.plan.lines)} lines"
                     + (" (aborted)" if self.aborted else ""))
         return self.lines_done
+
+
+# A crash-safe .csv part is written once this many rows have piled up since
+# the last one -- about 3.3 minutes of sweeping at 500 Hz, 17 at 100 Hz. Cut at
+# the end of a line, never inside one.
+CHECKPOINT_ROWS = 100_000
 
 
 class SweepLog:
@@ -744,6 +938,126 @@ class SweepLog:
         self.datum = {}
         self.t_wall0 = None
         self.n_rows = 0
+        self._parts = None            # set by keep_parts()
+        self.parts_written = []
+
+    # ---- crash-safe parts --------------------------------------------
+    def keep_parts(self, directory, log_hz, placement=None,
+                   every_rows=CHECKPOINT_ROWS, log_fn=print):
+        """Write the sweep out as .csv parts while it runs.
+
+        Everything else lives in memory until the end, so a hard crash, a
+        power cut or a killed window would lose the lot. With this on, at most
+        the last `every_rows` rows (plus the line in progress) are lost.
+
+        Each part is complete on its own -- positions included -- because the
+        polls and encoder datum of every line it touches go into it. Parts are
+        written from a background thread so the stages do not wait on the
+        disk, and under a temporary name first, so a part that exists is a
+        part that was finished.
+        """
+        os.makedirs(directory, exist_ok=True)
+        self._parts = {"dir": directory, "hz": float(log_hz),
+                       "placement": placement, "every": int(every_rows),
+                       "log": log_fn, "from_block": 0, "n": 0,
+                       "thread": None}
+        info = dict(self.meta)
+        info.update({"log_hz": float(log_hz), "every_rows": int(every_rows),
+                     "encoders": self.encoders.to_dict(),
+                     "note": "crash-safe parts of a volume sweep; the .npz "
+                             "written at the end holds the same rows"})
+        with open(os.path.join(directory, "info.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(info, fh, indent=2, default=str)
+            fh.write("\n")
+
+    def checkpoint(self, force=False):
+        """Write the rows logged since the last part, if there are enough.
+
+        Called by the runner between lines. Returns the path of the part being
+        written, or None. `force` writes whatever is pending however little.
+        """
+        st = self._parts
+        if st is None:
+            return None
+        n = len(self._b)                # blocks keep arriving: fix the end now
+        k0 = st["from_block"]
+        pending = sum(len(b) for b in self._b[k0:n])
+        if not pending or (pending < st["every"] and not force):
+            return None
+
+        part = SweepLog(self.geom, {}, self.encoders)
+        part._b = self._b[k0:n]
+        part._c = self._c[k0:n]
+        part._t0 = self._t0[k0:n]
+        part._line_of = self._line_of[k0:n]
+        touched = set(part._line_of)
+        npoll = min(len(self.poll_t_s), len(self.poll_mm), len(self.poll_line))
+        keep = [j for j in range(npoll) if self.poll_line[j] in touched]
+        part.poll_t_s = [self.poll_t_s[j] for j in keep]
+        part.poll_mm = [self.poll_mm[j] for j in keep]
+        part.poll_line = [self.poll_line[j] for j in keep]
+        part.lines = list(self.lines)
+        part.datum = {k: v for k, v in self.datum.items() if k in touched}
+        part.n_rows = pending
+
+        st["from_block"] = n
+        st["n"] += 1
+        path = os.path.join(st["dir"], f"part_{st['n']:04d}.csv")
+        self.finish_parts()             # one writer at a time, in order
+        th = threading.Thread(target=self._write_part, args=(part, path),
+                              name="sweep-part", daemon=True)
+        st["thread"] = th
+        th.start()
+        return path
+
+    def _write_part(self, part, path):
+        st = self._parts
+        try:
+            t_s, pos, machine, b_mt, line_index, in_span, counts = \
+                part.assemble(st["hz"], st["placement"])
+            names = (["t_s", "line", "in_span", "x_mm", "y_mm", "z_mm",
+                      "machine_x_mm", "machine_y_mm", "machine_z_mm"]
+                     + [f"s{s + 1:02d}_b{c}_mT"
+                        for s in range(pgeom.N_SENSORS) for c in "xyz"]
+                     + [f"counts_{j}" for j in range(counts.shape[1])])
+            table = np.column_stack([
+                t_s, line_index, in_span.astype(int), pos, machine,
+                b_mt.reshape(len(b_mt), -1).astype(np.float64), counts])
+            fmt = (["%.6f", "%d", "%d"] + ["%.5f"] * 6
+                   + ["%.7g"] * (3 * pgeom.N_SENSORS)
+                   + ["%.0f"] * counts.shape[1])
+            tmp = path + ".tmp"
+            np.savetxt(tmp, table, fmt=fmt, delimiter=",",
+                       header=",".join(names), comments="")
+            os.replace(tmp, path)
+            self.parts_written.append(path)
+            st["log"](f"volume map: saved {len(t_s):,} rows so far -> {path}")
+        except Exception as exc:        # a failed part must not end the sweep
+            st["log"](f"WARNING: volume map: could not write {path} ({exc}) "
+                      f"-- the sweep carries on, the final save is unaffected")
+
+    def finish_parts(self, timeout_s=120.0):
+        """Wait for a part still being written."""
+        th = None if self._parts is None else self._parts["thread"]
+        if th is not None:
+            th.join(timeout_s)
+
+    def drop_parts(self):
+        """Delete the parts, once the full map is safely on disk."""
+        if self._parts is None:
+            return
+        self.finish_parts()
+        d = self._parts["dir"]
+        if os.path.isdir(d):
+            for name in os.listdir(d):
+                if name.startswith("part_") or name == "info.json":
+                    os.remove(os.path.join(d, name))
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass                    # something else is in there: leave it
+        self.parts_written = []
 
     # ---- collection --------------------------------------------------
     def start(self):

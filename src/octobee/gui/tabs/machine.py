@@ -22,6 +22,7 @@ from octobee import record as orec
 from octobee.gui.widgets.machine3d import MachineView3D
 from octobee.gui.workers import (
     EncoderCalibrationWorker,
+    EncoderReferenceWorker,
     PlanWorker,
     SweepWorker,
 )
@@ -29,18 +30,19 @@ from octobee.motion import encoder as oenc
 from octobee.motion import stage as ostage
 from octobee.motion import sweep as osweep
 
-# The sweep patterns the volume panel offers: label -> (shell, with slices).
+# The sweep patterns the volume panel offers:
+#     label -> (shell, with slices, edges only).
 # The first is the default.
 VOLUME_PATTERNS = {
-    "outer surface + x–z slices": (True, True),
-    "outer surface": (True, False),
-    "filled box": (False, False),
+    "outer surface + x–z slices": (True, True, False),
+    "outer surface": (True, False, False),
+    "filled box": (False, False, False),
+    "edges only — check the travel": (False, False, True),
 }
 
 
-
 class MachineTab(QtWidgets.QWidget):
-    def __init__(self, session, parent=None):
+    def __init__(self, session, parent=None, motion=None):
         """Where the head is inside the coil set, and which coils are live.
 
             A field map is a table of vectors at rig millimetres, and rig
@@ -53,6 +55,10 @@ class MachineTab(QtWidgets.QWidget):
             are carrying current, then where the probe sits in it.
             """
         super().__init__(parent)
+        # The window's MotionControl, so its Stop and emergency stop reach a
+        # sweep thread too -- without it they stop the axis in motion and the
+        # thread commands the next line. None in a tab built on its own.
+        self.motion = motion
         self.session = session
         self._machine_key = None
         self._machine_quiet = False
@@ -328,7 +334,12 @@ class MachineTab(QtWidgets.QWidget):
             "x–z planes through the inside of the box, spread evenly along y. "
             "They are measured interior values to check a reconstruction from "
             "the faces against.\n\n"
-            "filled box: every line through the whole volume.")
+            "filled box: every line through the whole volume.\n\n"
+            "edges only — check the travel: the outline of the box as one "
+            "continuous path, corner to corner with no return moves — what a "
+            "map would cover. Run it first to see the probe go round the box "
+            "you meant; Stop now halts it at once if it is heading somewhere "
+            "it should not.")
         self.cmb_vol_pattern.currentIndexChanged.connect(self.on_volume_edited)
         f4.addWidget(self.cmb_vol_pattern, 4, 2, 1, 2)
 
@@ -415,10 +426,33 @@ class MachineTab(QtWidgets.QWidget):
         f4.addWidget(self.spin_enc_span, 8, 1)
         f4.addWidget(self.lbl_encoders, 8, 2, 1, 2)
 
+        self.btn_vol_ruler = QtWidgets.QPushButton("Check against a ruler…")
+        self.btn_vol_ruler.setToolTip(
+            "Park one axis at a series of points and ask what a ruler, tape "
+            "or dial indicator reads at each.\n\n"
+            "Every other check here compares the encoder with the controller, "
+            "and both are on the same motor, so a leadscrew or unit "
+            "conversion that is wrong is wrong in both and cannot show. This "
+            "is the only one that brings in a length from outside. It says "
+            "whether the controller's millimetre is a millimetre, and how "
+            "many counts a true one is.\n\n"
+            "The zero of the ruler does not matter, and neither does which "
+            "way it counts. Read it the same way every time.")
+        self.btn_vol_ruler.clicked.connect(self.on_ruler_check)
+        self.cmb_ruler_axis = QtWidgets.QComboBox()
+        self.cmb_ruler_axis.addItems(list(oenc.AXES))
+        self.spin_ruler_points = QtWidgets.QSpinBox()
+        self.spin_ruler_points.setRange(3, 15)
+        self.spin_ruler_points.setValue(7)
+        self.spin_ruler_points.setSuffix(" readings")
+        f4.addWidget(self.btn_vol_ruler, 9, 0)
+        f4.addWidget(self.cmb_ruler_axis, 9, 1)
+        f4.addWidget(self.spin_ruler_points, 9, 2)
+
         self.lbl_volume = QtWidgets.QLabel("")
         self.lbl_volume.setWordWrap(True)
         self.lbl_volume.setStyleSheet("color:#9aa3b2; font-size:11px;")
-        f4.addWidget(self.lbl_volume, 9, 0, 1, 4)
+        f4.addWidget(self.lbl_volume, 10, 0, 1, 4)
 
         self.btn_vol_plan = QtWidgets.QPushButton("Work out the path")
         self.btn_vol_plan.clicked.connect(self.on_volume_plan)
@@ -432,17 +466,25 @@ class MachineTab(QtWidgets.QWidget):
         self.btn_vol_start = QtWidgets.QPushButton("Start volume map")
         self.btn_vol_start.setEnabled(False)
         self.btn_vol_start.clicked.connect(self.on_volume_start)
-        self.btn_vol_abort = QtWidgets.QPushButton("Abort")
+        self.btn_vol_abort = QtWidgets.QPushButton("Stop now")
         self.btn_vol_abort.setEnabled(False)
+        self.btn_vol_abort.setStyleSheet(
+            "QPushButton:enabled { background:#b3261e; color:white; "
+            "font-weight:bold; }")
+        self.btn_vol_abort.setToolTip(
+            "Stop the axes where they are and end the sweep. A profiled stop, "
+            "so no steps are lost and the positions stay trusted; what was "
+            "logged up to here is still written. For a stop that also latches "
+            "the machine off, use the red emergency stop (or Esc).")
         self.btn_vol_abort.clicked.connect(self.on_volume_abort)
-        f4.addWidget(self.btn_vol_plan, 10, 0)
-        f4.addWidget(self.btn_vol_preview, 10, 1)
-        f4.addWidget(self.btn_vol_start, 10, 2)
-        f4.addWidget(self.btn_vol_abort, 10, 3)
+        f4.addWidget(self.btn_vol_plan, 11, 0)
+        f4.addWidget(self.btn_vol_preview, 11, 1)
+        f4.addWidget(self.btn_vol_start, 11, 2)
+        f4.addWidget(self.btn_vol_abort, 11, 3)
 
         self.bar_volume = QtWidgets.QProgressBar()
         self.bar_volume.setTextVisible(True)
-        f4.addWidget(self.bar_volume, 11, 0, 1, 4)
+        f4.addWidget(self.bar_volume, 12, 0, 1, 4)
         lay.addWidget(g4)
 
         self.lbl_clearance = QtWidgets.QLabel("no coil set loaded")
@@ -773,11 +815,12 @@ class MachineTab(QtWidgets.QWidget):
 
     def _pattern(self):
         """The plan() arguments for the chosen sweep pattern."""
-        shell, slices = VOLUME_PATTERNS[self.cmb_vol_pattern.currentText()]
+        shell, slices, edges = VOLUME_PATTERNS[
+            self.cmb_vol_pattern.currentText()]
         return {"shell": shell,
                 "slices": self.spin_vol_slices.value() if slices else 0,
                 "slice_inset_mm": self.spin_vol_inset.value(),
-                "slice_normal": "y"}
+                "slice_normal": "y", "edges": edges}
 
     def on_volume_whole(self, on):
         """Whole travel or a typed box: show the numbers either way.
@@ -825,6 +868,13 @@ class MachineTab(QtWidgets.QWidget):
             return
         self.machine_view.set_volume(
             self.session.machine.pose.flange_path_mm(vol.corners_mm()))
+        outside = vol.outside(self.session.machine.pose.travel_mm)
+        if outside:
+            self.lbl_volume.setText(
+                "OUTSIDE THE TRAVEL — " + "; ".join(outside)
+                + ". Tick 'the whole travel', or bring 'from' + 'size' "
+                  "inside it.")
+            return
         rough = osweep.plan(vol, speed_mm_s=self.spin_vol_speed.value(),
                             **self._pattern())
         self.lbl_volume.setText(
@@ -839,6 +889,15 @@ class MachineTab(QtWidgets.QWidget):
             vol = self.volume()
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Volume", str(exc))
+            return
+        outside = vol.outside(self.session.machine.pose.travel_mm)
+        if outside:
+            msg = ("This box goes past the end of the stage travel, so it "
+                   "cannot be run:\n\n  " + "\n  ".join(outside)
+                   + "\n\nTick 'the whole travel', or change 'from' and "
+                     "'size' so that from + size stays inside it.")
+            self.session.log("volume: refused -- " + "; ".join(outside))
+            QtWidgets.QMessageBox.warning(self, "Volume", msg)
             return
         if not self.chk_vol_avoid.isChecked() or self.session.coils is None:
             self._finish_plan(vol, None)
@@ -1009,13 +1068,17 @@ class MachineTab(QtWidgets.QWidget):
             return
         span = float(self.spin_enc_span.value())
         points = oenc.CALIBRATION_POINTS
+        passes = oenc.CALIBRATION_PASSES
         reply = QtWidgets.QMessageBox.question(
             self, "Encoders",
-            f"Each axis will be stepped along {span:g} mm and back, one at a "
-            f"time, stopping at {points} places each way, to see which stream "
-            f"column follows it and by how many counts per millimetre.\n\n"
-            f"The span is centred on where the axis is standing and clamped "
-            f"to the room it has. Every axis is returned to where it was "
+            f"Each axis will be run over {span:g} mm, one at a time, "
+            f"stopping at {points} places, {passes} times -- up the points, "
+            f"down them, then up again, each one approached from below -- to "
+            f"see which stream column follows it and by how many counts per "
+            f"millimetre, and whether it comes out the same each time.\n\n"
+            f"That is {3 * passes * points} stops and several minutes. The "
+            f"span is centred on where the axis is standing and clamped to "
+            f"the room it has. Every axis is returned to where it was "
             f"found.\n\nMake sure the head is clear over that range.\n\nGo?",
             QtWidgets.QMessageBox.StandardButton.Yes
             | QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -1026,11 +1089,119 @@ class MachineTab(QtWidgets.QWidget):
         self.lbl_encoders.setText("calibrating…")
         self._enc_worker = EncoderCalibrationWorker(
             self.session.stages, self._counts_now, span_mm=span,
-            points=points)
+            points=points, passes=passes)
         self._enc_worker.message.connect(self.session.log)
         self._enc_worker.progress.connect(self._on_enc_progress)
         self._enc_worker.done.connect(self.on_volume_calibrated)
         self._enc_worker.start()
+
+    def on_ruler_check(self):
+        if self._enc_worker is not None and self._enc_worker.isRunning():
+            return
+        if self.session.stages is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Ruler check",
+                "The stages are not connected. Connect them in the Stages tab.")
+            return
+        if not int(getattr(self.session.source, "enc_columns", 0) or 0):
+            QtWidgets.QMessageBox.warning(
+                self, "Ruler check",
+                "No encoder counts are arriving with the field, so there is "
+                "nothing to check against the ruler. Press Connect first.")
+            return
+        axis = self.cmb_ruler_axis.currentText()
+        span = float(self.spin_enc_span.value())
+        n = int(self.spin_ruler_points.value())
+        reply = QtWidgets.QMessageBox.question(
+            self, "Ruler check",
+            f"{axis} will be parked at {n} points over up to {span:g} mm, "
+            f"each approached from below. At each one you will be asked what "
+            f"the ruler reads; the axis stays put until you answer.\n\n"
+            f"Read it the same way every time -- same edge of the needle, eye "
+            f"at the same height. Its zero and its direction do not matter.\n\n"
+            f"Make sure the head is clear over that range.\n\nGo?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel)
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self.btn_vol_encoders.setEnabled(False)
+        self.btn_vol_ruler.setEnabled(False)
+        self.lbl_encoders.setText(f"ruler check on {axis}…")
+        self._enc_worker = EncoderReferenceWorker(
+            self.session.stages, self._counts_now, axis=axis, span_mm=span,
+            points=n)
+        self._enc_worker.message.connect(self.session.log)
+        self._enc_worker.ask.connect(self._on_ruler_ask)
+        self._enc_worker.done.connect(self.on_ruler_done)
+        self._enc_worker.start()
+
+    def _on_ruler_ask(self, axis, i, n, controller_mm):
+        worker = self._enc_worker
+        value, ok = QtWidgets.QInputDialog.getDouble(
+            self, "Ruler check",
+            f"Reading {i + 1} of {n}.\n\nThe controller says {axis} is at "
+            f"{controller_mm:.3f} mm.\nWhat does the ruler read, in mm?",
+            0.0, -1.0e6, 1.0e6, 2)
+        worker.supply(float(value) if ok else None)
+
+    def on_ruler_done(self, result, err):
+        self.btn_vol_encoders.setEnabled(True)
+        self.btn_vol_ruler.setEnabled(True)
+        self.refresh_encoders()
+        if err or not result:
+            self.session.log(f"WARNING: ruler check: {err}")
+            QtWidgets.QMessageBox.warning(self, "Ruler check", err
+                                          or "no result")
+            return
+        axis = result["axis"]
+        f = result["controller_factor"]
+        f_se = result["controller_factor_se"]
+        k = result["counts_per_mm"]
+        k_se = result["counts_per_mm_se_rel"]
+        resid = result["tape_residual_mm"]
+        span = result["span_mm"]
+        off_mm = (f - 1.0) * 300.0
+        lines = [
+            f"{axis}: over {span:g} mm the ruler moved {f:.4f} mm for each "
+            f"mm the controller said"
+            + (f" (+/- {f_se:.4f})" if f_se is not None else "")
+            + f", which is {off_mm:+.2f} mm over a 300 mm axis.",
+            f"{axis}: {k:+,.1f} counts per true mm"
+            + (f" (+/- {k_se * 100:.2f}%)" if k_se is not None else "") + ".",
+            f"{axis}: ruler readings scatter {resid * 1000:.0f} um about a "
+            f"straight line.",
+        ]
+        for line in lines:
+            self.session.log("ruler check: " + line)
+        old = (self.session.encoders.axes.get(axis, {})
+               if self.session.encoders else {}).get("counts_per_mm")
+        shown = "\n".join(lines)
+        if old:
+            shown += (f"\n\nstages.json has {axis} at {old:+,.1f}; this is "
+                      f"{(abs(k) / abs(old) - 1) * 100:+.2f}% from it.")
+        shown += ("\n\nSave this as the encoder scale for " + axis + "?\n"
+                  "(Choose No to keep what is there and only keep the log.)")
+        reply = QtWidgets.QMessageBox.question(
+            self, "Ruler check", shown,
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No)
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        spec = {"column": int(result["column"]), "counts_per_mm": float(k)}
+        merged = dict(self.session.encoders.to_dict()) \
+            if self.session.encoders else {}
+        merged[axis] = spec
+        self.session.encoders = oenc.EncoderMap(merged)
+        path = self.session.encoders.save(
+            self.session.stages_path,
+            note=(f"{axis}: {k:+,.1f} c/mm per true mm, measured against a "
+                  f"ruler at {result['n']} points over {span:g} mm, "
+                  f"controller factor {f:.4f}; other axes as before"))
+        self.session.log(f"encoders: {self.session.encoders.describe()} "
+                         f"-> written to {path}")
+        self.refresh_encoders()
 
     def _on_enc_progress(self, done, total):
         """Standstills taken so far. A long run needs to look like it is one."""
@@ -1053,17 +1224,37 @@ class MachineTab(QtWidgets.QWidget):
                 bits.append(f"{spec['span_mm']:g} mm x {spec.get('points')} pts")
             if spec.get("residual_um") is not None:
                 bits.append(f"residual {spec['residual_um']:.1f} um")
-            if spec.get("direction_spread_ppm") is not None:
-                bits.append(f"out/back {spec['direction_spread_ppm']:.0f} ppm")
-            if spec.get("direction_offset_um") is not None:
+            if spec.get("passes"):
+                bits.append(f"{spec['passes']} passes")
+            if spec.get("pass_spread_ppm") is not None:
+                bits.append(f"passes agree to {spec['pass_spread_ppm']:.0f} ppm")
+            if spec.get("nonlinearity_um") is not None:
                 bits.append(
-                    f"out/back agree to {spec['direction_offset_um']:.1f} um")
+                    f"{spec['nonlinearity_um']:.1f} um from straight")
             parts.append(f"{axis}: " + ", ".join(bits))
         return ("multi-point fit against the controller's measured position; "
                 + "; ".join(parts))
 
     def on_volume_calibrated(self, found, err):
         """Adopt whatever was measured, and say plainly what was not."""
+        # An axis whose passes disagree is not a measurement, and writing it
+        # over a scale that was at least measured once would make the file
+        # worse. Say so and keep what was there.
+        unrepeatable = {a: s for a, s in (found or {}).items()
+                        if not s.get("repeatable", True)}
+        if unrepeatable:
+            found = {a: s for a, s in found.items() if a not in unrepeatable}
+            for axis, spec in sorted(unrepeatable.items()):
+                self.session.log(
+                    f"WARNING: encoders: {axis} was NOT saved -- its passes "
+                    f"disagreed by {spec['pass_spread_ppm']:.0f} ppm. The "
+                    f"scale in stages.json is unchanged. Something is moving "
+                    f"between passes (slip, a loose coupling, a sensor "
+                    f"reading before the stage has stopped); that wants "
+                    f"finding before another run will help.")
+            err = "; ".join(filter(None, [err] + [
+                f"{a}: passes disagree by {s['pass_spread_ppm']:.0f} ppm, "
+                f"not saved" for a, s in sorted(unrepeatable.items())]))
         if found:
             merged = dict(self.session.encoders.to_dict())
             merged.update(found)
@@ -1155,7 +1346,7 @@ class MachineTab(QtWidgets.QWidget):
         out = []
         for line in self._plan.lines:
             n = max(2, int(round(line.span_mm / step)) + 1)
-            for t in np.linspace(line.start_mm, line.stop_mm, n):
+            for t in np.linspace(line.from_mm, line.to_mm, n):
                 out.append([line.fixed.get(a, 0.0) if a != line.sweep else t
                             for a in omach.Placement.AXES])
         return np.array(out).reshape(-1, 3) if out else np.zeros((0, 3))
@@ -1241,6 +1432,21 @@ class MachineTab(QtWidgets.QWidget):
         # sweep and a map assembled at a rate the rows were not written at
         # would have every position wrong by a growing amount.
         self._run_hz = float(self.session.out_rate)
+        # Named now rather than at the end, so the crash-safe parts written
+        # during the run sit beside the map they belong to.
+        self._run_path = orec.default_name("volume", "npz",
+                                           self.session.out_dir)
+        parts = os.path.splitext(self._run_path)[0] + "_parts"
+        try:
+            log.keep_parts(parts, self._run_hz, self.session.machine.pose,
+                           log_fn=self.session.log)
+            self.session.log(
+                f"volume map: a .csv part is saved every "
+                f"{osweep.CHECKPOINT_ROWS:,} rows to {parts} in case anything "
+                f"crashes -- removed once the full map is written")
+        except OSError as exc:
+            self.session.log(f"WARNING: volume map: no crash-safe parts "
+                             f"({exc}) -- the map is only saved at the end")
         self.bar_volume.setRange(0, len(self._plan.lines))
         self.bar_volume.setValue(0)
         self.btn_vol_start.setEnabled(False)
@@ -1251,11 +1457,46 @@ class MachineTab(QtWidgets.QWidget):
         self._sweep_worker.progress.connect(self.on_volume_progress)
         self._sweep_worker.done.connect(self.on_volume_done)
         self._sweep_worker.start()
+        if self.motion is not None:
+            self.motion.register(self._sweep_worker)
 
     def on_volume_abort(self):
-        if self._sweep_worker is not None:
-            self._sweep_worker.abort()
-            self.btn_vol_abort.setEnabled(False)
+        """Stop the sweep NOW: the axes first, then the thread.
+
+        Setting the worker's flag on its own is not a stop. The runner reads it
+        while a line is being swept, but not while it is driving to the start
+        of the next line -- and that drive is the long one, up to the whole
+        travel at full speed, which is exactly when a wrongly set travel shows
+        itself. So the axes are told to stop from here, on the GUI thread,
+        without waiting behind the move they are stopping. The waiting thread
+        then sees motion end, finds the flag up and quits.
+        """
+        worker = self._sweep_worker
+        if worker is None or not worker.isRunning():
+            return
+        worker.abort()
+        self._halt_axes()
+        # The thread can be between its last look at the flag and its next
+        # move command when the flag goes up. One more stop a moment later
+        # catches a move commanded in that gap.
+        QtCore.QTimer.singleShot(300, self._halt_axes_if_sweeping)
+        self.btn_vol_abort.setEnabled(False)
+        self.session.log("volume map: stopped by the operator")
+
+    def _halt_axes(self):
+        stages = self.session.stages
+        if stages is None:
+            return
+        try:
+            stages.stop_all()
+        except ostage.StageError as exc:
+            self.session.log(f"WARNING: volume map: stop failed — {exc}. "
+                             f"Use the emergency stop.")
+
+    def _halt_axes_if_sweeping(self):
+        worker = self._sweep_worker
+        if worker is not None and worker.isRunning():
+            self._halt_axes()
 
     def on_volume_progress(self, i, n, where):
         self.bar_volume.setValue(i)
@@ -1273,6 +1514,8 @@ class MachineTab(QtWidgets.QWidget):
         log = self.session.volume_log
         self.session.volume_runner = None
         self.session.volume_log = None
+        if self.motion is not None and self._sweep_worker is not None:
+            self.motion.retire(self._sweep_worker)
         if float(self.session.out_rate) != self._run_hz:
             self.session.log(
                 f"WARNING: volume map: the output rate changed from "
@@ -1296,14 +1539,21 @@ class MachineTab(QtWidgets.QWidget):
         # overnight run that ends with nothing on disk is the worst outcome
         # available.
         ran = runner.plan if runner is not None else None
-        path = orec.default_name("volume", "npz", self.session.out_dir)
+        path = getattr(self, "_run_path", None) or orec.default_name(
+            "volume", "npz", self.session.out_dir)
+        log.finish_parts()
         try:
             written = log.save(path, self._run_hz, self.session.machine.pose,
                                sync_note=self._sync_note(log, ran))
         except OSError as exc:
-            self.session.log(f"WARNING: volume map: could not be written ({exc})")
+            # The parts are now the only copy: put the last rows in one too.
+            log.checkpoint(force=True)
+            log.finish_parts()
+            self.session.log(f"WARNING: volume map: could not be written ({exc})"
+                             f" -- the .csv parts are kept")
             QtWidgets.QMessageBox.warning(self, "Volume map", str(exc))
             return
+        log.drop_parts()
         done = 0 if runner is None else runner.lines_done
         self.session.log(
             f"volume map: {log.n_rows:,} rows over {done} lines "
@@ -1424,8 +1674,15 @@ class MachineTab(QtWidgets.QWidget):
         self._machine_key = key
 
         if self.session.stages is not None and not self._machine_travel_taken:
-            self._machine_adopt_travel()
+            # Mark it taken BEFORE adopting, not after. Adopting re-reads the
+            # whole-travel box, which invalidates the plan, stops the preview
+            # and so calls back into refresh_machine(force=True) -- and with
+            # the flag still False that re-entry adopted again, recursing
+            # until Python gave up. It did, on every launch with the stages
+            # connected, from 2026-08-31 on: ~9,000 RecursionErrors and 3 GB
+            # of octobee_crash.log.
             self._machine_travel_taken = True
+            self._machine_adopt_travel()
 
         with self.session.prof.time("machine view"):
             self.machine_view.set_pose(pose, stage)

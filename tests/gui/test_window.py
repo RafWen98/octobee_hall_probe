@@ -248,6 +248,62 @@ def test_machine_tab(app, workdir):
         app.processEvents()
 
 
+def test_machine_tab_with_stages(app, workdir):
+    """Stages connected and "whole travel" ticked: what every launch looks like.
+
+    That combination sent refresh_machine round a cycle -- adopt the stage
+    travel, re-read the whole-travel box, stop the preview, refresh_machine
+    again -- with the "travel taken" flag set only after the cycle returned,
+    so it never did. Every bench launch from 2026-08-31 to 2026-11-16 raised a
+    RecursionError and the "Internal error" box. No test connected stages, so
+    none saw it.
+    """
+    print("\nmachine tab, stages connected")
+
+    class Axis:
+        is_open = True
+        position_mm = 10.0
+        limit_mm = (0.0, 250.0)
+        position_trusted = True
+
+    class Stages:
+        names = ["x", "y", "z"]
+
+        def __getitem__(self, name):
+            return Axis()
+
+    ns = argparse.Namespace(
+        uut=None, demo=True, replay=None, no_connect=True,
+        stages=os.path.join(workdir, "stages.json"),
+        geometry=os.path.join(workdir, "stg_geom.json"),
+        calibration=os.path.join(workdir, "stg_cal.json"),
+        machine=os.path.join(workdir, "stg_machine.json"),
+        out_dir=os.path.join(workdir, "stgcaps"),
+        screenshot=None, screenshot_tab=0, screenshot_warmup=0)
+    win = gui.MainWindow(ns)
+    try:
+        tab = win.tab_machine
+        tab.chk_vol_all.setChecked(True)
+        win.session.stages = Stages()
+        tab._machine_travel_taken = False
+        try:
+            tab.refresh_machine(force=True)
+            ok, err = True, ""
+        except RecursionError as exc:
+            ok, err = False, str(exc)
+        check("the first refresh with stages connected returns", ok, err)
+        check("and takes the travel from the axes",
+              win.session.machine.pose.travel_mm["x"] == (0.0, 250.0),
+              str(win.session.machine.pose.travel_mm["x"]))
+        check("which the whole-travel box then shows",
+              tab.vol_spins["size"][0].value() == 250.0,
+              str(tab.vol_spins["size"][0].value()))
+    finally:
+        win.session.stages = None
+        win.close()
+        app.processEvents()
+
+
 def _drag(view, frm, to):
     """Press at one widget pixel, move to another, release. As a mouse does."""
     for kind, at, buttons in (
@@ -443,8 +499,78 @@ def _check_machine_volume(win, app):
     # planning again adds x-z rectangles inside the box to the faces.
     check("the surface-plus-slices pattern is the default",
           tab.cmb_vol_pattern.currentText().startswith("outer surface + "))
-    tab.cmb_vol_pattern.setCurrentText("outer surface")
+    tab.cmb_vol_pattern.setCurrentText("edges only \u2014 check the travel")
     tab.chk_vol_avoid.setChecked(False)
+    tab.on_volume_plan()
+    app.processEvents()
+    check("the edges pattern plans the outline as one continuous path",
+          len(tab._plan.lines) == 15
+          and all(a.end() == b.approach()
+                  for a, b in zip(tab._plan.lines, tab._plan.lines[1:]))
+          and all(ln.part == "edge" for ln in tab._plan.lines)
+          and not tab.spin_vol_slices.isEnabled(),
+          tab.lbl_volume.text()[:120])
+
+    # Stop now has to stop the axes, not only raise a flag: the flag is not
+    # read during the drive to the start of the next line.
+    class FakeWorker:
+        aborted = False
+
+        def isRunning(self):
+            return True
+
+        def abort(self):
+            self.aborted = True
+
+    class FakeStages:
+        stops = 0
+
+        def stop_all(self, immediate=False):
+            FakeStages.stops += 1
+
+    worker, was_stages = FakeWorker(), session.stages
+    session.stages = FakeStages()
+    tab._sweep_worker = worker
+    tab.btn_vol_abort.setEnabled(True)
+    try:
+        tab.on_volume_abort()
+        check("Stop now stops the axes at once and tells the thread to end",
+              FakeStages.stops >= 1 and worker.aborted
+              and not tab.btn_vol_abort.isEnabled(),
+              f"{FakeStages.stops} stop(s), aborted={worker.aborted}")
+        deadline = time.time() + 2.0
+        while FakeStages.stops < 2 and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.02)
+        check("and stops them again in case a move slipped in meanwhile",
+              FakeStages.stops == 2, f"{FakeStages.stops} stop(s)")
+    finally:
+        tab._sweep_worker = None
+        session.stages = was_stages
+    check("the sweep is registered with the window's stop control",
+          tab.motion is win.motion)
+
+    # A box typed past the end of the travel is refused at Plan, not by the
+    # stage once the probe is moving.
+    tab.vol_spins["from"][0].setValue(100.0)
+    check("typing a box past the travel says so straight away",
+          tab.lbl_volume.text().startswith("OUTSIDE THE TRAVEL")
+          and "x:" in tab.lbl_volume.text(), tab.lbl_volume.text()[:120])
+    warned = []
+    real_warning = QtWidgets.QMessageBox.warning
+    QtWidgets.QMessageBox.warning = staticmethod(
+        lambda *a, **k: warned.append(a[2] if len(a) > 2 else ""))
+    try:
+        tab.on_volume_plan()
+    finally:
+        QtWidgets.QMessageBox.warning = real_warning
+    check("and Plan refuses it, with nothing to start",
+          tab._plan is None and not tab.btn_vol_start.isEnabled()
+          and warned and "past the end of the stage travel" in warned[0],
+          str(warned)[:120])
+    tab.vol_spins["from"][0].setValue(0.0)
+
+    tab.cmb_vol_pattern.setCurrentText("outer surface")
     tab.on_volume_plan()
     app.processEvents()
     faces_only = len(tab._plan.lines)
