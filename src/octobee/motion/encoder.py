@@ -47,31 +47,39 @@ which puts the absolute position where it belongs -- on the homing -- and the
 timing where it belongs, on the ADC clock. Both halves are then as good as the
 thing actually responsible for them.
 
-The scale is measured, not typed
---------------------------------
-`fit_axis` steps an axis along a span under the controller, reading the
-counts and the controller's own position at each standstill, and regresses one
-against the other. That identifies which longword belongs to which axis as
-well, empirically, rather than trusting the site order in a comment -- and it
-is a check that can be re-run, which is the half worth having. A typed-in
-counts-per-mm that is wrong by a factor rescales every position in every map
-and looks entirely plausible doing it.
+The scale is known, not fitted
+------------------------------
+The LTS300C moves its carriage exactly 1 mm per motor turn (409,600
+microsteps to the millimetre), and each encoder is a 3,600-line quadrature
+disc coupled 1:1 to its motor. Counted on all four edges that is
 
-What it fits against is the controller's MEASURED displacement, not the
-distance the move was asked for. Those are not the same number, and the
-difference goes straight into the scale: the first calibration run on this rig
-fitted x at 14,341 counts/mm against a commanded 20 mm while y and z came back
-at 14,400 within seven parts per million of each other. Three identical
-stages do not have different gearing -- x had undershot its commanded move by
-81 um, and dividing by 20 instead of by 19.919 put 0.41% into the scale, which
-is 1.2 mm across the 300 mm axis in a column labelled X_mm.
+    3,600 lines x 4 edges x 1 (coupling) / 1 mm per turn = 14,400 counts/mm
 
-Fitting against the controller is also the only thing that is being asked
-here. The encoder is on the motor and the controller counts the same
-leadscrew, so what is wanted is counts per CONTROLLER millimetre -- a gearing
-ratio. Whatever the leadscrew's own pitch error is, both sides inherit it and
-it cancels out of the ratio; it is not something this could measure and not
-something it needs to.
+for every axis, by construction. NOMINAL holds those parts and
+nominal_counts_per_mm() multiplies them out; stages.json carries them under
+encoders.nominal, so a part that is ever changed is changed there.
+
+It used to be fitted against the controller, which was measuring a number
+already known exactly -- and worse than that, a fit absorbs whatever went
+wrong while it ran. A quadrature counter can drop edges but never invent
+them, and every fit saved on this rig came out BELOW 14,400: x by 0.47%, y by
+up to 1.1%, a different amount each run, which no gear ratio does. Saved as
+the scale, each of those wrote one afternoon's count loss into every map
+after it.
+
+So the run that used to calibrate now only checks. It still steps each axis
+under the controller and fits counts against the controller's MEASURED
+position (not the commanded one: a stage that stops 80 um short would put that
+into the fit), and from that it takes three things: which stream column
+follows the axis, which way it counts, and how far its counts per mm are from
+nominal. Within NOMINAL_TOL_PPM is a healthy encoder. Further off -- almost
+always below -- is dropped counts: a slipping coupling, a noisy line, a
+counter missing edges at speed. That is something to find, never a scale.
+
+Comparing against the controller is also all that can be asked here. The
+encoder is on the motor and the controller counts the same leadscrew, so
+whatever the leadscrew's own pitch error is, both sides inherit it and it
+cancels out of the ratio. Only the ruler check can see it.
 
 Why more than two points
 ------------------------
@@ -147,6 +155,52 @@ MIN_CALIBRATION_SPAN_MM = 5.0
 # Below this the axis did not really move and the fit means nothing.
 MIN_CALIBRATION_COUNTS = 100
 
+# What the counts per millimetre IS, from the parts: a 3,600-line encoder,
+# counted on all four quadrature edges, coupled 1:1 to a motor that turns once
+# per millimetre of an LTS300C's leadscrew. Overridden per rig by
+# encoders.nominal in stages.json.
+NOMINAL = {"lines_per_rev": 3600, "edges_per_line": 4, "gear_ratio": 1.0,
+           "lead_mm": 1.0}
+
+# How far a check may land from nominal and still be a healthy encoder. The
+# controller counts microsteps, so against it the ratio is exact and what is
+# left is the fit's own noise -- a few ppm over 100 mm. 200 ppm is 0.06 mm
+# across a 300 mm axis: well clear of that, and well inside the 0.47% x was
+# losing when this was a fitted number.
+NOMINAL_TOL_PPM = 200.0
+
+
+def nominal_parts(spec=None):
+    """NOMINAL, with whatever `spec` overrides, as floats."""
+    parts = dict(NOMINAL)
+    parts.update({k: v for k, v in (spec or {}).items() if k in NOMINAL})
+    return {k: float(v) for k, v in parts.items()}
+
+
+def nominal_counts_per_mm(spec=None):
+    """Counts per millimetre from the parts. Always positive."""
+    p = nominal_parts(spec)
+    if p["lead_mm"] <= 0:
+        raise ValueError("encoders.nominal.lead_mm must be positive")
+    return abs(p["lines_per_rev"] * p["edges_per_line"] * p["gear_ratio"]
+               / p["lead_mm"])
+
+
+def describe_nominal(spec=None):
+    p = nominal_parts(spec)
+    return (f"{p['lines_per_rev']:,.0f} lines x {p['edges_per_line']:g} edges, "
+            f"{p['gear_ratio']:g}:1, {p['lead_mm']:g} mm per turn "
+            f"= {nominal_counts_per_mm(spec):,.1f} counts/mm")
+
+
+def ppm_from_nominal(counts_per_mm, nominal):
+    """How far a measured |counts/mm| is from nominal, in parts per million.
+
+    Negative is fewer counts than the parts say, which is what dropped edges
+    look like.
+    """
+    return (abs(float(counts_per_mm)) / float(nominal) - 1.0) * 1e6
+
 
 def unwrap32(raw, previous=None, offset=0):
     """Continuous int64 counts from wrapping uint32 ones.
@@ -210,13 +264,22 @@ class EncoderMap:
     opposite way to the rig axis, which is a fact about how the thing was
     wired and not something to correct anywhere else.
 
+    With `nominal` (the parts, see NOMINAL) every axis's scale IS the nominal
+    one, and the counts_per_mm given for it supplies only its sign -- so a
+    fitted number left over in a file cannot creep back in. Without it the
+    scales are used as given, which is what a map read back from a sweep's
+    sidecar wants: exactly the numbers that map was made with.
+
     An axis that is absent, or whose scale is zero, is simply not derived from
     the encoder -- the sweep falls back to the controller's own position for
     it and says so. Partial is a real state: one axis can be wired and the
     others not.
     """
 
-    def __init__(self, axes=None):
+    def __init__(self, axes=None, nominal=None):
+        self.nominal = None if nominal is None else nominal_parts(nominal)
+        size = (None if self.nominal is None
+                else nominal_counts_per_mm(self.nominal))
         self.axes = {}
         for name, spec in (axes or {}).items():
             if name not in AXES or not isinstance(spec, dict):
@@ -224,6 +287,8 @@ class EncoderMap:
             scale = float(spec.get("counts_per_mm") or 0.0)
             if spec.get("column") is None or scale == 0.0:
                 continue
+            if size is not None:
+                scale = size if scale > 0 else -size
             self.axes[str(name)] = {"column": int(spec["column"]),
                                     "counts_per_mm": scale}
 
@@ -268,6 +333,12 @@ class EncoderMap:
     def describe(self):
         if not self.axes:
             return "no encoder axes calibrated"
+        if self.nominal is not None:
+            wired = ", ".join(
+                f"{a} = column {s['column']}"
+                + (" (counts down)" if s["counts_per_mm"] < 0 else "")
+                for a, s in sorted(self.axes.items()))
+            return f"{wired}, all at {describe_nominal(self.nominal)}"
         return ", ".join(
             f"{a} = column {s['column']} at {s['counts_per_mm']:,.1f} counts/mm"
             for a, s in sorted(self.axes.items()))
@@ -283,7 +354,8 @@ class EncoderMap:
             return cls()
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        return cls((doc.get("encoders") or {}).get("axes"))
+        enc = doc.get("encoders") or {}
+        return cls(enc.get("axes"), nominal=enc.get("nominal"))
 
     def save(self, path=None, note=""):
         path = path or paths.config(AXIS_CONFIG)
@@ -292,6 +364,12 @@ class EncoderMap:
             with open(path, encoding="utf-8") as fh:
                 doc = json.load(fh)
         doc["encoders"] = {"axes": self.to_dict(), "note": note}
+        if self.nominal is not None:
+            n = self.nominal
+            doc["encoders"]["nominal"] = {
+                "lines_per_rev": int(n["lines_per_rev"]),
+                "edges_per_line": int(n["edges_per_line"]),
+                "gear_ratio": n["gear_ratio"], "lead_mm": n["lead_mm"]}
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, indent=2)
             fh.write("\n")

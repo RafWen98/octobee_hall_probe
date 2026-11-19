@@ -414,9 +414,20 @@ class SweepPlan:
                     out[a] = (min(lo, v), max(hi, v))
         return out
 
-    def rows(self):
-        """How many log rows this will produce, roughly."""
-        return int(round(self.duration_s() * self.log_hz))
+    def rows(self, accel_mm_s2=None):
+        """How many log rows this will produce, roughly.
+
+        Rows are logged only while a line is being swept, so this is the
+        sweeping time alone. It used to be the whole duration, returns and
+        settles included, which promised half as many rows again as any map
+        could have: 869,525 for one that delivered all of its 566,913, and
+        read as a third of the map gone missing.
+        """
+        a = float(self.accel_mm_s2 if accel_mm_s2 is None else accel_mm_s2)
+        v = otim.clamp_velocity(self.speed_mm_s)
+        swept_s = sum(otim.move_time_s(abs(ln.to_mm - ln.from_mm), v, a)
+                      for ln in self.lines)
+        return int(round(swept_s * self.log_hz))
 
     def describe(self):
         if not self.lines:
@@ -1074,10 +1085,11 @@ class SweepRunner:
                     f"WARNING: sweep: line {index + 1}: the {axis} encoder "
                     f"moved {enc:+.3f} mm where its controller moved "
                     f"{ctl:+.3f} mm. This line's {axis} positions are taken "
-                    f"from the controller instead. Check the coupling between "
-                    f"the {axis} encoder and its leadscrew first, then its "
-                    f"lead; if both are sound, calibrate the encoders again. "
-                    f"Further lines are counted, not listed.")
+                    f"from the controller instead. The encoder's scale is "
+                    f"fixed by its parts, so this is lost counts: check the "
+                    f"coupling between the {axis} encoder and its motor "
+                    f"first, then its cable. Further lines are counted, not "
+                    f"listed.")
 
     def _already_at(self, coords, tol_mm=0.002):
         """True if every named axis is within `tol_mm` of `coords` now.
@@ -1357,7 +1369,7 @@ def _part_to_csv(raw, out, timeout_s=900.0):
     # stdin explicitly: under pythonw (and pytest's capture) this process has
     # no valid stdin handle, and inheriting it fails with WinError 6.
     proc = subprocess.run([exe, "-c", _PART_TO_CSV, raw, out],
-                          stdin=subprocess.DEVNULL,
+                          stdin=subprocess.DEVNULL, check=False,
                           cwd=os.path.dirname(os.path.abspath(raw)),
                           creationflags=flags, capture_output=True,
                           timeout=timeout_s)

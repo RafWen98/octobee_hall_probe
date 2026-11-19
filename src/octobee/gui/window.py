@@ -274,7 +274,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tab_machine = MachineTab(self.session, motion=self.motion)
         # Built after the Stages tab, so it cannot be handed to it. What the
         # Machine tab needs to know is only that the stages came or went --
-        # its "Calibrate encoders" button is dead without them, and deciding
+        # its "Check encoders" button is dead without them, and deciding
         # that once at build time left it dead for the whole session.
         self.tab_stages.stages_changed.connect(self.tab_machine.refresh_encoders)
         self.tab_machine.map_finished.connect(self._map_finished)
@@ -1950,6 +1950,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 # have been emitted before the thread finished, so this runs
                 # whether or not the wait was needed.
                 QtWidgets.QApplication.processEvents()
+        # A finished volume map still being written: hours of data that exist
+        # nowhere else until it is. Waited for generously -- it takes
+        # seconds -- and parked rather than destroyed if it is somehow not
+        # done.
+        save = getattr(self.tab_machine, "_save_worker", None)
+        if is_running(save):
+            self.session.log("closing: waiting for the volume map to be "
+                             "written")
+            if not save.wait(300000):
+                _ORPHANED_THREADS.append(save)
         snap = self._snap_worker
         if is_running(snap) and not snap.wait(60000):
             # Still running: dropping our reference would destroy a live

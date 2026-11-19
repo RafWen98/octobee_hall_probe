@@ -1,5 +1,6 @@
 """Background threads. Anything that would otherwise block the event loop."""
 
+import contextlib
 import os
 import threading
 import time
@@ -18,6 +19,57 @@ from octobee.gui.sources import LiveSource
 # ==========================================================================
 # background workers
 # ==========================================================================
+
+# How many decoded blocks each carrier's reader may hold for the GUI thread.
+STREAM_QUEUE_BLOCKS = 1024
+
+
+class MapSaveWorker(QtCore.QThread):
+    """Write a finished volume map without stopping the stream.
+
+    The GUI thread is the one that drains the carriers' queues. Assembling
+    and compressing a map of half a million rows takes several seconds, and
+    done on that thread it overflowed both queues at the end of every long
+    map -- 648 blocks, 6.6 s of stream, on 2026-11-19 -- a hole in the
+    recording running beside it. numpy and zlib let go of the interpreter
+    lock for the heavy parts, so on a thread of its own the tick carries on.
+
+    `done` carries (written path or None, exception or None, kept), `kept`
+    being where the rows went as .csv parts if the .npz could not be written.
+    """
+
+    done = QtCore.pyqtSignal(object, object, str)
+
+    def __init__(self, log, path, log_hz, pose, sync_note):
+        super().__init__()
+        self.log, self.path, self.log_hz = log, path, log_hz
+        self.pose, self.sync_note = pose, sync_note
+
+    def run(self):
+        log = self.log
+        # The parts are a spare copy: whatever stops them, save anyway.
+        with contextlib.suppress(Exception):
+            log.finish_parts()
+        try:
+            written = log.save(self.path, self.log_hz, self.pose,
+                               sync_note=self.sync_note)
+        except Exception as exc:
+            # The .csv parts are now the only copy on disk: put the last
+            # rows in one too.
+            kept = ""
+            try:
+                log.checkpoint(force=True)
+                log.finish_parts()
+                if log.parts_written:
+                    kept = (f" The rows are also on disk as .csv parts in "
+                            f"{os.path.dirname(log.parts_written[-1])}.")
+            except Exception as part_exc:
+                kept = (f" The last .csv part could not be written either "
+                        f"({part_exc}).")
+            self.done.emit(None, exc, kept)
+            return
+        self.done.emit(written, None, "")
+
 
 class ConnectWorker(QtCore.QThread):
     """
@@ -63,8 +115,13 @@ class ConnectWorker(QtCore.QThread):
                 # on the main thread. 128 blocks is ~25 MB per box and buys a
                 # couple of seconds, which covers any single operation the GUI
                 # performs.
+                # ~10 s of stream per carrier (1024 x 2048 samples at
+                # 200 kHz, ~160 kB a block, so ~170 MB at worst and nothing
+                # while the GUI keeps up). 128 was 1.3 s: any stall of the GUI
+                # thread longer than that -- a 3 s compression at the end of a
+                # volume map was one -- dropped blocks from both carriers.
                 st = ob.Streamer(h, lay, block_samples=self.block_samples,
-                                 take_over=False, queue_depth=128)
+                                 take_over=False, queue_depth=STREAM_QUEUE_BLOCKS)
                 st.start()
                 streamers[h] = st
                 self.progress.emit(f"{h}: waiting for data")

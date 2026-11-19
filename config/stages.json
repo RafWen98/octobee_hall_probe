@@ -40,17 +40,23 @@
     "axes": {
       "x": {
         "column": 0,
-        "counts_per_mm": 14332.090909090906
+        "counts_per_mm": 14400.0
       },
       "y": {
         "column": 1,
-        "counts_per_mm": 14392.764545454545
+        "counts_per_mm": 14400.0
       },
       "z": {
         "column": 2,
-        "counts_per_mm": -14385.513181818187
+        "counts_per_mm": -14400.0
       }
     },
-    "note": "multi-point fit against the controller's measured position; x: +14,332.1 c/mm, 100 mm x 11 pts, residual 15.1 um, out/back 302 ppm, out/back agree to 60.7 um; y: +14,392.8 c/mm, 100 mm x 11 pts, residual 26.7 um, out/back 2 ppm, out/back agree to 88.4 um; z: -14,385.5 c/mm, 100 mm x 11 pts, residual 0.3 um, out/back 2001 ppm, out/back agree to 99.2 um"
+    "note": "scale from the parts: 3,600 lines x 4 edges, 1:1, 1 mm per turn = 14,400.0 counts/mm; wiring from the multi-point check of 2026-11-16. The fits it replaced on 2026-11-19 were x +14,332.1 (-4716 ppm); y +14,392.8 (-502 ppm); z -14,385.5 (-1006 ppm): all below nominal, i.e. counts dropped during those runs.",
+    "nominal": {
+      "lines_per_rev": 3600,
+      "edges_per_line": 4,
+      "gear_ratio": 1.0,
+      "lead_mm": 1.0
+    }
   }
 }

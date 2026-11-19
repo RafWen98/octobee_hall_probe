@@ -409,15 +409,24 @@ mm(n) = mm_at_datum + (counts(n) - counts_at_datum) / counts_per_mm
 — which puts absolute position on the homing and timing on the ADC clock, each
 on whichever is actually responsible for it.
 
-**Calibrate encoders** measures the scale rather than asking you to type it. It
-drives each axis 20 mm and back, one at a time, and watches which stream column
-follows it and by how much. Moving one axis at a time is the method, not
-politeness: the column that moved is the column that belongs to the axis that
-moved, and two at once makes that unanswerable — it refuses rather than guessing
-if two columns move together, or if none moves at all. The result goes into
-`stages.json` under `encoders`, beside the rest of the axis facts, and it can be
-re-run as a check. A typed-in counts-per-millimetre that is wrong rescales every
-position in every map and looks entirely plausible doing it.
+**The scale comes from the parts, not from a fit.** The LTS300C moves 1 mm per
+motor turn, and each encoder is a 3,600-line quadrature disc coupled 1:1 to its
+motor, so every axis is 3,600 × 4 edges ÷ 1 mm = **14,400 counts/mm**. The parts
+are written in `stages.json` under `encoders.nominal`; change them there if a
+part is ever changed. The scale used to be fitted against the controller, but
+both count the same leadscrew, so a fit can only rediscover that ratio. Worse,
+it absorbs whatever counts were lost while it ran. An encoder can drop edges
+but never add them, and every fit saved on this rig came out low (x by 0.47 %,
+y by up to 1.1 %), a different amount each run.
+
+**Check encoders** steps each axis over a span, one at a time, and watches which
+stream column follows it. Moving one axis at a time is the method: the column
+that moved belongs to the axis that moved. It refuses rather than guessing if
+two columns move together, or if none moves at all. It saves which column is
+which axis and which way it counts, and keeps the nominal scale. It also
+reports how far each axis's counts per mm came out from nominal. Within
+200 ppm (0.06 mm over 300 mm) is a healthy encoder; further below is dropped
+counts, reported as a warning to find, never saved.
 
 An encoder is believed only while it agrees with its controller. At the end of
 every line, standing still, the sweep compares how far each encoder says its
@@ -427,9 +436,8 @@ that line, with a warning on the first line it happens and a count at the end;
 the sidecar lists the lines under `position_fallback_lines` and what was found
 under `encoder_disagreed`. The usual cause on this rig is mechanical: the
 coupling between an encoder and its leadscrew breaks and slips, and the count
-comes up short by a steady fraction. Check the coupling before the lead, and
-do not press Calibrate encoders until it is sound — that would save the slip as
-the scale. A map made before this check existed can be repaired the same way
+comes up short by a steady fraction. Check the coupling before the cable;
+Check encoders will show the shortfall in ppm once it is sound again. A map made before this check existed can be repaired the same way
 afterwards: `python tools/rescue_positions.py captures/volume_….npz` writes
 `…_rescued.npz` beside it and leaves the original alone.
 

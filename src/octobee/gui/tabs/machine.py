@@ -28,6 +28,7 @@ from octobee.gui.widgets.machine3d import MachineView3D
 from octobee.gui.workers import (
     EncoderCalibrationWorker,
     EncoderReferenceWorker,
+    MapSaveWorker,
     PlanWorker,
     SweepWorker,
 )
@@ -123,6 +124,9 @@ class MachineTab(QtWidgets.QWidget):
         self._plan = None               # the last computed SweepPlan
         self._plan_worker = None
         self._sweep_worker = None
+        # The finished map being written, off the GUI thread.
+        self._save_worker = None
+        self._save_ctx = None
         self._preview = None            # [points, index] while animating
         self._preview_at = None          # the made-up stage reading it implies
         self._preview_timer = None
@@ -501,11 +505,16 @@ class MachineTab(QtWidgets.QWidget):
         self.lbl_encoders = QtWidgets.QLabel("")
         self.lbl_encoders.setWordWrap(True)
         self.lbl_encoders.setStyleSheet("color:#9aa3b2; font-size:11px;")
-        self.btn_vol_encoders = QtWidgets.QPushButton("Calibrate encoders")
+        self.btn_vol_encoders = QtWidgets.QPushButton("Check encoders")
         self.btn_vol_encoders.setToolTip(
             "Drive each axis a known distance and watch the quadrature counts "
             "that arrive with the field samples, to find which stream column "
-            "belongs to which axis and how many counts make a millimetre.\n\n"
+            "belongs to which axis, which way it counts, and whether it gives "
+            "the counts per millimetre its parts say it must (3,600 lines x 4 "
+            "edges, 1:1, 1 mm leadscrew = 14,400). The scale itself is never "
+            "fitted: an encoder can only lose counts, so a fitted scale "
+            "would save whatever it lost during the run. Fewer counts than "
+            "nominal means dropped edges, and is reported as such.\n\n"
             "Worth doing because those counts are latched by the ADC clock: a "
             "position taken from them belongs to the sample it is written "
             "against, where one polled over USB is a few milliseconds stale "
@@ -749,8 +758,23 @@ class MachineTab(QtWidgets.QWidget):
         if session.encoders:
             session.log(f"encoders: {session.encoders.describe()} "
                         f"— from {session.stages_path}")
-            self._warn_if_axes_disagree(session.encoders.to_dict(),
-                                        "loaded from file")
+            if session.encoders.nominal is None:
+                # A file from before the scale was fixed by the parts: every
+                # number in it was fitted, and fitted low wherever counts were
+                # dropped during the run. Used as it stands, it stretches every
+                # position on those axes.
+                size = oenc.nominal_counts_per_mm()
+                worst = max(session.encoders.axes.items(),
+                            key=lambda kv: abs(oenc.ppm_from_nominal(
+                                kv[1]["counts_per_mm"], size)))
+                ppm = oenc.ppm_from_nominal(worst[1]["counts_per_mm"], size)
+                if abs(ppm) > oenc.NOMINAL_TOL_PPM:
+                    session.log(
+                        f"WARNING: encoders: {session.stages_path} holds "
+                        f"fitted scales, not the {size:,.0f} counts/mm the "
+                        f"parts give -- {worst[0]} is {ppm:+.0f} ppm off "
+                        f"({abs(ppm) * 3e-4:.2f} mm over 300 mm). Press "
+                        f"Check encoders to switch to the nominal scale.")
         if session.coils is not None:
             session.log(f"coil set: {session.coils.note} — "
                         f"{session.machine.coil_file}")
@@ -1373,8 +1397,12 @@ class MachineTab(QtWidgets.QWidget):
             f"Each axis will be run over {span:g} mm, one at a time, "
             f"stopping at {points} places, {passes} times -- up the points, "
             f"down them, then up again, each one approached from below -- to "
-            f"see which stream column follows it and by how many counts per "
-            f"millimetre, and whether it comes out the same each time.\n\n"
+            f"see which stream column follows it, which way it counts, and "
+            f"whether it gives the "
+            f"{oenc.nominal_counts_per_mm(self._nominal_spec()):,.0f} counts "
+            f"per millimetre its parts say it must.\n\n"
+            f"The scale stays the nominal one whatever this finds; what is "
+            f"saved is which column is which axis.\n\n"
             f"That is {3 * passes * points} stops and several minutes. The "
             f"span is centred on where the axis is standing and clamped to "
             f"the room it has. Every axis is returned to where it was "
@@ -1385,7 +1413,7 @@ class MachineTab(QtWidgets.QWidget):
         if reply != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         self.btn_vol_encoders.setEnabled(False)
-        self.lbl_encoders.setText("calibrating…")
+        self.lbl_encoders.setText("checking…")
         self._enc_worker = EncoderCalibrationWorker(
             self.session.stages, self._counts_now, span_mm=span,
             points=points, passes=passes)
@@ -1479,148 +1507,129 @@ class MachineTab(QtWidgets.QWidget):
         ]
         for line in lines:
             self.session.log("ruler check: " + line)
-        old = (self.session.encoders.axes.get(axis, {})
-               if self.session.encoders else {}).get("counts_per_mm")
-        shown = "\n".join(lines)
-        if old:
-            shown += (f"\n\nstages.json has {axis} at {old:+,.1f}; this is "
-                      f"{(abs(k) / abs(old) - 1) * 100:+.2f}% from it.")
-        shown += ("\n\nSave this as the encoder scale for " + axis + "?\n"
-                  "(Choose No to keep what is there and only keep the log.)")
-        reply = QtWidgets.QMessageBox.question(
-            self, "Ruler check", shown,
-            QtWidgets.QMessageBox.StandardButton.Yes
-            | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No)
-        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
-            return
-        spec = {"column": int(result["column"]), "counts_per_mm": float(k)}
-        merged = dict(self.session.encoders.to_dict()) \
-            if self.session.encoders else {}
-        merged[axis] = spec
-        self.session.encoders = oenc.EncoderMap(merged)
-        path = self.session.encoders.save(
-            self.session.stages_path,
-            note=(f"{axis}: {k:+,.1f} c/mm per true mm, measured against a "
-                  f"ruler at {result['n']} points over {span:g} mm, "
-                  f"controller factor {f:.4f}; other axes as before"))
-        self.session.log(f"encoders: {self.session.encoders.describe()} "
-                         f"-> written to {path}")
-        self.refresh_encoders()
+        size = oenc.nominal_counts_per_mm(self._nominal_spec())
+        pitch_ppm = oenc.ppm_from_nominal(k, size)
+        line = (f"{axis}: the parts give {size:,.0f} counts per controller "
+                f"mm; per ruler mm it is {pitch_ppm:+.0f} ppm from that. That "
+                f"difference is the leadscrew's own pitch error (or the "
+                f"ruler's), which an encoder on the motor cannot see.")
+        self.session.log("ruler check: " + line)
+        QtWidgets.QMessageBox.information(
+            self, "Ruler check",
+            "\n".join(lines) + "\n\n" + line
+            + "\n\nNothing is saved: the encoder scale is fixed by its parts. "
+              "The numbers are in the log.")
 
     def _on_enc_progress(self, done, total):
         """Standstills taken so far. A long run needs to look like it is one."""
         if done < total:
             self.lbl_encoders.setText(
-                f"calibrating… {done}/{total} standstills")
+                f"checking… {done}/{total} standstills")
+
+    def _nominal_spec(self):
+        """The parts the encoder scale comes from: the file's, else NOMINAL."""
+        enc = self.session.encoders
+        return dict(enc.nominal) if enc and enc.nominal is not None else {}
 
     @staticmethod
-    def _encoder_note(found):
-        """One line for stages.json recording how good the fit was.
+    def _encoder_note(found, nominal):
+        """One line for stages.json recording what the last check found.
 
-        The scale alone cannot be told apart from a wrong scale later, and
-        this file is the only thing that outlives the session it was measured
-        in. So the residual goes in beside it.
+        The scale beside it is the nominal one; this says how close the
+        encoders actually came to it, which is the only thing that can tell a
+        healthy encoder from one dropping counts once the session is over.
         """
         parts = []
         for axis, spec in sorted(found.items()):
-            bits = [f"{spec['counts_per_mm']:+,.1f} c/mm"]
+            bits = [f"column {spec['column']}",
+                    "counts down" if spec["counts_per_mm"] < 0
+                    else "counts up",
+                    f"measured {abs(spec['counts_per_mm']):,.1f} c/mm "
+                    f"({spec['ppm_from_nominal']:+.0f} ppm)"]
             if spec.get("span_mm"):
                 bits.append(f"{spec['span_mm']:g} mm x {spec.get('points')} pts")
             if spec.get("residual_um") is not None:
                 bits.append(f"residual {spec['residual_um']:.1f} um")
-            if spec.get("passes"):
-                bits.append(f"{spec['passes']} passes")
             if spec.get("pass_spread_ppm") is not None:
                 bits.append(f"passes agree to {spec['pass_spread_ppm']:.0f} ppm")
-            if spec.get("nonlinearity_um") is not None:
-                bits.append(
-                    f"{spec['nonlinearity_um']:.1f} um from straight")
             parts.append(f"{axis}: " + ", ".join(bits))
-        return ("multi-point fit against the controller's measured position; "
-                + "; ".join(parts))
+        return (f"scale from the parts: {oenc.describe_nominal(nominal)}; "
+                f"wiring checked against the controller; " + "; ".join(parts))
 
     def on_volume_calibrated(self, found, err):
-        """Adopt whatever was measured, and say plainly what was not."""
+        """Keep the wiring that was found, and say how far from nominal it was.
+
+        The scale is never taken from the run. What the run is good for is
+        which column follows which axis and which way -- and, by comparing its
+        counts per millimetre with the parts', whether the encoder kept every
+        edge while it was being watched.
+        """
         self._enc_busy = False
         self._retire(self._enc_worker)
-        # An axis whose passes disagree is not a measurement, and writing it
-        # over a scale that was at least measured once would make the file
-        # worse. Say so and keep what was there.
-        unrepeatable = {a: s for a, s in (found or {}).items()
-                        if not s.get("repeatable", True)}
-        if unrepeatable:
-            found = {a: s for a, s in found.items() if a not in unrepeatable}
-            for axis, spec in sorted(unrepeatable.items()):
+        found = dict(found or {})
+        nominal = self._nominal_spec()
+        size = oenc.nominal_counts_per_mm(nominal)
+        span = max(hi - lo for lo, hi
+                   in self.session.machine.pose.travel_mm.values())
+        faults = []
+        for axis, spec in sorted(found.items()):
+            ppm = oenc.ppm_from_nominal(spec["counts_per_mm"], size)
+            spec["ppm_from_nominal"] = round(ppm, 1)
+            self.session.log(
+                f"encoders: {axis}: column {spec['column']}, counts "
+                f"{'down' if spec['counts_per_mm'] < 0 else 'up'}, measured "
+                f"{abs(spec['counts_per_mm']):,.1f} counts/mm against "
+                f"{size:,.0f} nominal ({ppm:+.0f} ppm, "
+                f"{ppm * 1e-6 * span:+.3f} mm over {span:g} mm)")
+            if abs(ppm) > oenc.NOMINAL_TOL_PPM:
+                faults.append(f"{axis}: {ppm:+.0f} ppm from nominal")
                 self.session.log(
-                    f"WARNING: encoders: {axis} was NOT saved -- its passes "
-                    f"disagreed by {spec['pass_spread_ppm']:.0f} ppm. The "
-                    f"scale in stages.json is unchanged. Something is moving "
-                    f"between passes (slip, a loose coupling, a sensor "
-                    f"reading before the stage has stopped); that wants "
-                    f"finding before another run will help.")
-            err = "; ".join(filter(None, [err] + [
-                f"{a}: passes disagree by {s['pass_spread_ppm']:.0f} ppm, "
-                f"not saved" for a, s in sorted(unrepeatable.items())]))
+                    f"WARNING: encoders: {axis} came out {ppm:+.0f} ppm from "
+                    f"the {size:,.0f} counts/mm its parts give, more than the "
+                    f"{oenc.NOMINAL_TOL_PPM:.0f} ppm a healthy encoder stays "
+                    f"within. "
+                    + ("Fewer counts than the parts allow is dropped edges: "
+                       "check the coupling to the motor shaft first (a "
+                       "slipping set screw), then the encoder cable and its "
+                       "shield. "
+                       if ppm < 0 else
+                       "More counts than the parts allow is not something an "
+                       "encoder does: check the encoder's line count and the "
+                       "gearing in stages.json (encoders.nominal). ")
+                    + "The scale stays nominal; positions on this axis will "
+                      "be wrong by whatever it keeps dropping, and the "
+                      "end-of-line check in a map will say so.")
+            if not spec.get("repeatable", True):
+                faults.append(f"{axis}: passes disagree by "
+                              f"{spec['pass_spread_ppm']:.0f} ppm")
         if found:
-            merged = dict(self.session.encoders.to_dict())
-            merged.update(found)
-            self.session.encoders = oenc.EncoderMap(merged)
+            merged = (dict(self.session.encoders.to_dict())
+                      if self.session.encoders else {})
+            merged.update({a: {"column": s["column"],
+                               "counts_per_mm": s["counts_per_mm"]}
+                           for a, s in found.items()})
+            self.session.encoders = oenc.EncoderMap(merged, nominal=nominal)
             path = self.session.encoders.save(
-                self.session.stages_path, note=self._encoder_note(found))
+                self.session.stages_path,
+                note=self._encoder_note(found, nominal))
             self.session.log(f"encoders: {self.session.encoders.describe()} "
                              f"-> written to {path}")
-            self._warn_if_axes_disagree(found, "this run")
         if err:
             self.session.log(f"WARNING: encoders: {err}")
         self.refresh_encoders()
-        if err:
-            QtWidgets.QMessageBox.warning(
-                self, "Encoders",
-                "Not every axis could be calibrated:\n\n  "
-                + "\n  ".join(err.split("; "))
-                + "\n\nWhatever was measured has been kept; the rest fall "
-                  "back to the controller's own position.")
-
-    def _warn_if_axes_disagree(self, found, source="this run"):
-        """Say so when one axis's scale is the odd one out.
-
-        A warning rather than a refusal: two axes of genuinely different pitch
-        would trip this legitimately, and the operator knows what is bolted to
-        the rig where the software does not. See encoder.odd_axis_out for why
-        the axes are each other's only check here.
-
-        Run on the way IN as well as on the way out of a calibration. A scale
-        read back from stages.json is used exactly as hard as one just
-        measured, and it outlives the session that measured it -- so a bad one
-        would otherwise be caught once, on the day, and never again.
-        """
-        scales = {a: s.get("counts_per_mm") for a, s in found.items()}
-        odd = oenc.odd_axis_out(scales)
-        if odd is None:
-            if len(scales) >= 3:
-                self.session.log(
-                    f"encoders ({source}): all {len(scales)} axes agree on "
-                    f"their counts per millimetre to within 0.1% -- which is "
-                    f"what identical stages should do")
-            return
-        axis, frac = odd
-        spec = found[axis]
-        detail = ""
-        if spec.get("residual_um") is not None:
-            detail = f" Its own fit residual was {spec['residual_um']:.1f} um."
-        # In millimetres as well as per cent, because a percentage of a
-        # gearing ratio is not a quantity anyone can picture and the length of
-        # the axis is what it actually costs.
-        span = max(hi - lo for lo, hi
-                   in self.session.machine.pose.travel_mm.values())
-        self.session.log(
-            f"WARNING: encoders ({source}): {axis} is {frac * 100:+.2f}% from "
-            f"the other axes ({abs(spec['counts_per_mm']):,.1f} counts/mm), "
-            f"which is {abs(frac) * span:.1f} mm across a {span:g} mm axis. "
-            f"Identical stages share a gearing ratio, so this is more likely a "
-            f"bad run on {axis} than a real difference.{detail} Re-run it, "
-            f"with a longer span if there is room.")
+        if err or faults:
+            text = ""
+            if faults:
+                text += ("Not every encoder gave the counts its parts say it "
+                         "must:\n\n  " + "\n  ".join(faults)
+                         + "\n\nThat is lost counts, not a different scale "
+                           "-- details in the log. ")
+            if err:
+                text += ("Not every axis could be checked:\n\n  "
+                         + "\n  ".join(err.split("; ")) + "\n\n")
+            text += ("The wiring that was found has been kept, at the "
+                     "nominal scale.")
+            QtWidgets.QMessageBox.warning(self, "Encoders", text.strip())
 
     # ---- flying the path -------------------------------------------------
     def on_volume_preview(self):
@@ -1700,6 +1709,11 @@ class MachineTab(QtWidgets.QWidget):
     # ---- running it ------------------------------------------------------
     def on_volume_start(self):
         if self._sweep_worker is not None and self._sweep_worker.isRunning():
+            return
+        if self.saving_map():
+            self.session.log("volume map: the last map is still being "
+                             "written -- start again when it says where it "
+                             "went")
             return
         if self._plan is None or not self._plan.lines:
             return
@@ -1953,29 +1967,33 @@ class MachineTab(QtWidgets.QWidget):
         path = getattr(self, "_run_path", None) or orec.default_name(
             "volume", "npz", self.session.out_dir)
         pose = self._run_pose or self.session.machine.pose
-        log.finish_parts()
-        try:
-            written = log.save(path, self._run_hz, pose,
-                               sync_note=self._sync_note(log, ran))
-        except Exception as exc:
+        # Off the GUI thread: that thread drains the stream, and the seconds
+        # a large map takes to assemble and compress used to overflow both
+        # carriers' queues -- a hole in any recording running alongside.
+        self._save_ctx = (log, runner, err)
+        self.btn_vol_start.setEnabled(False)
+        self.bar_volume.setFormat("saving the map…")
+        self.session.log(f"volume map: writing {log.n_rows:,} rows…")
+        self._save_worker = MapSaveWorker(
+            log, path, self._run_hz, pose, self._sync_note(log, ran))
+        self._save_worker.done.connect(self._on_volume_saved)
+        self._save_worker.start()
+
+    def saving_map(self):
+        w = self._save_worker
+        return w is not None and w.isRunning()
+
+    def _on_volume_saved(self, written, exc, kept):
+        log, runner, err = self._save_ctx
+        self._save_ctx = None
+        self.bar_volume.setFormat("%p%")
+        self.btn_vol_start.setEnabled(bool(self._plan and self._plan.lines))
+        if exc is not None:
             # Anything, not only OSError. This is the only copy of the run,
             # and an error in assembling it used to leave the handler without
             # a word and the hours with it. Keep the log reachable, so the
             # save can be tried again from the session.
             self.session.volume_log = log
-            # The .csv parts are now the only copy on disk: put the last rows
-            # in one too. Guarded, because whatever stopped the .npz may stop
-            # this as well and the message below still has to be shown.
-            kept = ""
-            try:
-                log.checkpoint(force=True)
-                log.finish_parts()
-                if log.parts_written:
-                    kept = (f" The rows are also on disk as .csv parts in "
-                            f"{os.path.dirname(log.parts_written[-1])}.")
-            except Exception as part_exc:
-                self.session.log(f"WARNING: volume map: the last .csv part "
-                                 f"could not be written either ({part_exc})")
             self.session.log(
                 f"WARNING: volume map: could not be written "
                 f"({type(exc).__name__}: {exc}). The data is still in memory "
