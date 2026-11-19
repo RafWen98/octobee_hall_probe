@@ -419,6 +419,20 @@ if two columns move together, or if none moves at all. The result goes into
 re-run as a check. A typed-in counts-per-millimetre that is wrong rescales every
 position in every map and looks entirely plausible doing it.
 
+An encoder is believed only while it agrees with its controller. At the end of
+every line, standing still, the sweep compares how far each encoder says its
+axis has moved since the line's datum with how far the controller says it has.
+More than 0.2 mm apart and that axis is positioned from the controller polls for
+that line, with a warning on the first line it happens and a count at the end;
+the sidecar lists the lines under `position_fallback_lines` and what was found
+under `encoder_disagreed`. The usual cause on this rig is mechanical: the
+coupling between an encoder and its leadscrew breaks and slips, and the count
+comes up short by a steady fraction. Check the coupling before the lead, and
+do not press Calibrate encoders until it is sound — that would save the slip as
+the scale. A map made before this check existed can be repaired the same way
+afterwards: `python tools/rescue_positions.py captures/volume_….npz` writes
+`…_rescued.npz` beside it and leaves the original alone.
+
 Lines still never reverse, for `octobee/motion/scan.py`'s reason: the leadscrew
 has backlash and a serpentine would stamp a fixed offset into every other line.
 Each line is swept in the +ve direction and the axis returns to the start of the

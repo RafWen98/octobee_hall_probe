@@ -109,6 +109,16 @@ MAX_SPEED_MM_S = 6.0
 # sample every 0.1 mm -- already finer than the leadscrew is accurate.
 DEFAULT_LOG_HZ = 100.0
 
+# How far an encoder may end a line from where the controller says the axis
+# is before that line's positions are taken from the controller instead. Both
+# count turns of the same screw, so standing still they agree to micrometres;
+# 0.2 mm is far outside that and far inside a grid step. What it catches is an
+# encoder that has stopped following the screw -- a coupling that has broken
+# and slips, a lead that has lost a phase -- or a counts-per-mm that is wrong.
+# On this rig a broken coupling read 29 % short for two days of maps before
+# anyone looked.
+ENCODER_TOL_MM = 0.2
+
 # How long to sit still at the start of a line before the sweep begins, so the
 # first samples are not the tail of the move that got there.
 DEFAULT_SETTLE_S = 0.5
@@ -979,6 +989,8 @@ class SweepRunner:
         self.line_index = -1
         self.counts_now = None
         self.lines_done = 0
+        # {axis: lines on which its encoder disagreed with its controller}
+        self.encoder_faults = {}
         self.aborted = False
 
     def _go(self, where, should_abort, settle_s=0.0):
@@ -1025,6 +1037,47 @@ class SweepRunner:
         while self.counts_now is was and time.monotonic() < deadline:
             time.sleep(POLL_S)
         return self.counts_now
+
+    def _check_encoders(self, index):
+        """Compare each encoder with its controller, the line just swept.
+
+        Called standing still at the end of a line, the one moment both can be
+        read with nothing to interpolate. An axis whose encoder has moved a
+        different distance since the line's datum than its controller has is
+        taken out of that line's datum, so the line is positioned from the
+        controller polls -- and said, on the first line it happens, not found
+        in the data days later.
+        """
+        datum = self.log.datum.get(index)
+        if not datum:
+            return
+        counts = self._fresh_counts()
+        if counts is None:
+            return
+        counts = np.asarray(counts, dtype=float).ravel()
+        for axis, (c0, mm0) in sorted(datum.items()):
+            spec = self.log.encoders.axes.get(axis)
+            if spec is None or spec["column"] >= len(counts):
+                continue
+            try:
+                ctl = float(self.stages[axis].position_mm) - float(mm0)
+            except Exception:
+                continue                    # not a reason to end a sweep
+            enc = float(self.log.encoders.displacement_mm(
+                counts[spec["column"]], axis, c0))
+            if abs(enc - ctl) <= ENCODER_TOL_MM:
+                continue
+            self.log.distrust_encoder(index, axis, enc, ctl)
+            n = self.encoder_faults[axis] = self.encoder_faults.get(axis, 0) + 1
+            if n == 1:
+                self.log_fn(
+                    f"WARNING: sweep: line {index + 1}: the {axis} encoder "
+                    f"moved {enc:+.3f} mm where its controller moved "
+                    f"{ctl:+.3f} mm. This line's {axis} positions are taken "
+                    f"from the controller instead. Check the coupling between "
+                    f"the {axis} encoder and its leadscrew first, then its "
+                    f"lead; if both are sound, calibrate the encoders again. "
+                    f"Further lines are counted, not listed.")
 
     def _already_at(self, coords, tol_mm=0.002):
         """True if every named axis is within `tol_mm` of `coords` now.
@@ -1231,6 +1284,7 @@ class SweepRunner:
                         f"{axis}: line {i + 1} ended at {at:.3f} mm, not the "
                         f"{line.to_mm:.3f} mm it was sent to -- the move did "
                         f"not run, or did not finish. The sweep ends here.")
+                self._check_encoders(i)
                 doc["completed"] = True
                 self.lines_done = i + 1
                 # Between lines, standing still: the only place a part can be
@@ -1246,6 +1300,11 @@ class SweepRunner:
                 except Exception as exc:
                     self.log_fn(f"sweep: could not put {a}'s speed back "
                                 f"({exc}) -- check it before the next move")
+        for axis, n in sorted(self.encoder_faults.items()):
+            self.log_fn(
+                f"WARNING: sweep: the {axis} encoder disagreed with its "
+                f"controller on {n} line(s); those lines' {axis} positions "
+                f"come from the controller. Check the encoder's coupling.")
         self.log_fn(f"sweep: {self.lines_done} of {len(self.plan.lines)} lines"
                     + (" (aborted)" if self.aborted else ""))
         return self.lines_done
@@ -1330,6 +1389,9 @@ class SweepLog:
         # line, standing still, before the sweep starts: an encoder counts
         # displacement and has to be told where it started from.
         self.datum = {}
+        # {line: {axis: {...}}} where an encoder ended the line somewhere its
+        # controller did not: see distrust_encoder().
+        self.encoder_disagreed = {}
         self.t_wall0 = None
         self.n_rows = 0
         self._parts = None            # set by keep_parts()
@@ -1519,6 +1581,20 @@ class SweepLog:
         if datum:
             self.datum[int(line_index)] = dict(datum)
 
+    def distrust_encoder(self, line_index, axis, encoder_mm, controller_mm):
+        """This line's encoder did not follow its axis: use the polls for it.
+
+        The axis is taken out of the line's datum, which is all assemble()
+        needs to position it from the controller instead, and what was found
+        is kept for the sidecar. The raw counts stay in the file.
+        """
+        li = int(line_index)
+        was = self.datum.get(li, {}).pop(axis, None)
+        self.encoder_disagreed.setdefault(li, {})[axis] = {
+            "encoder_mm": float(encoder_mm),
+            "controller_mm": float(controller_mm),
+            "datum": None if was is None else [float(v) for v in was]}
+
     def add_poll(self, t_s, pos_mm, line_index):
         self.poll_t_s.append(float(t_s))
         self.poll_mm.append([float(pos_mm.get(a, np.nan)) for a in AXES])
@@ -1690,6 +1766,9 @@ class SweepLog:
             "position_fallback_lines": self.fallback_lines(),
             "encoders": self.encoders.to_dict(),
             "encoder_datum": {str(k): v for k, v in sorted(self.datum.items())},
+            "encoder_disagreed": {
+                str(k): v for k, v in sorted(self.encoder_disagreed.items())},
+            "encoder_tolerance_mm": ENCODER_TOL_MM,
             "position_accuracy": (
                 "Both sources count turns of the same 1 mm leadscrew: the "
                 "encoders are rotary, on the motors, and the LTS300C has no "
@@ -1719,3 +1798,119 @@ class SweepLog:
             with open(base + ".json", encoding="utf-8") as fh:
                 side = json.load(fh)
         return arrays, side
+
+
+# How close to a line's last controller read its rows must come for the two
+# to be compared there, standing still. Rows that stop earlier -- blocks were
+# dropped, or the line was cut off -- are compared while moving instead, with
+# MOVING_SLACK_MM allowed for the controller's USB latency at sweep speed.
+_END_WINDOW_S = 0.3
+MOVING_SLACK_MM = 0.5
+
+
+def rebuild_positions(arrays, side, placement=None, tol_mm=ENCODER_TOL_MM,
+                      force=()):
+    """Reposition a saved map's lines whose encoder did not follow its axis.
+
+    For maps made before the sweep checked this itself. Returns
+    (arrays, side, report): copies with `pos_mm`, `pos_machine_mm` and
+    `in_span` redone, and report = {axis: [{"line", "encoder_mm",
+    "controller_mm"}, ...]} of what was changed. Nothing else is touched --
+    the field, the raw counts and the polls are the same arrays.
+
+    A line is judged the way the sweep now judges it: where the encoder says
+    the axis ended against where the controller says it did. An axis that
+    fails on a line gets that line's positions from the controller polls,
+    interpolated onto the sample clock exactly as assemble() does for an axis
+    with no encoder; rows outside the polls become NaN. `force` names axes to
+    rebuild on every line regardless.
+
+    `placement` redoes the machine-frame column; without it the rebuilt rows
+    are NaN there rather than left where the encoder put them.
+    """
+    arrays = dict(arrays)
+    side = json.loads(json.dumps(side))
+    t_s = np.asarray(arrays["t_s"], dtype=float)
+    line_index = np.asarray(arrays["line_index"])
+    counts = np.asarray(arrays["counts"], dtype=float)
+    pos = np.array(arrays["pos_mm"], dtype=float)
+    polls_t = np.asarray(arrays["poll_t_s"], dtype=float)
+    polls_p = np.asarray(arrays["poll_mm"], dtype=float).reshape(-1, 3)
+    polls_l = np.asarray(arrays["poll_line"])
+    emap = oenc.EncoderMap(side.get("encoders") or {})
+    datums = side.get("encoder_datum") or {}
+    report, touched = {}, np.zeros(len(t_s), dtype=bool)
+    for li in np.unique(line_index):
+        datum = datums.get(str(int(li))) or {}
+        rows = np.flatnonzero(line_index == li)
+        keep = (polls_l == li) & np.isfinite(polls_p).all(axis=1)
+        if keep.sum() < 2 or not len(rows):
+            continue
+        order = np.argsort(polls_t[keep])
+        pt, pp = polls_t[keep][order], polls_p[keep][order]
+        tr = t_s[rows]
+        inside = (tr >= pt[0]) & (tr <= pt[-1])
+        for axis in sorted(datum):
+            if axis not in emap or emap.axes[axis]["column"] >= counts.shape[1]:
+                continue
+            k = AXES.index(axis)
+            c0, mm0 = datum[axis]
+            enc = mm0 + emap.displacement_mm(
+                counts[rows, emap.axes[axis]["column"]], axis, c0)
+            ctl = np.interp(tr, pt, pp[:, k])
+            if pt[-1] - tr[-1] <= _END_WINDOW_S:
+                # Logged through to the stop: compare where each ended.
+                off, allowed = enc[-1] - pp[-1, k], tol_mm
+                found = (float(enc[-1] - mm0), float(pp[-1, k] - mm0))
+            else:
+                d = (enc - ctl)[inside]
+                if not len(d) or not np.isfinite(d).any():
+                    continue
+                at = int(np.nanargmax(np.abs(d)))
+                off, allowed = d[at], tol_mm + MOVING_SLACK_MM
+                found = (float(enc[inside][at] - mm0),
+                         float(ctl[inside][at] - mm0))
+            if not (abs(off) > allowed or axis in force):
+                continue
+            pos[rows[inside], k] = ctl[inside]
+            pos[rows[~inside], k] = np.nan
+            touched[rows] = True
+            report.setdefault(axis, []).append(
+                {"line": int(li), "encoder_mm": found[0],
+                 "controller_mm": found[1]})
+            side.setdefault("encoder_disagreed", {}).setdefault(
+                str(int(li)), {})[axis] = {
+                    "encoder_mm": found[0], "controller_mm": found[1],
+                    "datum": [float(c0), float(mm0)]}
+            datum.pop(axis)
+
+    in_span = np.zeros(len(t_s), dtype=bool)
+    for li, doc in enumerate(side.get("lines") or []):
+        rows = line_index == li
+        if rows.any():
+            here = pos[:, AXES.index(doc["sweep"])]
+            in_span |= (rows & (here >= doc["start_mm"])
+                        & (here <= doc["stop_mm"]))
+    machine = np.array(arrays["pos_machine_mm"], dtype=float)
+    if placement is None:
+        machine[touched] = np.nan
+    else:
+        machine = placement.flange_path_mm(np.nan_to_num(pos))
+        machine[~np.isfinite(pos).all(axis=1)] = np.nan
+    arrays.update(pos_mm=pos, pos_machine_mm=machine, in_span=in_span)
+    side["position_fallback_lines"] = {
+        a: sorted({*side.get("position_fallback_lines", {}).get(a, []),
+                   *(r["line"] for r in rs)})
+        for a, rs in report.items()} | {
+        a: v for a, v in side.get("position_fallback_lines", {}).items()
+        if a not in report}
+    side["encoder_tolerance_mm"] = float(tol_mm)
+    if report:
+        side["positions_rebuilt"] = (
+            "On the lines listed in position_fallback_lines the encoder did "
+            "not end where its controller did, so that axis is positioned "
+            "from the controller polls, interpolated onto the sample clock. "
+            "Their timing is the USB poll's, good to a few tenths of a "
+            "millimetre at sweep speed; the encoder's own counts are still "
+            "in `counts`.")
+    return arrays, side, report

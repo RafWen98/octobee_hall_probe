@@ -1,5 +1,6 @@
 """Mapping a volume by sweeping it: the plan, the run, and what is logged."""
 
+import importlib.util
 import itertools
 import json
 import os
@@ -506,6 +507,161 @@ def test_sweep_positions_come_from_the_encoders(workdir):
     check("the sidecar does not claim the encoders improved the accuracy",
           "timing, not accuracy" in side["position_accuracy"],
           side["position_accuracy"][:80])
+
+
+_SLIPPED = {}
+
+
+def _slipped_sweep():
+    """(log, runner, what was said) for one sweep with a 29 % short encoder.
+
+    Run once and shared: the simulated rig moves in real time, and a sweep is
+    half a minute.
+    """
+    if not _SLIPPED:
+        said = []
+        log, runner = _sweep_with_a_slipping_encoder(0.71, said)
+        _SLIPPED.update(log=log, runner=runner, said=said)
+    return _SLIPPED["log"], _SLIPPED["runner"], _SLIPPED["said"]
+
+
+def _sweep_with_a_slipping_encoder(slip, said):
+    """One x sweep whose x encoder counts `slip` of what the axis moves."""
+    counts_per_mm = 2048.0
+    rig = _Rig(speed=40.0)
+    v = osweep.Volume((10.0, 0.0, 0.0), (60.0, 20.0, 0.0), step_mm=20.0,
+                      sweep="x")
+    p = osweep.plan(v, speed_mm_s=40.0, log_hz=500.0, settle_s=0.0,
+                    travel_mm=dict.fromkeys("xyz", (0.0, 300.0)))
+    emap = oenc.EncoderMap({"x": {"column": 0, "counts_per_mm": counts_per_mm}})
+    log = osweep.SweepLog(pgeom.Geometry(), {}, emap)
+    runner = osweep.SweepRunner(rig, p, log, log_fn=said.append)
+    stop = threading.Event()
+
+    def tick():
+        while not stop.is_set():
+            here = rig["x"].position_mm
+            c = np.array([here * counts_per_mm * slip])
+            runner.counts_now = c
+            if runner.logging:
+                rows = np.zeros((10, pgeom.N_SENSORS, 3), dtype=np.float32)
+                rows[:, 0, 0] = here / 1000.0
+                log.add_block(rows, time.time() - 10 / 500.0,
+                              runner.line_index, counts=np.tile(c, (10, 1)))
+            time.sleep(0.02)
+
+    feeder = threading.Thread(target=tick, daemon=True)
+    feeder.start()
+    runner.run()
+    stop.set()
+    feeder.join(timeout=2.0)
+    return log, runner
+
+
+def test_an_encoder_that_slips_is_caught_on_the_line(workdir):
+    """A coupling that slips is said on line 1, and the polls are used."""
+    print("\nan encoder that does not follow its axis")
+    log, runner, said = _slipped_sweep()
+    warned = [s for s in said if "WARNING" in s]
+    check("one that reads 29 % short is caught on every line",
+          runner.encoder_faults == {"x": 2}
+          and sorted(log.encoder_disagreed) == [0, 1], str(runner.encoder_faults))
+    check("it is said once in full, naming the coupling, then summed up",
+          len(warned) == 2 and "line 1" in warned[0]
+          and "coupling" in warned[0] and "2 line(s)" in warned[1],
+          str(warned)[:300])
+    check("the lines are listed as positioned from the controller",
+          log.fallback_lines() == {"x": [0, 1]}, str(log.fallback_lines()))
+    _t, pos, _m, b_mt, _line, _span, counts = log.assemble(500.0)
+    known = np.isfinite(pos[:, 0])
+    err = np.abs(b_mt[known, 0, 0] * 1000.0 - pos[known, 0])
+    check("and their positions are the controller's, not 29 % short",
+          known.any() and float(err.max()) < 3.0, f"worst {err.max():.2f} mm")
+    check("the raw counts are kept", np.isfinite(counts).all())
+    path = log.save(os.path.join(workdir, "slip"), 500.0)
+    _arrays, side = osweep.SweepLog.load(path)
+    found = side["encoder_disagreed"]["0"]["x"]
+    check("the sidecar says what was found, and by what rule",
+          abs(found["encoder_mm"] / found["controller_mm"] - 0.71) < 0.02
+          and side["encoder_tolerance_mm"] == osweep.ENCODER_TOL_MM
+          and side["position_fallback_lines"] == {"x": [0, 1]}, str(found))
+
+
+def test_a_map_saved_with_a_slipped_encoder_can_be_rescued(workdir):
+    """Maps from before the check: rebuild the bad lines from the polls."""
+    print("\nrescuing a saved map")
+    spec = importlib.util.spec_from_file_location(
+        "rescue_positions", os.path.join(os.path.dirname(__file__), "..",
+                                         "tools", "rescue_positions.py"))
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    # The map as the sweep used to save it: the encoder believed whatever
+    # it said, so every line still has its datum and nothing is flagged.
+    log, _runner, _said = _slipped_sweep()
+    was = {li: dict(d) for li, d in log.datum.items()}, dict(
+        log.encoder_disagreed)
+    try:
+        for li, found in log.encoder_disagreed.items():
+            for axis, doc in found.items():
+                log.datum.setdefault(li, {})[axis] = tuple(doc["datum"])
+        log.encoder_disagreed = {}
+        log.meta["machine"] = {"pose": omach.Placement().to_dict()}
+        bad = log.save(os.path.join(workdir, "old_bad"), 500.0,
+                       omach.Placement())
+    finally:
+        log.datum, log.encoder_disagreed = was
+    arrays, side = osweep.SweepLog.load(bad)
+    check("it claims the encoder throughout",
+          not side["position_fallback_lines"]
+          and not side["encoder_disagreed"])
+    truth = arrays["b_mt"][:, 0, 0] * 1000.0
+    before = np.nanmax(np.abs(arrays["pos_mm"][:, 0] - truth))
+    check("the old map really is wrong", before > 10.0, f"{before:.1f} mm")
+    said = []
+    out, report = tool.rescue(bad, log=said.append)
+    check("both lines are rebuilt, and it says how short the encoder was",
+          [r["line"] for r in report["x"]] == [0, 1] and "29" in said[0],
+          str(said))
+    new, new_side = osweep.SweepLog.load(out)
+    ok = np.isfinite(new["pos_mm"][:, 0])
+    after = np.abs(new["pos_mm"][ok, 0] - truth[ok]).max()
+    check("the rescued positions are the controller's",
+          ok.mean() > 0.9 and after < 3.0,
+          f"worst {after:.2f} mm on {ok.mean():.0%} of rows")
+    whole = np.isfinite(new["pos_mm"]).all(axis=1)
+    parts = (
+        np.allclose(new["pos_machine_mm"][whole],
+                    omach.Placement().flange_path_mm(new["pos_mm"][whole])),
+        bool(np.isnan(new["pos_machine_mm"][~whole]).all()),
+        np.array_equal(
+            new["in_span"][ok],
+            (new["pos_mm"][ok, 0] >= side["lines"][0]["start_mm"])
+            & (new["pos_mm"][ok, 0] <= side["lines"][0]["stop_mm"])),
+        not new["in_span"][~ok].any())
+    check("in the machine frame as well, and in_span is redone",
+          all(parts), f"machine, machine NaN, in_span, no span off-line: "
+                      f"{parts}")
+    check("the field, the counts and the polls are untouched",
+          np.array_equal(new["b_mt"], arrays["b_mt"])
+          and np.array_equal(new["counts"], arrays["counts"])
+          and np.array_equal(new["poll_mm"], arrays["poll_mm"]))
+    check("the original file is not written to",
+          np.array_equal(osweep.SweepLog.load(bad)[0]["pos_mm"],
+                         arrays["pos_mm"], equal_nan=True))
+    check("the sidecar says which lines, and where the rows came from",
+          new_side["position_fallback_lines"] == {"x": [0, 1]}
+          and "controller polls" in new_side["positions_rebuilt"]
+          and new_side["rescued_from"] == "old_bad.npz"
+          and "x" not in new_side["encoder_datum"]["0"])
+
+    # Its own output is a map whose every line already agrees.
+    said = []
+    again, report = tool.rescue(out, log=said.append)
+    check("a map with nothing wrong is left alone, and no file is written",
+          again is None and not report and "nothing to rescue" in said[0]
+          and not os.path.exists(os.path.join(
+              workdir, "old_bad_rescued_rescued.npz")), str(said))
 
 
 def test_the_datum_rule_is_shared():
