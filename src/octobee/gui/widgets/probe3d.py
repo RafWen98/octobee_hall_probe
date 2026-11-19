@@ -33,6 +33,7 @@ from PyQt6 import QtGui
 
 from octobee import profile as oprof
 from octobee.calib import geometry as pg_geom
+from octobee.gui.widgets import glsafe
 import itertools
 
 # Turbo runs blue -> green -> red with even perceptual steps, so a small change
@@ -103,10 +104,15 @@ class ProbeView3D(gl.GLViewWidget):
         self._items = []
         self.setBackgroundColor(pg.mkColor(18, 20, 26))
         self.rebuild()
+        self._safe = glsafe.SafePaint("3D probe view", rebuild=self.rebuild,
+                                      give_up=self.hide)
 
     def paintGL(self, *args, **kwargs):
+        # Through glsafe: a GL error here used to escape on every frame and
+        # take the whole GUI down for a picture nothing else depends on.
         with self.profiler.time("GL paint (probe head)"):
-            super().paintGL(*args, **kwargs)
+            self._safe.paint(lambda: super(ProbeView3D, self).paintGL(
+                *args, **kwargs))
 
     def gl_info(self):
         """Cached vendor/renderer strings for the live context."""

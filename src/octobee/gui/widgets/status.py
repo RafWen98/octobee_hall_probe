@@ -59,7 +59,20 @@ class Chip(QtWidgets.QLabel):
         self.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self.set(text, state)
 
+    # A chip is one short line. Anything longer is cut, with the whole of it
+    # in the tooltip: a runaway text here (a dict of data arrays, once) widens
+    # the window's layout past what Qt and the GL views can draw, and the
+    # session crashes in native code with nothing pointing back to the label.
+    MAX_CHARS = 160
+
     def set(self, text, state=IDLE, tip=None):
+        text = str(text)
+        first = text.split("\n", 1)[0]
+        if len(first) > self.MAX_CHARS or first != text:
+            if tip is None:
+                tip = text[:2000]
+            text = first[:self.MAX_CHARS - 1] + "…" if len(first) > self.MAX_CHARS \
+                else first + " …"
         if text != self.text():
             self.setText(text)
         if tip is not None:

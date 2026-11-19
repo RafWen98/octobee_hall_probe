@@ -418,9 +418,18 @@ class CalibrationTab(QtWidgets.QWidget):
             # Started before the map, finished during it.
             return
         z = self.session.cal.tare(data)
+        # Reported over the sensors in use. A dead one (the demo's S16 sits
+        # railed at ~195 mT) otherwise headlines every zero, and the number
+        # worth reading -- how far the working sensors were off -- is hidden.
+        dead = set(self.session.cal.dead)
+        live = [i for i in range(z.shape[0]) if f"S{i + 1}" not in dead]
+        rows = live or list(range(z.shape[0]))
+        worst = max(rows, key=lambda i: np.abs(z[i]).max())
+        note = (f"; {', '.join(sorted(dead, key=lambda s: int(s[1:])))} "
+                f"excluded, not counted" if dead and live else "")
         self.session.log(f"zeroed on {data.shape[0]} points; "
-                     f"largest offset removed {np.abs(z).max():.4f} mT "
-                     f"(S{int(np.argmax(np.abs(z).max(axis=1)))+1})")
+                     f"largest offset removed {np.abs(z[worst]).max():.4f} mT "
+                     f"(S{worst + 1}){note}")
         self.calibration_changed.emit("the zero point")
         self.refresh_cal_report()
 
@@ -535,10 +544,19 @@ class CalibrationTab(QtWidgets.QWidget):
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Apply roll calibration", str(e))
             return
-        g = sol.gains()
+        # Over the sensors actually installed. The solve's gains for the ones
+        # it rejected are exactly the numbers it could not believe, and with
+        # them in, a run that installed 8 sensors reported a "gain spread" of
+        # 299 % -- describing nothing that was applied.
+        g = np.asarray(sol.gains(), dtype=float)
+        skipped = set(sol.unusable())
+        used = g[[i for i in range(len(g)) if f"S{i + 1}" not in skipped]]
+        used = used[np.isfinite(used)]
+        spread = (f"gain spread over the {len(used)} installed sensor(s) was "
+                  f"{(used.max() - used.min()) * 100:.2f} %"
+                  if len(used) else "no sensor was installed")
         self.session.log("roll calibration applied: matrix + offsets installed, "
-                     f"magnet gain trim cleared; gain spread was "
-                     f"{(np.nanmax(g)-np.nanmin(g))*100:.2f} %")
+                     f"magnet gain trim cleared; {spread}")
         self._show_vcm_state()
         self.calibration_changed.emit("the roll calibration")
         self.refresh_cal_report()
@@ -581,6 +599,11 @@ class CalibrationTab(QtWidgets.QWidget):
     def on_clear_tare(self):
         if self._volume_map_running("clearing the zero"):
             return
+        # A zero still being collected would land a moment later and undo
+        # this -- "zero cleared" in the log, and a zero set anyway.
+        c = self.session.collecting
+        if c is not None and c["what"] == "tare":
+            self.abandon_collection("Clear zero was pressed")
         self.session.cal.clear_tare()
         self.session.log("zero cleared")
         self.calibration_changed.emit("the zero point")
@@ -653,7 +676,7 @@ class CalibrationTab(QtWidgets.QWidget):
                 "This routine drives the head past a fixed magnet, so it "
                 "needs the stages. Press Connect — it brings up the carriers "
                 "and the stages together — or connect them from the Stages "
-                "tab.\n\nWithout motion, the hand magnet pass above is the "
+                "tab.\n\nWithout motion, the hand magnet pass (tick 'show the superseded manual routines') is the "
                 "alternative; it needs geometry weighting to be fair, which "
                 "this one does not.")
             return
