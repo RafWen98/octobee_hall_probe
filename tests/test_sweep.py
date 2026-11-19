@@ -593,6 +593,71 @@ def test_sweep_refuses_an_unhomed_rig():
     check("and so does a latched emergency stop", "stop" in why, why[:120])
 
 
+def test_plan_both_ways():
+    """Sweeping on the way back takes the returns out, and says so per line."""
+    print("\nsweeping both ways")
+    travel = dict.fromkeys("xyz", (0.0, 300.0))
+    v = osweep.Volume((50.0, 50.0, 50.0), (250.0, 250.0, 250.0), step_mm=10.0,
+                      sweep="x")
+    kw = {"travel_mm": travel, "shell": True, "slices": 3}
+    one = osweep.plan(v, **kw)
+    two = osweep.plan(v, both_ways=True, **kw)
+    check("it is off unless asked for",
+          not one.both_ways and not any(ln.reverse for ln in one.lines))
+
+    def key(ln):
+        return (ln.sweep, tuple(sorted(ln.fixed.items())), ln.start_mm,
+                ln.stop_mm, ln.part)
+    check("the same lines are swept, only their direction and order differ",
+          sorted(map(key, one.lines)) == sorted(map(key, two.lines)),
+          f"{len(one)} vs {len(two)}")
+    rev = sum(ln.reverse for ln in two.lines)
+    check("about half of them run downward",
+          0.4 * len(two) < rev < 0.6 * len(two), f"{rev} of {len(two)}")
+    check("the first line still runs upward", not two.lines[0].reverse)
+    check("a reversed line starts above its span and ends below it",
+          all(ln.from_mm > ln.stop_mm - 1e-9 and ln.to_mm < ln.start_mm + 1e-9
+              for ln in two.lines if ln.reverse))
+
+    # No row is entered from its far end: the swept axis never travels more
+    # than half a row to get to the next one.
+    worst, prev = 0.0, None
+    for ln in two.lines:
+        if prev is not None:
+            here = prev[ln.sweep]
+            if abs(here - ln.from_mm) > abs(here - ln.to_mm) + 1e-9:
+                worst = max(worst, abs(here - ln.from_mm))
+        prev = ln.leave()
+    check("every row is entered from its nearer end", worst == 0.0,
+          f"{worst:.1f} mm")
+    check("and the map is at least a quarter shorter for it",
+          two.duration_s() < 0.75 * one.duration_s(),
+          f"{two.duration_s() / 60:.0f} min against "
+          f"{one.duration_s() / 60:.0f}")
+    check("the plan and its description say which it is",
+          two.to_dict()["both_ways"] and "both ways" in two.describe()
+          and "both ways" not in one.describe()
+          and two.to_dict()["lines"][1]["reverse"] in (True, False))
+
+    # A row cut in two by a winding is taken far piece first when it is run
+    # backwards, and the way between the pieces is still routed.
+    small = osweep.Volume((0.0, 0.0, 0.0), (100.0, 20.0, 0.0), step_mm=10.0,
+                          sweep="x")
+    mask = np.ones(small.shape, dtype=bool)
+    mask[4:6, 1, 0] = False                 # a block across the middle row
+    cut = osweep.plan(small, mask, travel_mm=travel, both_ways=True)
+    mid = [ln for ln in cut.lines if ln.fixed["y"] == 10.0]
+    check("a cut row run backwards takes its far piece first",
+          len(mid) == 2 and all(ln.reverse for ln in mid)
+          and mid[0].start_mm > mid[1].start_mm,
+          str([(ln.start_mm, ln.stop_mm, ln.reverse) for ln in mid]))
+    check("and nothing was dropped for it", cut.skipped == 0
+          and len(cut.lines) == 4, f"{len(cut.lines)} lines")
+    check("the edge trace is not touched",
+          not osweep.plan(v, travel_mm=travel, edges=True,
+                          both_ways=True).both_ways)
+
+
 def test_plan_surface_with_xz_slices():
     """The box's six faces, then smaller x-z rectangles inside it."""
     print("\nsurface plus x-z slices")

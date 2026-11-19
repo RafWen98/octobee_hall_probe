@@ -574,6 +574,21 @@ def _check_machine_volume(win, app):
     tab.on_volume_plan()
     app.processEvents()
     faces_only = len(tab._plan.lines)
+    one_way = tab._plan.duration_s()
+    check("lines run one way unless asked", not tab.chk_vol_both.isChecked()
+          and not any(ln.reverse for ln in tab._plan.lines))
+    tab.chk_vol_both.setChecked(True)
+    check("ticking 'sweep both ways' invalidates the plan", tab._plan is None)
+    tab.on_volume_plan()
+    app.processEvents()
+    check("and the new plan sweeps on the way back, in less time",
+          tab._plan.both_ways and any(ln.reverse for ln in tab._plan.lines)
+          and len(tab._plan.lines) == faces_only
+          and tab._plan.duration_s() < one_way,
+          tab._plan.describe()[:100])
+    tab.chk_vol_both.setChecked(False)
+    tab.on_volume_plan()
+    app.processEvents()
     check("the slice controls are idle with the faces-only pattern",
           not tab.spin_vol_slices.isEnabled())
     tab.cmb_vol_pattern.setCurrentText("outer surface + x–z slices")

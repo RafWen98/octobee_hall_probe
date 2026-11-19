@@ -424,6 +424,16 @@ is in the estimate rather than discovered overnight. Lines also over-run at both
 ends where the travel allows, putting the trapezoidal ramps outside the region
 being measured.
 
+That is the default. Ticking **sweep both ways** takes the returns out: the way
+back is swept as well, each row starting at whichever end is nearer to where the
+last one finished, so a raster becomes a serpentine. It saves about a third of a
+map's running time and costs exactly what the paragraph above describes —
+alternate lines are approached from opposite sides, so the leadscrew's backlash
+lies between them as an offset along the swept axis, and the encoders, being on
+the screws, do not see it. Every line stores `reverse` in the sidecar. Map one
+box each way before relying on it: the shift between the two is the number to
+correct by, or the evidence that at your grid step it does not matter.
+
 ### Saying which coils are on
 
 Pick a configuration, tick the coils that are actually energised, and set the

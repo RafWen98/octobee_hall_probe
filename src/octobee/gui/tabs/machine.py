@@ -456,6 +456,23 @@ class MachineTab(QtWidgets.QWidget):
         self.spin_vol_inset.valueChanged.connect(self.on_volume_edited)
         f4.addWidget(self.spin_vol_inset, 6, 2, 1, 2)
 
+        self.chk_vol_both = QtWidgets.QCheckBox(
+            "sweep both ways (faster, backlash between alternate lines)")
+        self.chk_vol_both.setToolTip(
+            "Off: every line is swept in the +ve direction and the axis "
+            "drives back empty to start the next one. About a third of a "
+            "map's time is those returns.\n\n"
+            "On: the way back is swept too, so the returns go. Alternate "
+            "lines are then approached from opposite sides, and the "
+            "leadscrew's backlash sits between them as a fixed offset along "
+            "the swept axis. The encoders are on the screws and cannot see "
+            "it. Each line's direction is stored with the map ('reverse'), "
+            "so the offset can be measured by mapping the same box each way "
+            "and taken out afterwards.\n\n"
+            "The edge trace is not affected.")
+        self.chk_vol_both.toggled.connect(self.on_volume_edited)
+        f4.addWidget(self.chk_vol_both, 8, 0, 1, 4)
+
         self.chk_vol_avoid = QtWidgets.QCheckBox("keep clear of the coils")
         self.chk_vol_avoid.setChecked(True)
         self.chk_vol_avoid.setToolTip(
@@ -510,9 +527,9 @@ class MachineTab(QtWidgets.QWidget):
             "0.41% into x that way.\n\n"
             "Clamped to whatever room the axis actually has, from where it is "
             "standing. The run says so if it had to shorten it.")
-        f4.addWidget(self.btn_vol_encoders, 8, 0)
-        f4.addWidget(self.spin_enc_span, 8, 1)
-        f4.addWidget(self.lbl_encoders, 8, 2, 1, 2)
+        f4.addWidget(self.btn_vol_encoders, 9, 0)
+        f4.addWidget(self.spin_enc_span, 9, 1)
+        f4.addWidget(self.lbl_encoders, 9, 2, 1, 2)
 
         self.btn_vol_ruler = QtWidgets.QPushButton("Check against a ruler…")
         self.btn_vol_ruler.setToolTip(
@@ -533,14 +550,14 @@ class MachineTab(QtWidgets.QWidget):
         self.spin_ruler_points.setRange(3, 15)
         self.spin_ruler_points.setValue(7)
         self.spin_ruler_points.setSuffix(" readings")
-        f4.addWidget(self.btn_vol_ruler, 9, 0)
-        f4.addWidget(self.cmb_ruler_axis, 9, 1)
-        f4.addWidget(self.spin_ruler_points, 9, 2)
+        f4.addWidget(self.btn_vol_ruler, 10, 0)
+        f4.addWidget(self.cmb_ruler_axis, 10, 1)
+        f4.addWidget(self.spin_ruler_points, 10, 2)
 
         self.lbl_volume = QtWidgets.QLabel("")
         self.lbl_volume.setWordWrap(True)
         self.lbl_volume.setStyleSheet("color:#9aa3b2; font-size:11px;")
-        f4.addWidget(self.lbl_volume, 10, 0, 1, 4)
+        f4.addWidget(self.lbl_volume, 11, 0, 1, 4)
 
         self.btn_vol_plan = QtWidgets.QPushButton("Work out the path")
         self.btn_vol_plan.clicked.connect(self.on_volume_plan)
@@ -971,7 +988,8 @@ class MachineTab(QtWidgets.QWidget):
         return {"shell": shell,
                 "slices": self.spin_vol_slices.value() if slices else 0,
                 "slice_inset_mm": self.spin_vol_inset.value(),
-                "slice_normal": "y", "edges": edges}
+                "slice_normal": "y", "edges": edges,
+                "both_ways": self.chk_vol_both.isChecked() and not edges}
 
     def on_volume_whole(self, on):
         """Whole travel or a typed box: show the numbers either way.

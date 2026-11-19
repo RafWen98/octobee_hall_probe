@@ -33,6 +33,14 @@ and a serpentine would stamp a fixed offset into every other line. Every line
 here is therefore swept in the +ve direction and the axis returns to the start
 of the next one. It costs travel time and buys a map with no comb in it.
 
+That is the default, and `plan(both_ways=True)` is the way out of it. The
+return is about a third of a map's running time, and sweeping on the way back
+as well gets it back. What it costs is exactly what the paragraph above says:
+alternate lines are approached from opposite sides, so the leadscrew's
+backlash sits between them. The encoders are on the screws and cannot see it.
+Every line records `reverse` in the sidecar, so the offset can be measured --
+map one box each way -- and taken out afterwards rather than guessed at.
+
 Lines also over-run at both ends where the travel allows. The controller drives
 a trapezoidal profile, so the first and last few millimetres of a move are ramp,
 not sweep; starting before the box and finishing after it puts the ramps outside
@@ -221,10 +229,11 @@ class SweepLine:
         # {axis: mm} positions. Empty when the straight move there is clear --
         # see route().
         self.via = [dict(p) for p in via]
-        # Run from stop down to start rather than up. Only the edge trace
-        # does this: it is one continuous path round the box, and a path that
+        # Run from stop down to start rather than up. The edge trace does
+        # this: it is one continuous path round the box, and a path that
         # goes round a corner has to come back down the far side. A map's
-        # lines never do -- see "Every line still runs the same way" above.
+        # lines do it only when the plan was asked to sweep both ways -- see
+        # "Every line still runs the same way" above.
         # start_mm < stop_mm either way; this only changes which end is
         # driven to first.
         self.reverse = bool(reverse)
@@ -281,8 +290,11 @@ class SweepPlan:
     def __init__(self, volume, lines, speed_mm_s=DEFAULT_SPEED_MM_S,
                  log_hz=DEFAULT_LOG_HZ, settle_s=DEFAULT_SETTLE_S,
                  skipped=0, note="", slices=None,
-                 accel_mm_s2=otim.DEFAULT_ACCEL_MM_S2, reachable=None):
+                 accel_mm_s2=otim.DEFAULT_ACCEL_MM_S2, reachable=None,
+                 both_ways=False):
         self.volume = volume
+        # Alternate lines swept in the -ve direction: see _both_ways().
+        self.both_ways = bool(both_ways)
         self.accel_mm_s2 = float(accel_mm_s2)
         # The grid the lines were cut on, kept so the one move that cannot be
         # planned in advance -- from wherever the head is parked to the first
@@ -346,10 +358,10 @@ class SweepPlan:
 
         The sweeps themselves are exact -- distance over velocity, plus the
         ramps. So is the return: these axes are capped at MAX_VEL_MM_S, so
-        going back to the start of the next line costs the same as sweeping it
-        did, and a volume takes twice as long as the sweeping alone suggests.
-        That is the price of never reversing into a line, and it is included
-        here rather than discovered overnight.
+        going back to the start of the next line costs most of what sweeping
+        it did. That is the price of never reversing into a line, and it is
+        included here rather than discovered overnight. A plan swept both
+        ways has no return to charge, only the step to the next line.
         """
         return float(sum(self.line_durations_s(accel_mm_s2)))
 
@@ -415,6 +427,7 @@ class SweepPlan:
                 "speed_mm_s": self.speed_mm_s, "log_hz": self.log_hz,
                 "accel_mm_s2": self.accel_mm_s2,
                 "transits_checked": self.reachable is not None,
+                "both_ways": self.both_ways,
                 "settle_s": self.settle_s, "skipped": self.skipped,
                 "note": self.note, "slices": self.slices,
                 "lines": [ln.to_dict() for ln in self.lines]}
@@ -533,6 +546,36 @@ def _route_lines(volume, reachable, lines):
         kept.append(line)
         last = line
     return kept, dropped
+
+
+def _both_ways(lines):
+    """Turn rows round so each starts at the end nearest where the last ended.
+
+    A row is every line with the same swept axis and the same two fixed
+    coordinates: one line, or the several pieces a winding cut it into. A row
+    taken backwards has its pieces in the opposite order too, each swept from
+    its high end down. The first row runs upward. Inside a raster this comes
+    out as a serpentine; between rasters it picks whichever end is closer,
+    which a strict alternation would get wrong half the time.
+
+    Only the swept axis decides: the other two travel the same distance to
+    the row whichever end it is entered from.
+    """
+    out, at = [], None
+    for _, group in itertools.groupby(
+            lines, key=lambda ln: (ln.sweep, tuple(sorted(ln.fixed.items())),
+                                   ln.part)):
+        row = list(group)
+        low = row[0].start_mm - row[0].run_in_mm
+        high = row[-1].stop_mm + row[-1].run_out_mm
+        here = None if at is None else at.get(row[0].sweep)
+        if here is not None and abs(here - high) < abs(here - low):
+            row.reverse()
+            for ln in row:
+                ln.reverse = True
+        out.extend(row)
+        at = row[-1].leave()
+    return out
 
 
 # One continuous path over all twelve edges of a box, as corners (x, y, z),
@@ -702,7 +745,8 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
          log_hz=DEFAULT_LOG_HZ, settle_s=DEFAULT_SETTLE_S,
          accel_mm_s2=otim.DEFAULT_ACCEL_MM_S2,
          travel_mm=None, min_span_mm=None, shell=False, slices=0,
-         slice_inset_mm=0.0, slice_normal="y", edges=False):
+         slice_inset_mm=0.0, slice_normal="y", edges=False,
+         both_ways=False):
     """Turn a Volume into the lines that will actually be swept.
 
     `reachable` is a boolean array of `volume.shape` -- machine.reachable_grid's
@@ -741,6 +785,13 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
     travel and the box are what was meant before committing hours to them.
     No settle at the corners and no overshoot past them. Its lines are
     tagged part="edge".
+
+    `both_ways` sweeps a line on the way back as well, instead of returning
+    empty to start every line from its low end (see _both_ways()). It takes
+    the return moves out of the map, about a third of its running time, and
+    puts the leadscrew's backlash between lines swept in opposite directions.
+    Off unless asked for; each line's `reverse` says which way it went. The
+    edge trace has its own route and ignores it.
 
     `travel_mm` is {axis: (lo, hi)}; the run-up and run-down are fitted into
     whatever it leaves outside the box, and silently shortened where it does
@@ -810,6 +861,9 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
                             run_out = 0.0
                     lines.append(SweepLine(axis, start, stop, fixed,
                                            run_in, run_out, part))
+    both_ways = bool(both_ways) and not edges
+    if both_ways:
+        lines = _both_ways(lines)       # before routing: it moves the ends
     if reachable is not None:
         lines, unroutable = _route_lines(volume, reachable, lines)
         skipped += unroutable
@@ -842,9 +896,11 @@ def plan(volume, reachable=None, speed_mm_s=DEFAULT_SPEED_MM_S,
                      f"room for them on a {volume.step_mm:g} mm grid)")
     note += (", cut to the space the probe body actually fits in"
              if reachable is not None else ", coils ignored")
+    if both_ways:
+        note += ", swept both ways"
     return SweepPlan(volume, lines, speed_mm_s, log_hz, settle_s, skipped, note,
                      slices=slice_doc, accel_mm_s2=accel_mm_s2,
-                     reachable=reachable)
+                     reachable=reachable, both_ways=both_ways)
 
 
 class Aborted(RuntimeError):
