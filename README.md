@@ -14,7 +14,7 @@ channels: Phoebus was pointed at one box.
 
 | carrier | IP | ACQ423 s/n | sensors | stream frame |
 |---|---|---|---|---|
-| `acq1001_694` | 192.168.1.82 | E42310297 | S1–S8 | 96 B (24 LW), 1 site-2 word (**not** an encoder) |
+| `acq1001_694` | 192.168.1.84 | E42310297 | S1–S8 | 96 B (24 LW), 1 site-2 word (**not** an encoder) |
 | `acq1001_695` | 192.168.1.83 | E42310298 | S9–S16 | 104 B (26 LW), 3 encoder words (ENC_X/Y/Z) |
 
 Both: ACQ423ELF, 32 ch, 16-bit packed, ±10 V, 200 kSPS, SPAD = 7 longwords.

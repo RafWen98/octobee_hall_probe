@@ -10,7 +10,7 @@ Hardware chain (as found on the bench, 2026-08-19)
       -> ACQ1001S carrier, raw stream on TCP port 4210
 
     Two carriers, one LAN cable each, 8 sensors per carrier:
-        acq1001_694  192.168.1.82   ACQ423 s/n E42310297   -> sensors  1..8
+        acq1001_694  192.168.1.84   ACQ423 s/n E42310297   -> sensors  1..8
         acq1001_695  192.168.1.83   ACQ423 s/n E42310298   -> sensors  9..16
 
     Which carrier holds which physical half of the probe is an ASSUMPTION.
@@ -56,6 +56,21 @@ from octobee import paths
 
 # The two carriers. Order here defines the global sensor numbering.
 DEFAULT_UUTS = ("acq1001_694", "acq1001_695")
+
+# Where each carrier answers. The names above stay the labels used in
+# recordings and reports; this table is only consulted when connecting, since
+# the bench switch (Netgear GS305EP) has no DNS to resolve the names. 694 was
+# found at .84, not its old .82, on 2026-11-19. Unlisted names (e.g. an IP or
+# another hostname passed with --uut) are used as given.
+UUT_ADDRESSES = {
+    "acq1001_694": "192.168.1.84",
+    "acq1001_695": "192.168.1.83",
+}
+
+
+def address(host):
+    """The network address to connect to for carrier name `host`."""
+    return UUT_ADDRESSES.get(host, host)
 
 PORT_STREAM = 4210          # raw aggregator stream
 PORT_SITE0 = 4220           # motherboard command port; site N -> 4220 + N
@@ -165,7 +180,7 @@ class Uut:
 
     def _sock(self, site):
         if site not in self._sockets:
-            s = socket.create_connection((self.host, PORT_SITE0 + site),
+            s = socket.create_connection((address(self.host), PORT_SITE0 + site),
                                          timeout=self.timeout)
             s.settimeout(self.BANNER_WAIT)
             with contextlib.suppress(OSError):
@@ -528,7 +543,7 @@ def capture_one(host, seconds=2.0, layout=None, take_over=True, verbose=True):
         print(f"{host}: stopped the Phoebus CONTINUOUS stream to free port 4210")
 
     nbytes = int(seconds * layout.fs_hz) * layout.ssb
-    s = socket.create_connection((host, PORT_STREAM), timeout=10)
+    s = socket.create_connection((address(host), PORT_STREAM), timeout=10)
     s.settimeout(10)
     buf = bytearray()
     t0 = time.time()
@@ -600,7 +615,7 @@ class Streamer:
 
     def _run(self):
         try:
-            s = socket.create_connection((self.host, PORT_STREAM), timeout=10)
+            s = socket.create_connection((address(self.host), PORT_STREAM), timeout=10)
             s.settimeout(5)
         except OSError as e:
             self.error = e
