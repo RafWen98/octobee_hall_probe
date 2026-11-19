@@ -152,10 +152,22 @@ class LiveSource(SourceBase):
             if st.error and h not in self._reported and self.error is None:
                 self._reported.add(h)
                 self.error = f"{h}: {st.error}"
-            for blk in st.get_all():
-                if blk is None:
-                    continue
-                self._take_block(h, blk)
+            blocks = [blk for blk in st.get_all() if blk is not None]
+            if not blocks:
+                continue
+            # One block per box per tick, joined here, not one at a time:
+            # _accept grows the pending buffer by concatenation, which copies
+            # everything already pending. At two or three blocks a tick that
+            # is nothing; a GUI that has fallen behind collects a full queue
+            # (128) per tick and the copying grows with the SQUARE of that --
+            # 45x the cost per sample, enough that a stream which had fallen
+            # behind for a few seconds never caught up again and shed ~20%
+            # of its blocks for the rest of the run. Joining first copies
+            # each sample once. find_gaps checks every step inside the joined
+            # counter, so a break between two of these blocks is still seen
+            # at the row it happened.
+            self._take_block(h, self._join(blocks))
+            for blk in blocks:
                 if "temp_raw" in blk:
                     self._temp[h] = blk["temp_raw"]
         n = min(len(b) for b in self._buf.values()) if self._buf else 0
@@ -179,6 +191,20 @@ class LiveSource(SourceBase):
             self._sam_buf[h] = self._sam_buf[h][n:]
         self.enc = self._take_enc(n)
         self._taken += n
+        return out
+
+    @staticmethod
+    def _join(blocks):
+        """One block holding the rows of `blocks`, in order (see read)."""
+        if len(blocks) == 1:
+            return blocks[0]
+        out = dict(blocks[-1])
+        for key in ("ai", "sam_cnt", "enc"):
+            parts = [b.get(key) for b in blocks]
+            if all(p is not None for p in parts):
+                out[key] = np.concatenate(parts, axis=0)
+            else:
+                out.pop(key, None)
         return out
 
     def _take_block(self, h, blk):

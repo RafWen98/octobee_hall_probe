@@ -74,6 +74,8 @@ import itertools
 import json
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -1199,6 +1201,54 @@ class SweepRunner:
 CHECKPOINT_ROWS = 100_000
 
 
+# Turns one part's binary table into its .csv, in a process of its own.
+#
+# Formatting 100,000 rows as text is a Python loop per row. Done on a thread
+# of this process it shares the interpreter lock with the threads draining the
+# stream, and for the seconds it takes they get half the time they need: the
+# carriers' queues overflow and blocks are dropped -- a hole in the map and in
+# any recording running beside it. A child process has a lock of its own.
+#
+# Only numpy, nothing of this package: the child must start the same way
+# whether the GUI was launched from a checkout, an install or the .pyw.
+_PART_TO_CSV = """
+import os, sys
+import numpy as np
+raw, out = sys.argv[1], sys.argv[2]
+with np.load(raw) as z:
+    table = z["table"]
+    names = [str(n) for n in z["names"]]
+    fmt = [str(f) for f in z["fmt"]]
+tmp = out + ".tmp"
+np.savetxt(tmp, table, fmt=fmt, delimiter=",", header=",".join(names),
+           comments="")
+os.replace(tmp, out)
+os.remove(raw)
+"""
+
+
+def _part_to_csv(raw, out, timeout_s=900.0):
+    """Run _PART_TO_CSV on `raw` -> `out`. (returncode, last of stderr)."""
+    flags = 0
+    if os.name == "nt":
+        # BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW: behind the GUI for
+        # the CPU, and no console flashing up under pythonw.
+        flags = 0x00004000 | 0x08000000
+    exe = sys.executable
+    if os.name == "nt" and os.path.basename(exe).lower() == "pythonw.exe":
+        # pythonw has no stderr to report a failure through.
+        console = os.path.join(os.path.dirname(exe), "python.exe")
+        exe = console if os.path.exists(console) else exe
+    # stdin explicitly: under pythonw (and pytest's capture) this process has
+    # no valid stdin handle, and inheriting it fails with WinError 6.
+    proc = subprocess.run([exe, "-c", _PART_TO_CSV, raw, out],
+                          stdin=subprocess.DEVNULL,
+                          cwd=os.path.dirname(os.path.abspath(raw)),
+                          creationflags=flags, capture_output=True,
+                          timeout=timeout_s)
+    return proc.returncode, proc.stderr.decode(errors="replace")[-400:]
+
+
 class SweepLog:
     """Everything a sweep produced, growing as it runs.
 
@@ -1319,17 +1369,31 @@ class SweepLog:
             fmt = (["%.6f", "%d", "%d"] + ["%.5f"] * 6
                    + ["%.7g"] * (3 * pgeom.N_SENSORS)
                    + ["%.0f"] * counts.shape[1])
-            tmp = path + ".tmp"
-            np.savetxt(tmp, table, fmt=fmt, delimiter=",",
-                       header=",".join(names), comments="")
-            os.replace(tmp, path)
-            self.parts_written.append(path)
-            st["log"](f"volume map: saved {len(t_s):,} rows so far -> {path}")
+            # Binary first: milliseconds, and from here on the rows are safe
+            # even if the conversion below never happens.
+            raw = os.path.splitext(path)[0] + ".npz"
+            with open(raw + ".tmp", "wb") as fh:
+                np.savez(fh, table=table, names=np.array(names),
+                         fmt=np.array(fmt))
+            os.replace(raw + ".tmp", raw)
         except Exception as exc:        # a failed part must not end the sweep
             st["log"](f"WARNING: volume map: could not write {path} ({exc}) "
                       f"-- the sweep carries on, the final save is unaffected")
+            return
+        try:
+            rc, err = _part_to_csv(raw, path)
+        except Exception as exc:        # could not start, or ran too long
+            rc, err = -1, str(exc)
+        if rc == 0:
+            self.parts_written.append(path)
+            st["log"](f"volume map: saved {len(t_s):,} rows so far -> {path}")
+        else:
+            self.parts_written.append(raw)
+            st["log"](f"WARNING: volume map: {os.path.basename(path)} could "
+                      f"not be made ({err.strip().splitlines()[-1:] or rc}) "
+                      f"-- the same rows are safe in {raw}")
 
-    def finish_parts(self, timeout_s=120.0):
+    def finish_parts(self, timeout_s=900.0):
         """Wait for a part still being written."""
         th = None if self._parts is None else self._parts["thread"]
         if th is not None:

@@ -981,3 +981,49 @@ def test_crash_safe_parts(workdir):
     log.drop_parts()
     check("and they are removed once the full map is safe",
           not os.path.exists(parts))
+
+
+def test_a_part_does_not_starve_the_stream(workdir):
+    """Writing a 100k-row part leaves this process's threads their time.
+
+    The text formatting runs in a child process. Done on a thread here it
+    took half the interpreter for seconds and the stream dropped blocks.
+    """
+    print("\na part is written without starving the stream")
+    log = osweep.SweepLog(pgeom.Geometry(), {})
+    parts = os.path.join(workdir, "big_parts")
+    said = []
+    log.keep_parts(parts, 100.0, every_rows=100_000, log_fn=said.append)
+    log.lines.append({"sweep": "x", "start_mm": 0.0, "stop_mm": 300.0})
+    rng = np.random.default_rng(0)
+    for k in range(1000):
+        log.add_block(rng.normal(0, 0.05, (100, pgeom.N_SENSORS, 3)),
+                      1e9 + k, 0,
+                      counts=np.cumsum(np.ones((100, 3)), 0) + k * 100)
+        log.add_poll(1e9 + k, {"x": 0.3 * k, "y": 1.0, "z": 2.0}, 0)
+
+    # Python work on this thread, as the acquisition tick does, timed while
+    # the part is being written.
+    def work(seconds):
+        n, end = 0, time.perf_counter() + seconds
+        while time.perf_counter() < end:
+            sum(range(2000))
+            n += 1
+        return n
+
+    alone = work(0.5)
+    log.checkpoint()
+    beside = work(0.5)
+    log.finish_parts()
+    check("this thread keeps most of its pace while a part is written",
+          beside > 0.7 * alone, f"{beside} vs {alone} loops in 0.5 s")
+    files = sorted(os.listdir(parts))
+    check("the part arrives as a .csv, and the binary copy is cleaned up",
+          "part_0001.csv" in files and "part_0001.npz" not in files,
+          f"{files} {said[-1:]}")
+    with open(os.path.join(parts, "part_0001.csv"), encoding="utf-8") as fh:
+        head = fh.readline()
+        rows = sum(1 for _ in fh)
+    check("with every row in it", rows == 100_000 and head.startswith("t_s,"),
+          f"{rows} rows")
+    log.drop_parts()

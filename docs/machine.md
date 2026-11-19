@@ -345,8 +345,12 @@ in `captures/` as `volume_<timestamp>.npz` with a `.json` sidecar:
 **In case of a crash.** The `.npz` is only written at the end, so while the
 sweep runs a `.csv` part is saved every 100,000 rows (`CHECKPOINT_ROWS` in
 `motion/sweep.py`) into `volume_<timestamp>_parts/`, next to where the map will
-go. Parts are cut between lines, written in the background (about a second and
-~63 MB each), and each one is complete on its own: `t_s, line, in_span`, rig
+go. Parts are cut between lines and are ~63 MB each. The rows are put on disk
+as a binary `part_NNNN.npz` first (milliseconds), and a separate low-priority
+Python process turns that into the `.csv` and deletes it — formatting text on
+a thread of the GUI's own process starved the stream readers and dropped
+blocks. If the conversion fails, the `.npz` stays and the log says so. Each
+part is complete on its own: `t_s, line, in_span`, rig
 and machine x/y/z, then `sNN_b{x,y,z}_mT` for all 16 sensors, then the raw
 counts. A crash loses at most the rows since the last part. Once the `.npz`
 is written the parts folder is deleted; if that save fails, the last rows go

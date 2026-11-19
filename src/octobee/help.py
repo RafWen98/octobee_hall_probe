@@ -147,29 +147,37 @@ def split_markdown(text, source=README_NAME):
 GUI_TOPICS = [
     ("Getting started: what each tab is for",
      """
-**Live** — the rolling plot, the sensor bar chart and the 3D probe head. Start
-here; if the field is wrong, it is wrong here first. Dragging or scrolling
-either plot stops it auto-ranging, with nothing on screen to say so; **reset
-view** on each of them puts the axes back on auto.
+**Live** — the rolling plot. Start here; if the field is wrong, it is wrong
+here first. Dragging or scrolling a plot stops it auto-ranging, with nothing on
+screen to say so; **reset view** puts the axes back on auto.
+
+**Side panel** (right-hand column, on every tab; **F9** shows and hides it) —
+the 3D probe head, the peak bars and the jog controls for the stages.
 
 **Sensors** — the 16 sensors as numbers, with per-channel health. The place to
 look when one sensor disagrees with the rest.
 
-**Calibration** — in order: the zero point, a magnet pass to equalise
-response, the Earth-field roll sweep that matches the sensors properly, and the
-calibration file itself.
+**Calibration** — in order: the zero point (take it from ambient, with no
+magnet near), the guided magnet calibration that equalises response under
+motor control, and the calibration file itself. The older hand magnet pass and
+Earth-field roll are still there, behind "show the superseded manual
+routines".
 
 **Diagnostics** — railed, stuck and noisy channels, and the report you send to
 someone else.
 
-**Stages** — the three translators: axis map, jogging, homing, motion profile,
-and the field map.
+**Stages** — the three translators: finding and mapping them, homing, the
+motion profile, and the stepped field map. Jog and Go are in the side panel.
+
+**Machine** — the coil set and where the probe sits in it (**Set-up**), and
+the swept volume map: outer surface, x–z planes, a filled box, or just the
+edges to check the travel (**Volume map**).
 
 **Data output** — recording and one-shot exports.
 
-**Profile** — where the frame time goes, when the window feels slow.
-
 **Log** — everything the window has done this session, with timings.
+
+**Profile** and **Help** open in windows of their own from the toolbar.
 
 The window connects itself when it opens — carriers and stages together. Start
 it with `--no-connect` if you would rather it did not.

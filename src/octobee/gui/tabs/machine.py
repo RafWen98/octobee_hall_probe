@@ -1059,11 +1059,27 @@ class MachineTab(QtWidgets.QWidget):
                 + ". Tick 'the whole travel', or bring 'from' + 'size' "
                   "inside it.")
             return
+        # At the rate the rows will actually be logged at. Without it the
+        # estimate used the module default (100 Hz) while the toolbar said
+        # 500, and the row count -- the number that sizes the file -- was
+        # out by five.
         rough = osweep.plan(vol, speed_mm_s=self.spin_vol_speed.value(),
+                            log_hz=self.session.out_rate,
                             **self._pattern())
         self.lbl_volume.setText(
             f"{vol.describe()} — not planned yet. Ignoring the coils it "
             f"would be {rough.describe()}.")
+
+    def refresh_estimate(self):
+        """Redo the not-yet-planned estimate, e.g. after the output rate moved.
+
+        Only while nothing is planned or being planned: a finished plan is
+        still valid at a new rate (its lines do not depend on it), and one in
+        flight must not be cancelled by a toolbar change.
+        """
+        busy = self._plan_worker is not None and self._plan_worker.isRunning()
+        if self._plan is None and not busy:
+            self.on_volume_edited()
 
     def on_volume_plan(self):
         """Work out what can actually be swept, then draw it."""
@@ -1241,7 +1257,16 @@ class MachineTab(QtWidgets.QWidget):
         running = self._enc_busy
         enc = self.session.encoders
         cols = int(getattr(self.session.source, "enc_columns", 0) or 0)
-        if enc:
+        if enc and self.session.source is not None and not cols:
+            # Scales are known, but the stream in hand has no counts to apply
+            # them to (the demo, a replay, a carrier set without counting
+            # modules). Saying "all three on the sample clock" here, while the
+            # readiness list below said the opposite, left you to work out
+            # which one to believe.
+            text = ("encoders: scales saved, but this stream carries no "
+                    "encoder counts — positions come from the controllers "
+                    "over USB")
+        elif enc:
             missing = [a for a in oenc.AXES if a not in enc]
             text = "encoders: " + enc.describe()
             text += (f" — {', '.join(missing)} still from the controller"

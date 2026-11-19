@@ -230,3 +230,51 @@ def test_block_index_follows_each_boxes_own_counter():
           src.block_index["sam_cnt"] == [1000 + 2 * BLOCK, 5_000_000 + 2 * BLOCK]
           and src.block_index["lost"] == BLOCK and src.block_index["gaps"] == 1,
           str(src.block_index))
+
+
+def test_a_backlog_is_read_in_one_go_and_stays_cheap():
+    """A full queue per tick: same rows as one block a tick, at the same cost.
+
+    A GUI that falls behind collects a whole queue (128 blocks) per tick. The
+    pending buffer used to grow block by block, copying everything pending
+    each time -- cost growing with the square of the backlog, so a stream that
+    fell behind never caught up. Now each box's blocks are joined once.
+    """
+    print("\nLiveSource, a backlog of blocks in one read")
+    drop = {(0, 5), (1, 40)}
+    cut = {(0, 2050, 7)}
+    src1, a1, b1, e1 = _run(drop=drop, cut=cut, n_blocks=128, interleave=True)
+    src2, a2, b2, e2 = _run(drop=drop, cut=cut, n_blocks=128, interleave=False)
+    check("a backlog read at once gives exactly the rows read one by one",
+          np.array_equal(a1, a2) and _paired(a2, b2, e2), f"{len(a1)} vs {len(a2)}")
+    check("and finds the same losses, at the same places",
+          (src1.gaps, src1.lost) == (src2.gaps, src2.lost),
+          f"{src1.gaps}/{src1.lost} vs {src2.gaps}/{src2.lost}")
+
+    import time
+    rows = 2048                               # the GUI's block size
+
+    def cost(per_tick, ticks):
+        src, streams = _source()
+        t0, n = 0, 0
+        spent = 0.0
+        for _ in range(ticks):
+            for _ in range(per_tick):
+                times = np.arange(t0, t0 + rows)
+                for box in (0, 1):
+                    streams[box].blocks.append(_block(box, times, (1000, 5_000_000)[box]))
+                t0 += rows
+            start = time.perf_counter()
+            out = src.read()
+            spent += time.perf_counter() - start
+            n += 0 if out is None else len(out[0])
+        return spent / max(n, 1)
+
+    # Per sample, a backlog four times deeper must not cost four times more,
+    # which is what copying the whole pending buffer per block did (745 ns
+    # at 32 blocks, 3121 at 128 on the bench machine).
+    small = min(cost(32, 4) for _ in range(3))
+    big = min(cost(128, 1) for _ in range(3))
+    check("a sample costs no more in a 128-block backlog than in a 32-block "
+          "one", big < 2 * small,
+          f"{1e9 * big:.0f} vs {1e9 * small:.0f} ns per sample")

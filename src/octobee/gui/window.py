@@ -61,6 +61,7 @@ from octobee.gui.tabs.machine import MachineTab
 from octobee.gui.tabs.stages import StagesTab
 from octobee.gui.tabs.profile import ProfileTab
 from octobee.gui.sources import DemoSource, LiveSource, ReplaySource
+from octobee.gui.widgets import glsafe
 from octobee.gui.widgets import status as gstatus
 from octobee.gui.widgets.log import LogPane
 from octobee.gui.widgets.sensors import SensorTable
@@ -242,6 +243,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # session from here on; nothing else needs the widget.
         self.session.attach_log(self.log_pane)
 
+        # A GL error in a 3D view goes to the log, not the crash dialog.
+        glsafe.log_fn = self.session.log
         self.probe_pane = ProbeHeadPane(self.session)
         self.tab_live = LiveTab(self.session)
         self.table = SensorTable(self.session.geom)
@@ -406,7 +409,18 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.motion.busy():
             strip.set_job("stages moving", None)
         elif self.session.collecting is not None:
-            strip.set_job(f"collecting ({self.session.collecting})", None)
+            # Name and progress only. This used to format the whole
+            # `collecting` dict -- including every data block gathered so far
+            # -- into the chip: 850,000 characters on 16,900 lines after one
+            # second of a zero, growing each tick. The layout then asked for
+            # a GL viewport wider than the card allows (the "invalid value"
+            # pyqtgraph blamed on glClearColor) or Qt's text drawing crashed
+            # outright.
+            c = self.session.collecting
+            name = {"tare": "taking the zero", "magnet": "magnet pass",
+                    "sweep": "rolling sweep"}.get(c.get("what"), "collecting")
+            need = c.get("need") or 0
+            strip.set_job(name, (c.get("n", 0) / need) if need else None)
         else:
             strip.set_job("")
 
@@ -763,6 +777,38 @@ class MainWindow(QtWidgets.QMainWindow):
                           padding:5px 10px; border-radius:3px; }
             QPushButton:hover { background:#2c3244; }
             QPushButton:checked { background:#3a5070; }
+            /* A greyed-out control has to LOOK greyed out. Without these a
+               disabled Home or Start looked exactly like an enabled one. */
+            QPushButton:disabled { background:#171a21; color:#5b6274;
+                                   border:1px solid #232733; }
+            QToolButton:disabled, QCheckBox:disabled, QRadioButton:disabled,
+            QComboBox:disabled, QAbstractSpinBox:disabled,
+            QLabel:disabled { color:#5b6274; }
+            /* An unticked box was a dark square on a dark background. */
+            QCheckBox::indicator { width:13px; height:13px; border-radius:2px;
+                                   border:1px solid #5a6378;
+                                   background:#171a22; }
+            QCheckBox::indicator:hover { border-color:#8f98a8; }
+            QCheckBox::indicator:checked { background:#3d7bd9;
+                                           border-color:#6a9be6; }
+            QCheckBox::indicator:disabled { border-color:#2f3442;
+                                            background:#14161c; }
+            QCheckBox::indicator:checked:disabled { background:#2b3c58; }
+            /* Qt's default track is a grey hatch that looks broken on a dark
+               window (Help topic list, the coil table). */
+            /* The status bar drew a separator beside every permanent label,
+               empty ones included: stray bars after the text. Padding
+               spaces them instead. */
+            QStatusBar::item { border:0; }
+            QStatusBar QLabel { padding:0 10px; }
+            QScrollBar:vertical { background:#14161c; width:12px; margin:0; }
+            QScrollBar:horizontal { background:#14161c; height:12px;
+                                    margin:0; }
+            QScrollBar::handle { background:#323849; border-radius:4px;
+                                 min-height:24px; min-width:24px; }
+            QScrollBar::handle:hover { background:#454d63; }
+            QScrollBar::add-line, QScrollBar::sub-line { width:0; height:0; }
+            QScrollBar::add-page, QScrollBar::sub-page { background:none; }
             QPlainTextEdit { background:#0d0f14; border:1px solid #262b38; }
             QToolBar { background:#171a22; border-bottom:1px solid #262b38;
                        spacing:4px; padding:3px; }
@@ -846,6 +892,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # for the moment between start() and the thread actually running, and
         # that moment is exactly when a second call arrives.
         if self._connecting:
+            return
+        # A session started on the synthetic probe or a replay reconnects to
+        # THAT. It used to go to the carriers instead: Disconnect, Connect in
+        # a demo session dialled real hardware, timed out when the bench was
+        # off, and threw a "Connect failed" dialog at someone who had asked
+        # for no hardware at all.
+        args = getattr(self.session, "args", None)
+        if getattr(args, "demo", False):
+            self._set_source(DemoSource(self.session.geom), "demo")
+            return
+        if getattr(args, "replay", None):
+            self._set_source(ReplaySource(args.replay), f"replay {args.replay}")
             return
         fs = float(self.cmb_rate.currentData())
         self.act_connect.setEnabled(False)
@@ -1038,14 +1096,20 @@ class MainWindow(QtWidgets.QMainWindow):
         encoder state, or the second file would quietly lose the position
         columns the first one had.
         """
+        # The counts come from the stream; the scale only says what they mean.
+        # A stream with no encoder columns (the demo, a replay, a carrier set
+        # without counting modules) has no counts to record, and handing the
+        # recorder the scale anyway gave every such file three permanently
+        # empty position columns, a log line promising positions at open and
+        # a warning about all of them missing at close.
+        columns = int(getattr(self.session.source, "enc_columns", 0) or 0)
         return orec.CsvRecorder(
             path, self.session.out_rate, self.session.cal, self.session.geom,
             tube_frame=self.tab_export.tube_frame(),
             meta=meta, samples_per_row=self.session.decim(),
-            encoders=self.session.encoders,
-            enc_datum=self.session.enc_datum,
-            enc_columns=int(
-                getattr(self.session.source, "enc_columns", 0) or 0))
+            encoders=self.session.encoders if columns else None,
+            enc_datum=self.session.enc_datum if columns else None,
+            enc_columns=columns)
 
     def _roll_over_csv(self, what, reason=None):
         """Close the CSV in progress and open a fresh one with a new header.
@@ -1845,6 +1909,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.new_decimator()
         self.session.log(f"output rate {self.session.out_rate:g} Hz "
                      f"(decimation {self.session.decim()}x from the stream)")
+        self.tab_machine.refresh_estimate()
         if self.session.csv_rec is not None:
             # The open file keeps the rate, samples-per-row and encoder datum
             # it was opened with, so carrying on into it would advance t_s at

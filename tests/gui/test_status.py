@@ -380,3 +380,53 @@ def _ancestors(widget, stop):
         out.append(w)
         w = w.parentWidget()
     return out
+
+
+def test_a_zero_in_progress_shows_a_name_not_its_data(app, workdir):
+    """The job chip during a zero is one short line with a progress bar.
+
+    It used to print the whole `collecting` dict -- every data block gathered
+    so far -- into the chip: 850,000 characters after one second, growing.
+    The window then crashed in native code or, on the GL views, raised
+    "invalid value" from glClearColor.
+    """
+    import numpy as np
+    print("\nthe job chip while zeroing")
+    win = _window(workdir, "zeroing")
+    try:
+        win.session.collecting = {
+            "what": "tare", "n": 20_000, "need": 40_000, "peak": None,
+            "baseline": None, "tag": None, "decim": 40,
+            "blocks": [np.zeros((20, 16, 3)) for _ in range(200)]}
+        win._refresh_strip()
+        text = win.strip.chip_job.text()
+        check("it names the job", text == "taking the zero", repr(text[:80]))
+        check("and shows how far it has got",
+              win.strip.bar_job.isVisibleTo(win.strip)
+              and abs(win.strip.bar_job.value() - 500) <= 1,
+              str(win.strip.bar_job.value()))
+        check("and the window stays its own width",
+              win.strip.chip_job.sizeHint().width() < 400,
+              str(win.strip.chip_job.sizeHint().width()))
+        win.session.collecting = None
+        win._refresh_strip()
+        check("and goes back to idle after", win.strip.chip_job.text() == "idle")
+    finally:
+        win.session.collecting = None
+        win.close()
+
+
+def test_a_chip_never_takes_a_runaway_text(app):
+    print("\na chip with too much to say")
+    chip = gstatus.Chip()
+    chip.set("x" * 100_000)
+    check("a long line is cut, with an ellipsis",
+          len(chip.text()) <= gstatus.Chip.MAX_CHARS and chip.text().endswith("…"),
+          str(len(chip.text())))
+    chip.set("first line\n" + "more\n" * 10_000)
+    check("only the first line is shown", chip.text() == "first line …",
+          repr(chip.text()))
+    check("and the rest is in the tooltip, bounded",
+          chip.toolTip().startswith("first line") and len(chip.toolTip()) <= 2000)
+    chip.set("short")
+    check("a normal text is left alone", chip.text() == "short")

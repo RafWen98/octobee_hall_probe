@@ -197,7 +197,8 @@ class StagesTab(QtWidgets.QWidget):
         # three axes to get it.
         self.btn_stage_stop = QtWidgets.QPushButton("Stop moving")
         self.btn_stage_stop.setStyleSheet(
-            "background:#7a1f1f; color:#fff; font-weight:bold;")
+            "QPushButton { background:#7a1f1f; color:#fff; font-weight:bold; }"
+            "QPushButton:disabled { background:#241a1d; color:#6e5a5e; }")
         self.btn_stage_stop.setToolTip(
             "End the move in progress and stop any running field map, without "
             "latching the machine off. Profiled, so positions stay "
@@ -369,7 +370,7 @@ class StagesTab(QtWidgets.QWidget):
         if not serials:
             msg = ("No stages on the bus. The Kinesis application is running "
                    "and holds all of them — close it and try again."
-                   if ostage.kinesisis_running() else
+                   if ostage.kinesis_is_running() else
                    "No stages on the bus. Check power and USB.")
             self.session.log(f"stages: {msg}")
             if not quiet:
@@ -1238,7 +1239,8 @@ class StageJogPane(QtWidgets.QWidget):
         self.btn_home.clicked.connect(lambda: home())      # noqa: PLW0108
         self.btn_stop = QtWidgets.QPushButton("Stop moving")
         self.btn_stop.setStyleSheet(
-            "background:#7a1f1f; color:#fff; font-weight:bold;")
+            "QPushButton { background:#7a1f1f; color:#fff; font-weight:bold; }"
+            "QPushButton:disabled { background:#241a1d; color:#6e5a5e; }")
         self.btn_stop.setToolTip(
             "End the move in progress without latching the machine off. "
             "Profiled, so positions stay trustworthy and nothing needs "

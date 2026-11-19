@@ -55,6 +55,7 @@ from PyQt6 import QtCore, QtGui
 from octobee import machine as omach
 from octobee import profile as oprof
 from octobee.calib import geometry as pgeom
+from octobee.gui.widgets import glsafe
 
 COIL_ON_COLOR = (0.95, 0.62, 0.18, 1.0)
 COIL_OFF_COLOR = (0.58, 0.63, 0.72, 1.0)
@@ -192,8 +193,12 @@ class MachineView3D(gl.GLViewWidget):
         self._build()
 
     def paintGL(self, *args, **kwargs):
+        # See glsafe: never let a GL error out of a paint.
+        if not hasattr(self, "_safe"):
+            self._safe = glsafe.SafePaint("3D machine view", give_up=self.hide)
         with self.profiler.time("GL paint (machine)"):
-            super().paintGL(*args, **kwargs)
+            self._safe.paint(lambda: super(MachineView3D, self).paintGL(
+                *args, **kwargs))
 
     # ---- construction ----------------------------------------------------
     def _build(self):
