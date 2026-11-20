@@ -278,3 +278,91 @@ def test_capture_default_goes_to_the_captures_directory(tmp_path, monkeypatch):
     check("with no -o the file lands in the captures directory",
           os.path.exists(tmp_path / "caps" / "octobee_capture.npz"))
     check("and not in the working directory", not os.listdir(cwd))
+
+
+def _fake_network(monkeypatch, boxes, local=("192.168.1.100",)):
+    """Stand in for the bench LAN: `boxes` maps address -> SERIAL.
+
+    Returns a list that records every subnet scanned, so a test can tell
+    whether the cheap path was taken.
+    """
+    scans = []
+    monkeypatch.setattr(ob, "_located", {})
+    monkeypatch.setattr(ob, "_scanned", {})
+    monkeypatch.setattr(ob, "_read_serial", lambda ip, timeout=1.0: boxes.get(ip))
+    monkeypatch.setattr(ob, "_local_ips", lambda: list(local))
+
+    def scan(prefix):
+        scans.append(prefix)
+        return sorted(ip for ip in boxes if ip.startswith(prefix + "."))
+
+    monkeypatch.setattr(ob, "_scan_subnet", scan)
+    return scans
+
+
+def test_a_carrier_where_the_table_says_is_used_without_a_scan(monkeypatch):
+    print("\naddress(): boxes where expected")
+    scans = _fake_network(monkeypatch, {"192.168.1.84": "CE4010694",
+                                        "192.168.1.83": "CE4010695"})
+    got = [ob.address(h) for h in ob.DEFAULT_UUTS]
+    check("both names map to their table addresses",
+          got == ["192.168.1.84", "192.168.1.83"], repr(got))
+    check("no subnet was scanned", scans == [], repr(scans))
+
+
+def test_a_carrier_that_moved_is_found_by_its_serial(monkeypatch, capsys):
+    print("\naddress(): 694 moved")
+    scans = _fake_network(monkeypatch, {"192.168.1.91": "CE4010694",
+                                        "192.168.1.83": "CE4010695"})
+    got = ob.address("acq1001_694")
+    out = capsys.readouterr().out
+    check("694 is found at its new address", got == "192.168.1.91", repr(got))
+    check("the move is reported, not silent", "found CE4010694 at 192.168.1.91" in out, out)
+    ob.address("acq1001_694")
+    ob.address("acq1001_695")
+    check("the subnet is scanned once, then remembered", scans == ["192.168.1"],
+          repr(scans))
+
+
+def test_two_carriers_that_swapped_addresses_are_not_swapped(monkeypatch):
+    """The failure that would be silent: sensors 1-8 and 9-16 trading places."""
+    print("\naddress(): swapped boxes")
+    _fake_network(monkeypatch, {"192.168.1.84": "CE4010695",
+                                "192.168.1.83": "CE4010694"})
+    check("694 follows its serial", ob.address("acq1001_694") == "192.168.1.83")
+    check("695 follows its serial", ob.address("acq1001_695") == "192.168.1.84")
+
+
+def test_a_missing_carrier_names_what_the_scan_did_find(monkeypatch):
+    print("\naddress(): 694 absent")
+    _fake_network(monkeypatch, {"192.168.1.83": "CE4010695"})
+    try:
+        ob.address("acq1001_694")
+        err = None
+    except ConnectionError as e:
+        err = str(e)
+    check("a ConnectionError is raised", err is not None)
+    check("it lists the boxes that were there",
+          err is not None and "CE4010695 at 192.168.1.83" in err, err)
+
+
+def test_a_pc_off_the_carrier_subnet_is_told_how_to_fix_it(monkeypatch):
+    """What actually happened on 2026-11-19: Ethernet sat on 169.254.x."""
+    print("\naddress(): PC not on 192.168.1.x")
+    scans = _fake_network(monkeypatch, {}, local=("10.70.91.186", "169.254.139.50"))
+    try:
+        ob.address("acq1001_695")
+        err = None
+    except ConnectionError as e:
+        err = str(e)
+    check("nothing is scanned from the wrong network", scans == [], repr(scans))
+    check("the error says the PC needs a 192.168.1.x address and how",
+          err is not None and "192.168.1.x" in err and "netsh" in err, err)
+
+
+def test_a_host_not_in_the_table_is_used_as_given(monkeypatch):
+    print("\naddress(): unknown names pass through")
+    scans = _fake_network(monkeypatch, {})
+    check("an IP passes through", ob.address("10.0.0.5") == "10.0.0.5")
+    check("an unknown hostname passes through", ob.address("fake") == "fake")
+    check("neither triggers a scan", scans == [], repr(scans))

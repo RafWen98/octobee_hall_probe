@@ -57,20 +57,146 @@ from octobee import paths
 # The two carriers. Order here defines the global sensor numbering.
 DEFAULT_UUTS = ("acq1001_694", "acq1001_695")
 
-# Where each carrier answers. The names above stay the labels used in
-# recordings and reports; this table is only consulted when connecting, since
-# the bench switch (Netgear GS305EP) has no DNS to resolve the names. 694 was
-# found at .84, not its old .82, on 2026-11-19. Unlisted names (e.g. an IP or
-# another hostname passed with --uut) are used as given.
+# Where each carrier is expected to answer, and the serial that proves it is
+# the right box. The names stay the labels used in recordings and reports;
+# these tables are only consulted when connecting, since the bench switch
+# (Netgear GS305EP) has no DNS to resolve the names. 694 was found at .84, not
+# its old .82, on 2026-11-19. Unlisted names (e.g. an IP or another hostname
+# passed with --uut) are used exactly as given, with no check.
 UUT_ADDRESSES = {
     "acq1001_694": "192.168.1.84",
     "acq1001_695": "192.168.1.83",
 }
+UUT_SERIALS = {
+    "acq1001_694": "CE4010694",
+    "acq1001_695": "CE4010695",
+}
+
+LOCATE_TIMEOUT = 1.0        # per box when checking its serial
+SCAN_TIMEOUT = 0.5          # per address when sweeping a subnet
+SCAN_WORKERS = 128
+
+_located = {}               # name -> address, once confirmed this process
+_scanned = {}               # subnet prefix -> {serial: address}
+_locate_lock = threading.Lock()
+
+
+def _read_serial(ip, timeout=LOCATE_TIMEOUT):
+    """The SERIAL a box at `ip` reports, or None if nothing answers there."""
+    u = Uut(ip, timeout=timeout)
+    try:
+        s = u.value("SERIAL")
+    except OSError:
+        return None
+    finally:
+        u.close()
+    return s or None
+
+
+def _local_ips():
+    """This PC's own IPv4 addresses.
+
+    Not "which address would the OS send from" (a connected UDP socket):
+    Windows caches a route per destination, so an address pinged while the
+    Ethernet port had no 192.168.1.x yet keeps going out over Wi-Fi after it
+    gets one, and the answer is wrong.
+    """
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        return []
+    return sorted({i[4][0] for i in infos})
+
+
+def _port_open(ip, timeout=SCAN_TIMEOUT):
+    try:
+        socket.create_connection((ip, PORT_SITE0), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def _scan_subnet(prefix):
+    """Every address in `prefix`.1-254 with a carrier command port open."""
+    from concurrent.futures import ThreadPoolExecutor
+    ips = [f"{prefix}.{n}" for n in range(1, 255)]
+    with ThreadPoolExecutor(SCAN_WORKERS) as pool:
+        hits = list(pool.map(_port_open, ips))
+    return [ip for ip, hit in zip(ips, hits) if hit]
+
+
+def _subnet_serials(prefix):
+    """{serial: address} for every carrier found on `prefix`.0/24 (cached)."""
+    if prefix not in _scanned:
+        found = {}
+        for ip in _scan_subnet(prefix):
+            serial = _read_serial(ip)
+            if serial:
+                found[serial] = ip
+        _scanned[prefix] = found
+    return _scanned[prefix]
+
+
+def _locate(host):
+    expected_ip = UUT_ADDRESSES[host]
+    serial = UUT_SERIALS[host]
+    got = _read_serial(expected_ip)
+    if got == serial:
+        return expected_ip
+
+    # Not where the table says. Look on that subnet only: sweeping whatever
+    # else the PC is on would mean port-scanning the campus network.
+    prefix = expected_ip.rsplit(".", 1)[0]
+    mine = _local_ips()
+    if not any(ip.rsplit(".", 1)[0] == prefix for ip in mine):
+        raise ConnectionError(
+            f"{host} ({serial}) did not answer at {expected_ip}, and this PC "
+            f"has no address on {prefix}.x to look for it from (it has "
+            f"{', '.join(mine) or 'none'}). Give the Ethernet port on the carriers' "
+            f"switch a {prefix}.x address, e.g. in an admin Command Prompt:\n"
+            f'    netsh interface ipv4 set address name="Ethernet" static '
+            f"{prefix}.100 255.255.255.0")
+
+    found = _subnet_serials(prefix)
+    if serial in found:
+        ip = found[serial]
+        why = ("nothing answered there" if got is None
+               else f"{got} answered there instead")
+        print(f"{host}: not at {expected_ip} ({why}); found {serial} at {ip}. "
+              f"Update UUT_ADDRESSES in octobee/acq/carrier.py to skip the scan.")
+        return ip
+
+    seen = (", ".join(f"{s} at {ip}" for s, ip in sorted(found.items()))
+            or "no carriers at all")
+    raise ConnectionError(
+        f"{host} ({serial}) is not on {prefix}.x: not at {expected_ip}"
+        f"{'' if got is None else f' ({got} answered there)'}, and a scan "
+        f"found {seen}. Is it powered and plugged into the switch?")
 
 
 def address(host):
-    """The network address to connect to for carrier name `host`."""
-    return UUT_ADDRESSES.get(host, host)
+    """The network address to connect to for carrier name `host`.
+
+    A known carrier is checked by serial at its usual address first, which
+    costs a few milliseconds. Only if it is missing, or a different box
+    answers, is its subnet scanned for the right serial -- so two boxes that
+    swap addresses cannot quietly swap sensors 1-8 with 9-16. The answer is
+    kept for the rest of the process.
+    """
+    if host not in UUT_ADDRESSES:
+        return host
+    with _locate_lock:
+        if host not in _located:
+            _located[host] = _locate(host)
+        return _located[host]
+
+
+def forget_addresses():
+    """Drop what address() learned, so the next connection checks again."""
+    with _locate_lock:
+        _located.clear()
+        _scanned.clear()
+
 
 PORT_STREAM = 4210          # raw aggregator stream
 PORT_SITE0 = 4220           # motherboard command port; site N -> 4220 + N

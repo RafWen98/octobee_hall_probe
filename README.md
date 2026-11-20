@@ -17,6 +17,13 @@ channels: Phoebus was pointed at one box.
 | `acq1001_694` | 192.168.1.84 | E42310297 | S1–S8 | 96 B (24 LW), 1 site-2 word (**not** an encoder) |
 | `acq1001_695` | 192.168.1.83 | E42310298 | S9–S16 | 104 B (26 LW), 3 encoder words (ENC_X/Y/Z) |
 
+The tools connect by carrier name. Each name is checked against its carrier
+serial (CE4010694 / CE4010695) at the IP above. If the box isn't there, or a
+different box answers, the tools scan that 192.168.1.x subnet for the right
+serial and print where they found it. The PC therefore needs a 192.168.1.x
+address on the port that goes to the carriers' switch (e.g. 192.168.1.100).
+Both tables are `UUT_ADDRESSES` / `UUT_SERIALS` in `src/octobee/acq/carrier.py`.
+
 Both: ACQ423ELF, 32 ch, 16-bit packed, ±10 V, 200 kSPS, SPAD = 7 longwords.
 The two boxes have **different frame layouts**, so anything that decodes the raw
 stream has to read the geometry off the box rather than hard-code it. The tools
