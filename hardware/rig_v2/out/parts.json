@@ -1,0 +1,538 @@
+{
+ "printed": [
+  {
+   "id": "nose_core",
+   "title": "Probe nose: 16 board seats",
+   "qty": 1,
+   "material": "PETG / ASA",
+   "notes": "Stand on the spigot, brim 5 mm, 0.16 mm layers, 5 walls, 40 % gyroid. 32 brass M2 heat-set inserts. Nylon M2x6 screws.",
+   "size_mm": [
+    25.4,
+    25.4,
+    194.0
+   ],
+   "est_g_each": 67,
+   "watertight": true,
+   "genus": 1
+  },
+  {
+   "id": "nose_coupler",
+   "title": "Nose-to-boom coupler",
+   "qty": 1,
+   "material": "PETG / ASA",
+   "notes": "Stand on the sleeve end. 6 walls, 50 % infill. 1 brass M4 insert + nylon M4 thumbscrew; 4x M5x10 into aluminium T-nuts.",
+   "size_mm": [
+    34.0,
+    162.0,
+    54.0
+   ],
+   "est_g_each": 96,
+   "watertight": true,
+   "genus": 10
+  },
+  {
+   "id": "carriage_plate",
+   "title": "Carriage plate on the Y sled",
+   "qty": 1,
+   "material": "PETG / PA-CF",
+   "notes": "Flat on the outer face. 6 walls, 60 % infill. 8x 1/4-20 (or M6) into the sled; 8x M5 into the boom. Check CARRIAGE_ROWS_Y first.",
+   "size_mm": [
+    160.0,
+    250.0,
+    10.0
+   ],
+   "est_g_each": 208,
+   "watertight": true,
+   "genus": 14
+  },
+  {
+   "id": "octo_frame",
+   "title": "OCTO-BEE-CONC frame (both boards)",
+   "qty": 1,
+   "material": "PETG",
+   "notes": "Flat on the back. 4 walls, 30 % infill. 10 brass M3 inserts. Print octo_gauge first.",
+   "size_mm": [
+    210.0,
+    201.0,
+    15.0
+   ],
+   "est_g_each": 111,
+   "watertight": true,
+   "genus": 20
+  },
+  {
+   "id": "octo_gauge",
+   "title": "OCTO-BEE hole gauge",
+   "qty": 1,
+   "material": "PLA / PETG",
+   "notes": "10-minute print. Lay it on a CONC: every hole should show a board hole through it. If not, measure and fix OCTO_HOLES.",
+   "size_mm": [
+    94.0,
+    189.0,
+    1.4
+   ],
+   "est_g_each": 4,
+   "watertight": true,
+   "genus": 6
+  },
+  {
+   "id": "tower_foot",
+   "title": "2040 tower foot",
+   "qty": 1,
+   "material": "PETG",
+   "notes": "Flat on its base. 6 walls, 50 % infill. 4x 1/4-20 cap screws.",
+   "size_mm": [
+    120.0,
+    120.0,
+    48.0
+   ],
+   "est_g_each": 113,
+   "watertight": true,
+   "genus": 8
+  },
+  {
+   "id": "device_shelf",
+   "title": "Switch + USB hub shelf",
+   "qty": 1,
+   "material": "PETG",
+   "notes": "On its back plate. 4 walls, 25 % infill. Two 20 mm velcro straps.",
+   "size_mm": [
+    160.0,
+    120.0,
+    70.0
+   ],
+   "est_g_each": 125,
+   "watertight": true,
+   "genus": 12
+  },
+  {
+   "id": "psu_cradle",
+   "title": "Supply-brick cradle (x4)",
+   "qty": 4,
+   "material": "PETG",
+   "notes": "Flat. Two per brick; check the 62 x 34 mm default against your bricks.",
+   "size_mm": [
+    106.0,
+    30.0,
+    29.5
+   ],
+   "est_g_each": 12,
+   "watertight": true,
+   "genus": 4
+  },
+  {
+   "id": "chain_end",
+   "title": "Drag-chain end bracket (x4)",
+   "qty": 4,
+   "material": "PETG",
+   "notes": "On the horizontal leg. 5 walls.",
+   "size_mm": [
+    60.0,
+    50.0,
+    50.0
+   ],
+   "est_g_each": 27,
+   "watertight": true,
+   "genus": 4
+  },
+  {
+   "id": "carrier_shelf",
+   "title": "Carrier shelf on the boom",
+   "qty": 1,
+   "material": "PETG / PA-CF",
+   "notes": "Upside down, on the top face. 5 walls, 40 % infill. 3x M5 into the boom's top slot, 3x into its outer slot. Two velcro straps per carrier. MEASURE CAR_* first.",
+   "size_mm": [
+    101.0,
+    235.0,
+    44.0
+   ],
+   "est_g_each": 123,
+   "watertight": true,
+   "genus": 13
+  },
+  {
+   "id": "y_chain_arm",
+   "title": "Y-chain arm",
+   "qty": 1,
+   "material": "PETG / PA-CF",
+   "notes": "On its side (the long flat face). 5 walls, 40 % infill. 2x M5 into the carriage-plate tab.",
+   "size_mm": [
+    80.0,
+    131.0,
+    30.0
+   ],
+   "est_g_each": 37,
+   "watertight": true,
+   "genus": 4
+  },
+  {
+   "id": "spring_cap",
+   "title": "Z counterbalance cap",
+   "qty": 1,
+   "material": "PETG / PA-CF",
+   "notes": "Open end up. 6 walls, 60 % infill. 6 mm brass axle, 2x M5 pinch screws. MEASURE STAGE_END_* first.",
+   "size_mm": [
+    74.6,
+    110.6,
+    75.0
+   ],
+   "est_g_each": 99,
+   "watertight": true,
+   "genus": 5
+  },
+  {
+   "id": "cable_clip",
+   "title": "T-slot cable clip (x10)",
+   "qty": 10,
+   "material": "PETG",
+   "notes": "On the tab.",
+   "size_mm": [
+    14.0,
+    33.0,
+    15.0
+   ],
+   "est_g_each": 1,
+   "watertight": true,
+   "genus": 1
+  }
+ ],
+ "nose_in_ycar": {
+  "R": [
+   [
+    1.0,
+    0.0,
+    0.0
+   ],
+   [
+    0.0,
+    6.123233995736766e-17,
+    1.0
+   ],
+   [
+    0.0,
+    -1.0,
+    6.123233995736766e-17
+   ]
+  ],
+  "t": [
+   20.0,
+   576.0,
+   0.0
+  ]
+ },
+ "fsv_world_mid": [
+  20.0,
+  656.0,
+  4.898587196589413e-15
+ ],
+ "scan_volume_lo": [
+  -44.0,
+  356.0,
+  218.0
+ ],
+ "chain": {
+  "R": 48.0,
+  "inner": [
+   50.0,
+   15.0
+  ]
+ },
+ "chains": [
+  {
+   "id": "x_umbilical",
+   "gF": "fixed",
+   "F": [
+    -250,
+    -630,
+    14
+   ],
+   "gM": "xcar",
+   "M": [
+    -100,
+    -380,
+    32
+   ],
+   "d": [
+    1,
+    0,
+    0
+   ],
+   "n": [
+    0,
+    0,
+    1
+   ],
+   "R": 48.0,
+   "L": 520,
+   "w": 60,
+   "h": 28,
+   "carries": "DC leads (2x ACQ, Y + Z stage, switch, hub), X encoder, 1x USB, 1x Ethernet"
+  },
+  {
+   "id": "z_chain",
+   "gF": "xcar",
+   "F": [
+    -38,
+    -253,
+    40
+   ],
+   "gM": "zcar",
+   "M": [
+    60,
+    -253,
+    0
+   ],
+   "d": [
+    0,
+    0,
+    1
+   ],
+   "n": [
+    1,
+    0,
+    0
+   ],
+   "R": 48.0,
+   "L": 600,
+   "w": 64,
+   "h": 23,
+   "carries": "2x Ethernet, 2x ACQ DC, X + Z encoders, Y-stage USB + DC"
+  },
+  {
+   "id": "y_chain",
+   "gF": "zcar",
+   "F": [
+    42,
+    -185,
+    61.5
+   ],
+   "gM": "ycar",
+   "M": [
+    -46,
+    0,
+    157.5
+   ],
+   "d": [
+    0,
+    1,
+    0
+   ],
+   "n": [
+    0,
+    0,
+    1
+   ],
+   "R": 48.0,
+   "L": 630,
+   "w": 64,
+   "h": 23,
+   "carries": "2x Ethernet, 2x ACQ DC, X + Y + Z encoders"
+  }
+ ],
+ "z_budget": {
+  "items": [
+   {
+    "what": "Y stage (LTS300C, Thorlabs catalog)",
+    "kg": 2.5
+   },
+   {
+    "what": "Y bracket + fasteners (estimate)",
+    "kg": 0.35
+   },
+   {
+    "what": "2040 boom",
+    "kg": 0.45
+   },
+   {
+    "what": "printed: carriage plate, coupler, nose, CONC frame, chain arm",
+    "kg": 0.52
+   },
+   {
+    "what": "2x CONC + 16 eval kits + ribbons (estimate)",
+    "kg": 0.45
+   },
+   {
+    "what": "Y-chain cables, half their weight (estimate)",
+    "kg": 0.25
+   },
+   {
+    "what": "2x ACQ1001 + CELF in brackets (MEASURE, 1.2 kg each)",
+    "kg": 2.4
+   },
+   {
+    "what": "carrier shelf (printed)",
+    "kg": 0.12
+   }
+  ],
+  "z_load_before_kg": 4.52,
+  "z_load_after_kg": 7.04,
+  "z_rated_kg": 4.0,
+  "net_down_kg": 1.0,
+  "spring_total_n": 59,
+  "spring_each_n": 30
+ },
+ "boom_electronics_gap_mm": 5.0,
+ "fsv_radius_mm": 77.65624572434595,
+ "sensors": [
+  {
+   "id": 1,
+   "face": 0,
+   "slot": 3,
+   "fsv_tube_mm": [
+    14.45,
+    -76.3,
+    129.0
+   ]
+  },
+  {
+   "id": 2,
+   "face": 0,
+   "slot": 2,
+   "fsv_tube_mm": [
+    14.45,
+    -76.3,
+    96.0
+   ]
+  },
+  {
+   "id": 3,
+   "face": 0,
+   "slot": 1,
+   "fsv_tube_mm": [
+    14.45,
+    -76.3,
+    63.0
+   ]
+  },
+  {
+   "id": 4,
+   "face": 0,
+   "slot": 0,
+   "fsv_tube_mm": [
+    14.45,
+    -76.3,
+    30.0
+   ]
+  },
+  {
+   "id": 5,
+   "face": 1,
+   "slot": 0,
+   "fsv_tube_mm": [
+    76.3,
+    14.45,
+    30.0
+   ]
+  },
+  {
+   "id": 6,
+   "face": 1,
+   "slot": 1,
+   "fsv_tube_mm": [
+    76.3,
+    14.45,
+    63.0
+   ]
+  },
+  {
+   "id": 7,
+   "face": 1,
+   "slot": 2,
+   "fsv_tube_mm": [
+    76.3,
+    14.45,
+    96.0
+   ]
+  },
+  {
+   "id": 8,
+   "face": 1,
+   "slot": 3,
+   "fsv_tube_mm": [
+    76.3,
+    14.45,
+    129.0
+   ]
+  },
+  {
+   "id": 9,
+   "face": 2,
+   "slot": 0,
+   "fsv_tube_mm": [
+    -14.45,
+    76.3,
+    30.0
+   ]
+  },
+  {
+   "id": 10,
+   "face": 2,
+   "slot": 1,
+   "fsv_tube_mm": [
+    -14.45,
+    76.3,
+    63.0
+   ]
+  },
+  {
+   "id": 11,
+   "face": 2,
+   "slot": 2,
+   "fsv_tube_mm": [
+    -14.45,
+    76.3,
+    96.0
+   ]
+  },
+  {
+   "id": 12,
+   "face": 2,
+   "slot": 3,
+   "fsv_tube_mm": [
+    -14.45,
+    76.3,
+    129.0
+   ]
+  },
+  {
+   "id": 13,
+   "face": 3,
+   "slot": 0,
+   "fsv_tube_mm": [
+    -76.3,
+    -14.45,
+    30.0
+   ]
+  },
+  {
+   "id": 14,
+   "face": 3,
+   "slot": 1,
+   "fsv_tube_mm": [
+    -76.3,
+    -14.45,
+    63.0
+   ]
+  },
+  {
+   "id": 15,
+   "face": 3,
+   "slot": 2,
+   "fsv_tube_mm": [
+    -76.3,
+    -14.45,
+    96.0
+   ]
+  },
+  {
+   "id": 16,
+   "face": 3,
+   "slot": 3,
+   "fsv_tube_mm": [
+    -76.3,
+    -14.45,
+    129.0
+   ]
+  }
+ ]
+}
